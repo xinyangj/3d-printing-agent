@@ -66,7 +66,6 @@ flowchart LR
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python -m pip install -e ".[dev]"
-.\.venv\Scripts\python -m copilot download-runtime
 
 Copy-Item .env.example .env
 # Set PRINTING_AGENT_THINGIVERSE_TOKEN in .env
@@ -78,6 +77,7 @@ Set-Location ..
 ```
 
 The Copilot SDK uses the currently signed-in Copilot CLI user by default. `PRINTING_AGENT_COPILOT_MODEL` can select a model; leaving it empty uses the SDK default.
+The SDK package includes its matching Copilot runtime.
 
 For a development frontend with hot reload:
 
@@ -102,6 +102,99 @@ Set-Location ..
 ```
 
 Open <http://127.0.0.1:8000>. FastAPI serves `web/dist` when present.
+
+## Windows deployment with Tailscale Funnel
+
+The production-style Windows deployment keeps FastAPI and Caddy on loopback and uses
+Tailscale Funnel as the only public ingress:
+
+```text
+Public HTTPS -> Tailscale Funnel -> 127.0.0.1:8080 Caddy Basic Auth
+             -> 127.0.0.1:8000 FastAPI + React + durable worker
+```
+
+> [!WARNING]
+> Funnel is public internet access. Anyone with the Basic Auth credentials can create
+> Copilot workloads and approve print jobs. Use a unique password, rotate it if exposed,
+> and reset Funnel immediately when public access is not required.
+
+### Install
+
+Run PowerShell as the Windows user whose Copilot credentials should be used:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\deploy\windows\Install-Deployment.ps1
+```
+
+The installer:
+
+- installs Node.js LTS, OpenSCAD, Tailscale, and Caddy with WinGet when missing;
+- creates `.venv` and installs Python, development, and bundled Copilot runtime
+  dependencies;
+- builds `web\dist`;
+- creates a protected `.env` and records the detected OpenSCAD path;
+- prompts twice for a web password and stores only Caddy's password hash under
+  `var\deployment`;
+- registers and starts separate FastAPI and Caddy scheduled tasks at user logon; and
+- configures persistent public HTTPS with Tailscale Funnel.
+
+Before running the installer, sign in to Copilot CLI. Tailscale Funnel also requires a
+signed-in Tailscale client, MagicDNS, tailnet HTTPS, and the `funnel` node attribute. The
+first Funnel command may open the Tailscale approval page.
+
+After installation, set the Thingiverse developer token in the protected `.env` file:
+
+```text
+PRINTING_AGENT_THINGIVERSE_TOKEN=<token>
+```
+
+Restart the application task after changing `.env`:
+
+```powershell
+Stop-ScheduledTask -TaskName "3D Printing Agent"
+Start-ScheduledTask -TaskName "3D Printing Agent"
+```
+
+Use `-SkipPackageInstall`, `-SkipScheduledTasks`, or `-SkipFunnel` when provisioning
+those layers separately. The scheduled tasks use the current user's profile and start
+at logon, so the deployment is unavailable after a reboot until that user signs in.
+
+### Operations
+
+Inspect task state, local health, Basic Auth enforcement, and Funnel status:
+
+```powershell
+.\deploy\windows\Get-DeploymentStatus.ps1
+```
+
+Logs are written to `var\logs`. Caddy access logs rotate automatically. Back up the
+SQLite database consistently together with immutable artifacts and simulator jobs:
+
+```powershell
+.\deploy\windows\Backup-Deployment.ps1
+```
+
+Backups are ZIP archives under `var\backups` and include a manifest of the effective
+configured storage paths. To restore, stop both scheduled tasks, extract a backup, and
+copy `printing-agent.db`, `artifacts`, and `simulator` to the corresponding
+`PRINTING_AGENT_DATABASE_URL`, `PRINTING_AGENT_ARTIFACT_DIR`, and
+`PRINTING_AGENT_SIMULATOR_SPOOL_DIR` destinations recorded in
+`backup-manifest.json`. Then restart the tasks.
+
+For an upgrade, back up first, update the checkout, then rerun
+`Install-Deployment.ps1`; task registration and builds are idempotent. The installer
+prompts for a new web password each time, which also rotates the credential.
+
+Remove the scheduled tasks while retaining data, configuration, dependencies, and
+backups:
+
+```powershell
+.\deploy\windows\Uninstall-Deployment.ps1 -ResetFunnel
+```
+
+Without `-ResetFunnel`, the public Funnel configuration is preserved. No router port
+forwarding or inbound Windows Firewall rule is required or recommended.
 
 ## Configuration
 
