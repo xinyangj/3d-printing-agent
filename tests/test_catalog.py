@@ -17,6 +17,7 @@ def _image_bytes() -> bytes:
 
 async def test_thingiverse_search_and_page_gallery_are_normalized(
     settings: Settings,
+    tmp_path,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -74,8 +75,17 @@ async def test_thingiverse_search_and_page_gallery_are_normalized(
                     }
                 ],
             )
+        if path == "/files/9/download":
+            assert request.headers["referer"] == "https://www.thingiverse.com/thing:42"
+            return httpx.Response(
+                302,
+                headers={"location": "https://cdn.thingiverse.com/hook.stl"},
+            )
         if request.url.host == "cdn.thingiverse.com":
             assert "authorization" not in request.headers
+            if path == "/hook.stl":
+                assert request.headers["referer"] == "https://www.thingiverse.com/thing:42"
+                return httpx.Response(200, content=b"solid hook\nendsolid hook\n")
             return httpx.Response(
                 200,
                 content=_image_bytes(),
@@ -101,6 +111,9 @@ async def test_thingiverse_search_and_page_gallery_are_normalized(
     assert inspection.candidate.instructions == "Use two screws"
     assert len(images) == 1
     assert images[0].mime_type == "image/jpeg"
+    model_path = tmp_path / "hook.stl"
+    await catalog.download_file(inspection.candidate, "9", model_path)
+    assert model_path.read_bytes() == b"solid hook\nendsolid hook\n"
     await catalog.close()
 
 

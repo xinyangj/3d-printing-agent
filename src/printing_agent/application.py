@@ -328,8 +328,9 @@ class PrintingApplication:
         if workflow.state not in {
             WorkflowState.AWAITING_APPROVAL,
             WorkflowState.APPROVED,
+            WorkflowState.PREPARATION_FAILED,
         }:
-            raise ConflictError("Only an unsubmitted artifact can be revised")
+            raise ConflictError("Only an unsubmitted or failed preparation can be revised")
         if mode == RevisionMode.REFINE_CURRENT:
             if workflow.active_artifact_version is None:
                 raise ConflictError("Workflow has no active artifact to refine")

@@ -1079,8 +1079,9 @@ class WorkflowRepository:
             if current_state not in {
                 WorkflowState.AWAITING_APPROVAL,
                 WorkflowState.APPROVED,
+                WorkflowState.PREPARATION_FAILED,
             }:
-                raise ConflictError("Only an unsubmitted artifact can be revised")
+                raise ConflictError("Only an unsubmitted or failed preparation can be revised")
             assert_transition(current_state, WorkflowState.REVISION_REQUESTED)
             await db.execute(
                 """

@@ -90,6 +90,28 @@ async def test_approved_workflow_can_record_submission_failure(
     assert workflow.state == WorkflowState.PRINT_FAILED
 
 
+async def test_failed_preparation_can_request_new_base(
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Print a small cube", "simulator")
+    pending = await repository.lease_next()
+    assert pending is not None
+    await repository.complete_work(pending.id)
+    await repository.transition(workflow.id, WorkflowState.PLANNING)
+    await repository.transition(workflow.id, WorkflowState.PREPARATION_FAILED)
+
+    await repository.request_revision(
+        RevisionRequest(
+            workflow_id=workflow.id,
+            mode=RevisionMode.SEARCH_NEW_BASE,
+            feedback="Retry catalog discovery",
+        )
+    )
+
+    revised = await repository.get_workflow(workflow.id)
+    assert revised.state == WorkflowState.REVISION_REQUESTED
+
+
 async def test_workflow_archive_and_restore_preserve_state(
     repository: WorkflowRepository,
 ) -> None:

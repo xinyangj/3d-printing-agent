@@ -201,10 +201,12 @@ class ThingiverseCatalog:
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         total = 0
         try:
+            headers = self._auth_headers(url)
+            headers["Referer"] = candidate.source_url
             async with client.stream(
                 "GET",
                 url,
-                headers=self._auth_headers(url),
+                headers=headers,
             ) as response:
                 self._raise_for_status(response, "download Thingiverse model file")
                 final_host = response.url.host
