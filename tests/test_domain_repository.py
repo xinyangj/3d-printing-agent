@@ -105,11 +105,13 @@ async def test_failed_preparation_can_request_new_base(
             workflow_id=workflow.id,
             mode=RevisionMode.SEARCH_NEW_BASE,
             feedback="Retry catalog discovery",
+            part_id="base_model",
         )
     )
 
     revised = await repository.get_workflow(workflow.id)
     assert revised.state == WorkflowState.REVISION_REQUESTED
+    assert (await repository.get_latest_revision(workflow.id)).part_id == "base_model"
 
 
 async def test_workflow_archive_and_restore_preserve_state(
@@ -213,6 +215,13 @@ async def test_initialize_migrates_existing_workflow_table(tmp_path: Path) -> No
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE revision_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id TEXT NOT NULL REFERENCES workflows(id),
+                mode TEXT NOT NULL,
+                feedback TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             INSERT INTO workflows (
                 id, requirement, printer_name, state, version, created_at, updated_at
             ) VALUES (
@@ -228,6 +237,11 @@ async def test_initialize_migrates_existing_workflow_table(tmp_path: Path) -> No
 
     assert workflow.archived_at is None
     assert workflow.state == WorkflowState.COMPLETED
+    with sqlite3.connect(database_path) as db:
+        revision_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(revision_requests)").fetchall()
+        }
+    assert "part_id" in revision_columns
 
 
 def test_modeling_handoff_digest_is_stable_and_mode_is_validated() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 from typing import cast
 
@@ -87,7 +88,11 @@ class PrintingApplication:
         elif workflow.state == WorkflowState.REVISION_REQUESTED:
             revision = await self.repository.get_latest_revision(workflow.id)
             if revision.mode == RevisionMode.REFINE_CURRENT:
-                return await self._refine_current(workflow.id, revision.feedback)
+                return await self._refine_current(
+                    workflow.id,
+                    revision.feedback,
+                    revision.part_id,
+                )
             await self.repository.transition(
                 workflow.id,
                 WorkflowState.DISCOVERING,
@@ -117,12 +122,23 @@ class PrintingApplication:
                 str(decision.candidate_id),
             )
             candidate = page.candidate
+            selected_file = next(
+                (item for item in candidate.files if item.id == str(decision.file_id)),
+                None,
+            )
+            if selected_file is None:
+                raise ValidationError("Selected source file is no longer available")
+            source_format = selected_file.format.casefold().lstrip(".")
+            if source_format not in {"stl", "3mf"}:
+                raise ValidationError(
+                    f"Source format '{source_format}' is discoverable but not yet importable"
+                )
             source_path = (
                 self.settings.candidate_cache_dir
                 / "models"
                 / "incoming"
                 / workflow_id
-                / f"{decision.file_id}.stl"
+                / f"{decision.file_id}.{source_format}"
             )
             await self.repository.transition(
                 workflow_id,
@@ -145,7 +161,7 @@ class PrintingApplication:
                 cache_path = (
                     self.settings.candidate_cache_dir
                     / "models"
-                    / f"{inspection.source_digest}.stl"
+                    / f"{inspection.source_digest}.{source_format}"
                 )
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 if not cache_path.exists():
@@ -188,14 +204,27 @@ class PrintingApplication:
                     WorkflowState.VALIDATING,
                     event_kind="source.adopting_unchanged",
                 )
+                if source_format == "3mf":
+                    return await self.model_pipeline.adopt_existing_3mf(
+                        workflow_id,
+                        inspection.cached_path,
+                        provenance,
+                        printer.build_volume,
+                    )
                 return await self.model_pipeline.adopt_existing(
                     workflow_id,
                     inspection.cached_path,
                     provenance,
                     printer.build_volume,
                 )
+            if source_format != "stl":
+                raise ValidationError(
+                    "Structured 3MF sources must be adopted before part-scoped revision"
+                )
 
             selected_source = SelectedSourceSummary(
+                filename=f"source.{source_format}",
+                format=source_format,
                 candidate_id=candidate.id,
                 file_id=str(decision.file_id),
                 title=candidate.title,
@@ -262,7 +291,12 @@ class PrintingApplication:
         )
         return await self.modeling.build(handoff)
 
-    async def _refine_current(self, workflow_id: str, feedback: str) -> ModelArtifact:
+    async def _refine_current(
+        self,
+        workflow_id: str,
+        feedback: str,
+        part_id: str | None,
+    ) -> ModelArtifact:
         workflow = await self.repository.get_workflow(workflow_id)
         if workflow.active_handoff_version is None or workflow.active_artifact_version is None:
             raise ConflictError("Current artifact was not produced by a modeling handoff")
@@ -315,6 +349,7 @@ class PrintingApplication:
             feedback,
             current_source,
             old_handoff,
+            part_id,
         )
 
     async def request_revision(
@@ -322,6 +357,7 @@ class PrintingApplication:
         workflow_id: str,
         mode: RevisionMode,
         feedback: str,
+        part_id: str | None = None,
     ) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
         PrintingApplication._ensure_not_archived(workflow)
@@ -342,10 +378,16 @@ class PrintingApplication:
                 raise ConflictError(
                     "This artifact has no editable OpenSCAD source; search for a new base instead"
                 )
+            if part_id is not None and (
+                artifact.project is None
+                or all(part.id != part_id for part in artifact.project.parts)
+            ):
+                raise ValidationError(f"Part '{part_id}' is not present in the active artifact")
         revision = RevisionRequest(
             workflow_id=workflow_id,
             mode=mode,
             feedback=feedback,
+            part_id=part_id,
         )
         await self.repository.request_revision(revision)
 
@@ -457,40 +499,84 @@ class PrintingApplication:
             if source_handoff is not None
             else None
         )
-        manifest = {
-            "workflow_id": copied_workflow.id,
-            "artifact_version": 1,
-            "source_digest": source_artifact.source_digest,
-            "model_digest": source_artifact.model_digest,
-            "mesh": source_artifact.mesh.model_dump(mode="json"),
-            "provenance": source_artifact.provenance.model_dump(mode="json"),
-            "copied_from": {
+        try:
+            copied_from = {
                 "workflow_id": workflow_id,
                 "artifact_version": source_artifact.version,
                 "manifest_digest": source_artifact.manifest_digest,
-            },
-        }
-        if copied_handoff is not None:
-            manifest["handoff_digest"] = copied_handoff.digest
-        manifest_digest = canonical_digest(manifest)
-        manifest["manifest_digest"] = manifest_digest
-        try:
-            adopted_source, adopted_model, _ = self.artifacts.adopt(
-                copied_workflow.id,
-                1,
-                source_artifact.source_path,
-                source_artifact.model_path,
-                manifest,
-            )
-            copied_artifact = source_artifact.model_copy(
-                update={
+            }
+            if source_artifact.schema_version == "2":
+                source_directory = self.artifacts.artifact_directory(
+                    workflow_id,
+                    source_artifact.version,
+                )
+                staging = (
+                    self.artifacts.workflow_root(copied_workflow.id)
+                    / "staging"
+                    / "artifact-1"
+                )
+                shutil.copytree(source_directory, staging)
+                manifest_path = staging / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest.update(
+                    {
+                        "workflow_id": copied_workflow.id,
+                        "artifact_version": 1,
+                        "copied_from": copied_from,
+                        "handoff_digest": (
+                            copied_handoff.digest if copied_handoff is not None else None
+                        ),
+                    }
+                )
+                manifest.pop("manifest_digest", None)
+                manifest_digest = canonical_digest(manifest)
+                manifest["manifest_digest"] = manifest_digest
+                manifest_path.write_text(
+                    json.dumps(manifest, sort_keys=True, indent=2),
+                    encoding="utf-8",
+                )
+                adopted = self.artifacts.adopt_project(copied_workflow.id, 1, staging)
+                copied_artifact = source_artifact.model_copy(
+                    update={
+                        "workflow_id": copied_workflow.id,
+                        "version": 1,
+                        "source_path": adopted / "project" / "main.scad",
+                        "model_path": adopted / "outputs" / "model.stl",
+                        "project_path": adopted / "project" / "project.json",
+                        "three_mf_path": adopted / "outputs" / "model.3mf",
+                        "manifest_digest": manifest_digest,
+                    }
+                )
+            else:
+                manifest = {
                     "workflow_id": copied_workflow.id,
-                    "version": 1,
-                    "source_path": adopted_source,
-                    "model_path": adopted_model,
-                    "manifest_digest": manifest_digest,
+                    "artifact_version": 1,
+                    "source_digest": source_artifact.source_digest,
+                    "model_digest": source_artifact.model_digest,
+                    "mesh": source_artifact.mesh.model_dump(mode="json"),
+                    "provenance": source_artifact.provenance.model_dump(mode="json"),
+                    "copied_from": copied_from,
                 }
-            )
+                if copied_handoff is not None:
+                    manifest["handoff_digest"] = copied_handoff.digest
+                manifest_digest = canonical_digest(manifest)
+                manifest["manifest_digest"] = manifest_digest
+                adopted_source, adopted_model, _ = self.artifacts.adopt(
+                    copied_workflow.id,
+                    1,
+                    source_artifact.source_path,
+                    source_artifact.model_path,
+                    manifest,
+                )
+                copied_artifact = source_artifact.model_copy(
+                    update={
+                        "workflow_id": copied_workflow.id,
+                        "version": 1,
+                        "source_path": adopted_source,
+                        "model_path": adopted_model,
+                        "manifest_digest": manifest_digest,
+                    }
+                )
             await self.repository.create_copy(
                 copied_workflow,
                 plan,

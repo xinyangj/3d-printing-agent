@@ -35,6 +35,7 @@ class ApproveArtifactRequest(BaseModel):
 class RevisionRequestBody(BaseModel):
     mode: RevisionMode
     feedback: str = Field(min_length=1, max_length=10_000)
+    part_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 @asynccontextmanager
@@ -116,9 +117,31 @@ def create_app(container: Container | None = None) -> FastAPI:
         if artifact is not None:
             artifact_payload = artifact.model_dump(
                 mode="json",
-                exclude={"source_path", "model_path"},
+                exclude={
+                    "source_path",
+                    "model_path",
+                    "project_path",
+                    "three_mf_path",
+                },
             )
             artifact_payload["source_available"] = artifact.source_path is not None
+            artifact_payload["downloads"] = [
+                {
+                    "role": item.role,
+                    "path": item.path,
+                    "media_type": item.media_type,
+                    "part_id": item.part_id,
+                }
+                for item in artifact.files
+                if item.role
+                in {
+                    "openscad_source",
+                    "part_project",
+                    "multipart_3mf",
+                    "combined_stl",
+                    "part_stl",
+                }
+            ]
         return {
             "workflow": workflow.model_dump(mode="json"),
             "artifact": artifact_payload,
@@ -189,7 +212,7 @@ def create_app(container: Container | None = None) -> FastAPI:
         )
 
     @app.get(
-        "/api/v1/workflows/{workflow_id}/artifacts/{version}/{filename}",
+        "/api/v1/workflows/{workflow_id}/artifacts/{version}/{filename:path}",
         response_class=FileResponse,
     )
     async def artifact_file(
@@ -198,18 +221,25 @@ def create_app(container: Container | None = None) -> FastAPI:
         filename: str,
         request: Request,
     ) -> FileResponse:
-        await get_container(request).repository.get_artifact(workflow_id, version)
+        artifact = await get_container(request).repository.get_artifact(workflow_id, version)
         path = get_container(request).artifacts.resolve_artifact_file(
             workflow_id,
             version,
             filename,
         )
-        media_type = {
+        aliases = {
             "model.stl": "model/stl",
+            "model.3mf": "model/3mf",
             "source.scad": "text/plain; charset=utf-8",
             "manifest.json": "application/json",
-        }[filename]
-        return FileResponse(path, media_type=media_type, filename=filename)
+        }
+        media_type = aliases.get(filename)
+        if media_type is None:
+            media_type = next(
+                (item.media_type for item in artifact.files if item.path == filename),
+                "application/octet-stream",
+            )
+        return FileResponse(path, media_type=media_type, filename=Path(filename).name)
 
     @app.post("/api/v1/workflows/{workflow_id}/approval", status_code=202)
     async def approve_artifact(
@@ -235,6 +265,7 @@ def create_app(container: Container | None = None) -> FastAPI:
             workflow_id,
             body.mode,
             body.feedback,
+            body.part_id,
         )
         return {"status": "revision_queued"}
 

@@ -56,6 +56,7 @@ class SelectCandidateParams(BaseModel):
 
 class SubmitOpenScadSourceParams(BaseModel):
     mode: Literal["modify", "create"]
+    part_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     source_code: str = Field(min_length=1, max_length=100_000)
     design_summary: str = Field(min_length=1, max_length=2_000)
 
@@ -70,6 +71,7 @@ class _DiscoveryToolState:
 @dataclass
 class _ModelingToolState:
     handoff: ModelingHandoff
+    target_part_id: str | None = None
     artifact: ModelArtifact | None = None
     failures: list[str] = field(default_factory=list)
 
@@ -567,9 +569,10 @@ class CopilotModelingAgent:
         feedback: str,
         current_source: str,
         previous_handoff: ModelingHandoff,
+        part_id: str | None = None,
     ) -> ModelArtifact:
         workflow = await self.repository.get_workflow(handoff.workflow_id)
-        state = _ModelingToolState(handoff=handoff)
+        state = _ModelingToolState(handoff=handoff, target_part_id=part_id)
         await self.runtime.run(
             workflow,
             "modeling",
@@ -580,6 +583,7 @@ class CopilotModelingAgent:
                 "not targeted by the feedback and continue to satisfy all original constraints.\n\n"
                 f"Original requirement: {workflow.requirement}\n"
                 f"Feedback: {feedback}\n"
+                f"Target part ID: {part_id or 'entire model'}\n"
                 f"Current artifact: {artifact.model_dump_json(indent=2)}\n"
                 f"Previous handoff: {previous_handoff.model_dump_json(indent=2)}\n"
                 f"New handoff: {handoff.model_dump_json(indent=2)}\n"
@@ -612,6 +616,13 @@ class CopilotModelingAgent:
                 return ToolResult(
                     result_type="rejected",
                     text_result_for_llm=f"Expected mode '{expected_mode}'.",
+                )
+            if params.part_id != state.target_part_id:
+                return ToolResult(
+                    result_type="rejected",
+                    text_result_for_llm=(
+                        f"Expected target part '{state.target_part_id or 'entire model'}'."
+                    ),
                 )
             workflow = await self.repository.get_workflow(state.handoff.workflow_id)
             active_handoff = await self.repository.get_handoff(
@@ -655,6 +666,8 @@ class CopilotModelingAgent:
         return (
             "You are the modeling specialist for a 3D-printing workflow. You have no search, "
             "network, shell, filesystem, or printer tools. Produce complete OpenSCAD only "
-            "through submit_openscad_source. Modify mode may import only source.stl; create "
-            "mode uses no imports. Build connected, watertight geometry within constraints."
+            "through submit_openscad_source. When a target part ID is supplied, change only "
+            "that semantic part and return the same part ID. Modify mode may import only "
+            "source.stl; create mode uses no imports. Build connected, watertight geometry "
+            "within constraints."
         )

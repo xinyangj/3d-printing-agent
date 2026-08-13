@@ -43,6 +43,25 @@ type Artifact = {
     creator: string | null
     license: string | null
   }
+  project: {
+    parts: Array<{
+      id: string
+      name: string
+      geometry_kind: 'parametric' | 'imported_mesh' | 'derived_mesh'
+      annotation_origin: string
+      confidence: number
+      material_id: string | null
+    }>
+    instances: Array<{ id: string; part_id: string; name: string }>
+    materials: Array<{ id: string; name: string; color: string }>
+    warnings: string[]
+  } | null
+  downloads: Array<{
+    role: string
+    path: string
+    media_type: string
+    part_id: string | null
+  }>
 }
 
 type PrintJob = {
@@ -700,6 +719,7 @@ function WorkflowPanel({
   const queryClient = useQueryClient()
   const [feedback, setFeedback] = useState('')
   const [sourceOpen, setSourceOpen] = useState(false)
+  const [selectedPartId, setSelectedPartId] = useState<string | null>(null)
   const workflowQuery = useQuery({
     queryKey: ['workflow', workflowId],
     queryFn: () => api<WorkflowResponse>(`/workflows/${workflowId}`),
@@ -714,6 +734,12 @@ function WorkflowPanel({
   const data = workflowQuery.data
   const artifact = data?.artifact
   const workflow = data?.workflow
+  useEffect(() => {
+    const firstPart = artifact?.project?.parts[0]?.id ?? null
+    if (firstPart && !artifact?.project?.parts.some((part) => part.id === selectedPartId)) {
+      setSelectedPartId(firstPart)
+    }
+  }, [artifact, selectedPartId])
   const canInspect = Boolean(workflow && artifact && INSPECTABLE_STATE.has(workflow.state))
   const modelUrl = artifact
     ? `${API}/workflows/${workflowId}/artifacts/${artifact.version}/model.stl`
@@ -747,7 +773,11 @@ function WorkflowPanel({
     mutationFn: (mode: 'refine_current' | 'search_new_base') =>
       api(`/workflows/${workflowId}/revisions`, {
         method: 'POST',
-        body: JSON.stringify({ mode, feedback }),
+        body: JSON.stringify({
+          mode,
+          feedback,
+          part_id: mode === 'refine_current' ? selectedPartId : null,
+        }),
       }),
     onSuccess: () => {
       setFeedback('')
@@ -927,6 +957,64 @@ function WorkflowPanel({
                   </a>
                 )}
               </div>
+              {artifact.project && (
+                <div className="panel-section">
+                  <span className="section-label">Editable parts</span>
+                  <div className="part-list">
+                    {artifact.project.parts.map((part) => {
+                      const instanceCount = artifact.project!.instances.filter(
+                        (instance) => instance.part_id === part.id,
+                      ).length
+                      const material = artifact.project!.materials.find(
+                        (item) => item.id === part.material_id,
+                      )
+                      return (
+                        <button
+                          className={`part-row ${selectedPartId === part.id ? 'selected' : ''}`}
+                          key={part.id}
+                          onClick={() => setSelectedPartId(part.id)}
+                        >
+                          <span
+                            className="part-color"
+                            style={{ background: material?.color ?? '#b7c4d4' }}
+                          />
+                          <span>
+                            <strong>{part.name}</strong>
+                            <small>
+                              {part.geometry_kind.replaceAll('_', ' ')} · {instanceCount}{' '}
+                              {instanceCount === 1 ? 'instance' : 'instances'} ·{' '}
+                              {Math.round(part.confidence * 100)}% confidence
+                            </small>
+                            <small>{part.annotation_origin.replaceAll('_', ' ')}</small>
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                  {artifact.project.warnings.map((warning) => (
+                    <p className="part-warning" key={warning}>
+                      {warning}
+                    </p>
+                  ))}
+                </div>
+              )}
+              {artifact.downloads.length > 0 && (
+                <div className="panel-section">
+                  <span className="section-label">Downloads</span>
+                  <div className="download-list">
+                    {artifact.downloads.map((download) => (
+                      <a
+                        key={download.path}
+                        href={`${API}/workflows/${workflowId}/artifacts/${artifact.version}/${download.path}`}
+                        download
+                      >
+                        {download.role.replaceAll('_', ' ')}
+                        {download.part_id ? ` · ${download.part_id}` : ''}
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className="digest">
                 <span>Immutable manifest</span>
                 <code>{artifact.manifest_digest}</code>
@@ -975,6 +1063,14 @@ function WorkflowPanel({
                   placeholder="Describe what should change…"
                   rows={3}
                 />
+                {artifact.project && selectedPartId && (
+                  <p className="revision-target">
+                    Editing part:{' '}
+                    <strong>
+                      {artifact.project.parts.find((part) => part.id === selectedPartId)?.name}
+                    </strong>
+                  </p>
+                )}
                 <div>
                   <button
                     className="secondary-action"

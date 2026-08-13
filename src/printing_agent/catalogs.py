@@ -21,7 +21,7 @@ from printing_agent.domain import (
 )
 from printing_agent.errors import ConfigurationError, ExternalServiceError, PolicyViolationError
 
-_PRINTABLE_FORMATS = {"stl"}
+_SOURCE_FORMATS = {"3mf", "scad", "stl", "step", "stp"}
 _DERIVATIVE_BLOCKING_LICENSES = {"cc-by-nd", "creative commons - attribution - no derivatives"}
 
 
@@ -188,8 +188,8 @@ class ThingiverseCatalog:
         selected = next((item for item in candidate.files if item.id == file_id), None)
         if selected is None:
             raise PolicyViolationError("Selected file is not part of the inspected candidate")
-        if selected.format.lower().lstrip(".") not in _PRINTABLE_FORMATS:
-            raise PolicyViolationError("The initial version accepts STL source models only")
+        if selected.format.lower().lstrip(".") not in _SOURCE_FORMATS:
+            raise PolicyViolationError("The selected source format is not supported")
 
         url = selected.download_url or f"/files/{selected.id}/download"
         parsed = urlparse(url)
@@ -315,7 +315,7 @@ class ThingiverseCatalog:
             return None
         name = str(item.get("name") or item.get("filename") or "")
         extension = str(item.get("extension") or Path(name).suffix.lstrip(".")).lower()
-        if extension not in _PRINTABLE_FORMATS:
+        if extension not in _SOURCE_FORMATS:
             return None
         download_url = item.get("download_url") or item.get("url")
         return CandidateFile(

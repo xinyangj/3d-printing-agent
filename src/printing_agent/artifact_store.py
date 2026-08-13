@@ -81,15 +81,57 @@ class ArtifactStore:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
 
+    def adopt_project(
+        self,
+        workflow_id: str,
+        version: int,
+        project_directory: Path,
+    ) -> Path:
+        destination = self.artifact_directory(workflow_id, version)
+        if destination.exists():
+            raise PolicyViolationError(f"Artifact version {version} already exists")
+        if not (project_directory / "manifest.json").is_file():
+            raise PolicyViolationError("Multipart artifact manifest is missing")
+        temporary = destination.with_name(f".{destination.name}.tmp")
+        try:
+            shutil.copytree(project_directory, temporary)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(temporary, destination)
+            return destination
+        except Exception:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+
     def resolve_artifact_file(
         self,
         workflow_id: str,
         version: int,
         filename: str,
     ) -> Path:
-        if filename not in {"source.scad", "model.stl", "manifest.json"}:
+        artifact_directory = self.artifact_directory(workflow_id, version)
+        aliases = {
+            "source.scad": "project/main.scad",
+            "model.stl": "outputs/model.stl",
+            "model.3mf": "outputs/model.3mf",
+        }
+        requested = aliases.get(filename, filename).replace("\\", "/")
+        if Path(requested).is_absolute() or ".." in Path(requested).parts:
             raise PolicyViolationError("Unsupported artifact filename")
-        path = (self.artifact_directory(workflow_id, version) / filename).resolve()
-        if self.root not in path.parents or not path.is_file():
+        manifest_path = artifact_directory / "manifest.json"
+        allowed = {"manifest.json", "source.scad", "model.stl"}
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                allowed.update(
+                    item["path"]
+                    for item in manifest.get("files", [])
+                    if isinstance(item, dict) and isinstance(item.get("path"), str)
+                )
+            except (json.JSONDecodeError, OSError, TypeError) as exc:
+                raise PolicyViolationError("Artifact manifest is invalid") from exc
+        if requested not in allowed and filename not in allowed:
+            raise PolicyViolationError("Artifact file is not listed in the manifest")
+        path = (artifact_directory / requested).resolve()
+        if artifact_directory.resolve() not in path.parents or not path.is_file():
             raise PolicyViolationError("Artifact path is not available")
         return path

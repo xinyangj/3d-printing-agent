@@ -57,7 +57,21 @@ async def test_thingiverse_search_and_page_gallery_are_normalized(
                         "extension": "stl",
                         "size": 100,
                         "download_url": "https://api.thingiverse.com/files/9/download",
-                    }
+                    },
+                    {
+                        "id": 10,
+                        "name": "hook.3mf",
+                        "extension": "3mf",
+                        "size": 200,
+                        "download_url": "https://api.thingiverse.com/files/10/download",
+                    },
+                    {
+                        "id": 11,
+                        "name": "hook.scad",
+                        "extension": "scad",
+                        "size": 50,
+                        "download_url": "https://api.thingiverse.com/files/11/download",
+                    },
                 ],
             )
         if path == "/things/42/images":
@@ -108,6 +122,7 @@ async def test_thingiverse_search_and_page_gallery_are_normalized(
 
     assert candidates[0].title == "Headphone hook"
     assert inspection.candidate.files[0].id == "9"
+    assert {item.format for item in inspection.candidate.files} == {"stl", "3mf", "scad"}
     assert inspection.candidate.instructions == "Use two screws"
     assert len(images) == 1
     assert images[0].mime_type == "image/jpeg"

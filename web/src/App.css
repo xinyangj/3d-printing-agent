@@ -689,6 +689,62 @@ select:focus {
   margin: 9px 0 0;
 }
 
+.part-list,
+.download-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.part-row {
+  align-items: center;
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  cursor: pointer;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 14px 1fr;
+  padding: 10px;
+  text-align: left;
+}
+
+.part-row.selected {
+  border-color: var(--teal-dark);
+  box-shadow: 0 0 0 2px var(--teal-pale);
+}
+
+.part-row span:last-child {
+  display: grid;
+  gap: 3px;
+}
+
+.part-row small {
+  color: var(--ink-soft);
+  font-size: 10px;
+  text-transform: capitalize;
+}
+
+.part-color {
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  height: 12px;
+  width: 12px;
+}
+
+.part-warning,
+.revision-target {
+  color: var(--ink-soft);
+  font-size: 12px;
+  margin: 10px 0 0;
+}
+
+.download-list a {
+  color: var(--teal-dark);
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
 .metric-grid {
   display: grid;
   gap: 1px;

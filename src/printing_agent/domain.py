@@ -80,6 +80,20 @@ class RevisionMode(StrEnum):
     SEARCH_NEW_BASE = "search_new_base"
 
 
+class PartGeometryKind(StrEnum):
+    PARAMETRIC = "parametric"
+    IMPORTED_MESH = "imported_mesh"
+    DERIVED_MESH = "derived_mesh"
+
+
+class AnnotationOrigin(StrEnum):
+    SOURCE_ANNOTATION = "source_annotation"
+    THREE_MF_STRUCTURE = "3mf_structure"
+    CATALOG_METADATA = "catalog_metadata"
+    TOPOLOGY_INFERENCE = "topology_inference"
+    AGENT_INFERENCE = "agent_inference"
+
+
 class Dimensions(FrozenModel):
     width_mm: float = Field(gt=0)
     depth_mm: float = Field(gt=0)
@@ -189,7 +203,8 @@ class DiscoveryDecision(FrozenModel):
 
 
 class SelectedSourceSummary(FrozenModel):
-    filename: Literal["source.stl"] = "source.stl"
+    filename: str = Field(default="source.stl", min_length=1, max_length=255)
+    format: str = Field(default="stl", min_length=1, max_length=20)
     candidate_id: str
     file_id: str
     title: str
@@ -205,6 +220,10 @@ class PrinterCapabilitySummary(FrozenModel):
     build_volume: Dimensions
     accepted_formats: set[str]
     supported_materials: set[str] = Field(default_factory=set)
+    supports_multipart_3mf: bool = False
+    supports_color: bool = False
+    supports_material_assignments: bool = False
+    slices_locally: bool = False
 
 
 class ModelingHandoff(FrozenModel):
@@ -243,15 +262,121 @@ class ArtifactProvenance(FrozenModel):
     source_digest: str | None = None
 
 
+class SourceAsset(FrozenModel):
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    filename: str = Field(min_length=1, max_length=255)
+    format: str = Field(min_length=1, max_length=20)
+    digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    path: str = Field(min_length=1, max_length=500)
+    role: str = Field(min_length=1, max_length=100)
+    original_cad: bool = False
+    annotation_origin: AnnotationOrigin
+
+
+class MaterialDefinition(FrozenModel):
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    name: str = Field(min_length=1, max_length=100)
+    color: str = Field(default="#b7c4d4", pattern=r"^#[0-9a-fA-F]{6}$")
+    printing_material: str | None = Field(default=None, max_length=50)
+
+
+class PartDefinition(FrozenModel):
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    name: str = Field(min_length=1, max_length=200)
+    geometry_kind: PartGeometryKind
+    module_name: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    source_asset_id: str | None = None
+    material_id: str | None = None
+    parameters: dict[str, float | int | str | bool] = Field(default_factory=dict)
+    annotation_origin: AnnotationOrigin
+    confidence: float = Field(ge=0, le=1)
+
+
+class PartInstance(FrozenModel):
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    part_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    name: str = Field(min_length=1, max_length=200)
+    transform: tuple[
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+        float,
+    ] = (1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)
+    parent_id: str | None = None
+    annotation_origin: AnnotationOrigin
+    confidence: float = Field(ge=0, le=1)
+
+
+class PartProject(FrozenModel):
+    schema_version: Literal["1"] = "1"
+    units: Literal["millimeter"] = "millimeter"
+    parts: list[PartDefinition] = Field(min_length=1, max_length=500)
+    instances: list[PartInstance] = Field(min_length=1, max_length=5_000)
+    materials: list[MaterialDefinition] = Field(default_factory=list, max_length=100)
+    source_assets: list[SourceAsset] = Field(default_factory=list, max_length=500)
+    warnings: list[str] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_references(self) -> PartProject:
+        part_ids = [part.id for part in self.parts]
+        if len(part_ids) != len(set(part_ids)):
+            raise ValueError("Part IDs must be unique")
+        instance_ids = [instance.id for instance in self.instances]
+        if len(instance_ids) != len(set(instance_ids)):
+            raise ValueError("Part instance IDs must be unique")
+        if any(instance.part_id not in part_ids for instance in self.instances):
+            raise ValueError("Every instance must reference a known part")
+        material_ids = {material.id for material in self.materials}
+        if any(part.material_id not in material_ids for part in self.parts if part.material_id):
+            raise ValueError("Every part material must reference a known material")
+        asset_ids = {asset.id for asset in self.source_assets}
+        if any(
+            part.source_asset_id not in asset_ids
+            for part in self.parts
+            if part.source_asset_id
+        ):
+            raise ValueError("Every part source asset must reference a known source asset")
+        return self
+
+
+class ArtifactFile(FrozenModel):
+    role: str = Field(min_length=1, max_length=100)
+    path: str = Field(min_length=1, max_length=500)
+    media_type: str = Field(min_length=1, max_length=100)
+    digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    size_bytes: int = Field(ge=0)
+    part_id: str | None = None
+
+
 class ModelArtifact(FrozenModel):
+    schema_version: Literal["1", "2"] = "1"
     workflow_id: str
     version: int = Field(ge=1)
     source_path: Path | None = None
     model_path: Path
+    project_path: Path | None = None
+    three_mf_path: Path | None = None
     source_digest: str | None = None
     model_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    project_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    three_mf_digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     manifest_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     mesh: MeshReport
+    project: PartProject | None = None
+    part_meshes: dict[str, MeshReport] = Field(default_factory=dict)
+    files: list[ArtifactFile] = Field(default_factory=list)
     provenance: ArtifactProvenance
     created_at: datetime = Field(default_factory=utc_now)
 
@@ -294,6 +419,7 @@ class RevisionRequest(FrozenModel):
     workflow_id: str
     mode: RevisionMode
     feedback: str = Field(min_length=1, max_length=10_000)
+    part_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     created_at: datetime = Field(default_factory=utc_now)
 
 

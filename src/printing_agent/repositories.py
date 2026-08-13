@@ -146,6 +146,7 @@ CREATE TABLE IF NOT EXISTS revision_requests (
     workflow_id TEXT NOT NULL REFERENCES workflows(id),
     mode TEXT NOT NULL,
     feedback TEXT NOT NULL,
+    part_id TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -209,6 +210,10 @@ class WorkflowRepository:
             columns = {row[1] for row in await cursor.fetchall()}
             if "archived_at" not in columns:
                 await db.execute("ALTER TABLE workflows ADD COLUMN archived_at TEXT")
+            cursor = await db.execute("PRAGMA table_info(revision_requests)")
+            revision_columns = {row[1] for row in await cursor.fetchall()}
+            if "part_id" not in revision_columns:
+                await db.execute("ALTER TABLE revision_requests ADD COLUMN part_id TEXT")
             await db.commit()
 
     async def _connect(self) -> aiosqlite.Connection:
@@ -1043,13 +1048,14 @@ class WorkflowRepository:
             await db.execute("BEGIN IMMEDIATE")
             await db.execute(
                 """
-                INSERT INTO revision_requests (workflow_id, mode, feedback, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO revision_requests (workflow_id, mode, feedback, part_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     revision.workflow_id,
                     revision.mode.value,
                     revision.feedback,
+                    revision.part_id,
                     revision.created_at.isoformat(),
                 ),
             )
@@ -1085,13 +1091,14 @@ class WorkflowRepository:
             assert_transition(current_state, WorkflowState.REVISION_REQUESTED)
             await db.execute(
                 """
-                INSERT INTO revision_requests (workflow_id, mode, feedback, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO revision_requests (workflow_id, mode, feedback, part_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     revision.workflow_id,
                     revision.mode.value,
                     revision.feedback,
+                    revision.part_id,
                     revision.created_at.isoformat(),
                 ),
             )
@@ -1120,7 +1127,11 @@ class WorkflowRepository:
                 revision.workflow_id,
                 "revision.requested",
                 WorkflowState.REVISION_REQUESTED,
-                {"mode": revision.mode.value, "feedback": revision.feedback},
+                {
+                    "mode": revision.mode.value,
+                    "feedback": revision.feedback,
+                    "part_id": revision.part_id,
+                },
             )
             await self._insert_work_item(db, item)
             await db.commit()
@@ -1245,6 +1256,7 @@ class WorkflowRepository:
                 workflow_id=row["workflow_id"],
                 mode=RevisionMode(row["mode"]),
                 feedback=row["feedback"],
+                part_id=row["part_id"],
                 created_at=row["created_at"],
             )
         finally:

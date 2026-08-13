@@ -38,6 +38,22 @@ class PrinterRegistry:
         return [await adapter.capabilities() for adapter in self._adapters.values()]  # type: ignore[attr-defined]
 
 
+def select_submission_file(
+    artifact: ModelArtifact,
+    capabilities: PrinterCapabilitySummary,
+) -> Path:
+    if (
+        "3mf" in capabilities.accepted_formats
+        and capabilities.supports_multipart_3mf
+        and artifact.three_mf_path is not None
+        and artifact.three_mf_path.is_file()
+    ):
+        return artifact.three_mf_path
+    if "stl" in capabilities.accepted_formats and artifact.model_path.is_file():
+        return artifact.model_path
+    raise ValidationError("Printer does not accept an available artifact format")
+
+
 class SimulatedPrinterAdapter:
     name = "simulator"
 
@@ -61,12 +77,12 @@ class SimulatedPrinterAdapter:
             build_volume=self._build_volume,
             accepted_formats={"stl"},
             supported_materials={"pla", "petg", "abs", "tpu"},
+            slices_locally=True,
         )
 
     async def validate(self, artifact: ModelArtifact, settings: PrintSettings) -> None:
         capabilities = await self.capabilities()
-        if artifact.model_path.suffix.lower().lstrip(".") not in capabilities.accepted_formats:
-            raise ValidationError("Simulator accepts STL artifacts only")
+        select_submission_file(artifact, capabilities)
         if not artifact.mesh.dimensions.fits(capabilities.build_volume):
             raise ValidationError("Artifact does not fit the simulator build volume")
         if (
@@ -91,7 +107,8 @@ class SimulatedPrinterAdapter:
         external_id = new_id()
         job_dir = self.spool_dir / external_id
         job_dir.mkdir(parents=False, exist_ok=False)
-        shutil.copy2(artifact.model_path, job_dir / "model.stl")
+        selected = select_submission_file(artifact, await self.capabilities())
+        shutil.copy2(selected, job_dir / selected.name)
         now = utc_now()
         job = PrintJob(
             workflow_id=workflow_id,

@@ -19,13 +19,18 @@ from printing_agent.domain import (
     ModelingHandoff,
     SelectedSourceInspection,
     WorkflowState,
-    canonical_digest,
 )
 from printing_agent.errors import (
     BudgetExhaustedError,
     ExternalServiceError,
     PolicyViolationError,
     ValidationError,
+)
+from printing_agent.multipart import (
+    ThreeMFService,
+    single_part_project,
+    write_project_artifact,
+    write_structured_import_artifact,
 )
 from printing_agent.repositories import WorkflowRepository
 
@@ -231,8 +236,15 @@ class TrimeshSelectedSourceInspector:
         path: Path,
         build_volume: Dimensions,
     ) -> SelectedSourceInspection:
+        temporary_stl: Path | None = None
         try:
-            mesh = await self.mesh_inspector.inspect(path)
+            if path.suffix.casefold() == ".3mf":
+                _, _, combined = await asyncio.to_thread(ThreeMFService().read, path)
+                temporary_stl = path.with_suffix(".inspection.stl")
+                await asyncio.to_thread(combined.export, temporary_stl)
+                mesh = await self.mesh_inspector.inspect(temporary_stl)
+            else:
+                mesh = await self.mesh_inspector.inspect(path)
             accepted = mesh.finite and mesh.triangle_count > 0
             reason = None
         except ValidationError as exc:
@@ -246,6 +258,9 @@ class TrimeshSelectedSourceInspector:
             )
             accepted = False
             reason = exc.message
+        finally:
+            if temporary_stl is not None:
+                temporary_stl.unlink(missing_ok=True)
         return SelectedSourceInspection(
             workflow_id=workflow_id,
             candidate_id=candidate_id,
@@ -290,7 +305,8 @@ class ModelPipeline:
             handoff.workflow_id,
             handoff.version,
         )
-        source_digest = hashlib.sha256(source_code.encode()).hexdigest()
+        canonical_source = f"module base_model() {{\n{source_code}\n}}\nbase_model();\n"
+        source_digest = hashlib.sha256(canonical_source.encode()).hexdigest()
         await self.repository.save_source_attempt(
             handoff.workflow_id,
             handoff.version,
@@ -307,7 +323,7 @@ class ModelPipeline:
                 attempt,
             )
             source_path = attempt_dir / "source.scad"
-            source_path.write_text(source_code, encoding="utf-8")
+            source_path.write_text(canonical_source, encoding="utf-8")
             if handoff.selected_source is not None:
                 selected_path = (
                     self.settings.candidate_cache_dir
@@ -345,37 +361,51 @@ class ModelPipeline:
 
             model_path = attempt_dir / "model.stl"
             temporary_model.replace(model_path)
-            model_digest = sha256_file(model_path)
             version = await self.repository.next_artifact_version(handoff.workflow_id)
             provenance = self._provenance(handoff)
-            manifest = {
-                "workflow_id": handoff.workflow_id,
-                "artifact_version": version,
-                "handoff_digest": handoff.digest,
-                "source_digest": source_digest,
-                "model_digest": model_digest,
-                "mesh": mesh.model_dump(mode="json"),
-                "provenance": provenance.model_dump(mode="json"),
-                "renderer_diagnostics": diagnostics[-2_000:],
-            }
-            manifest_digest = canonical_digest(manifest)
-            manifest["manifest_digest"] = manifest_digest
-            adopted_source, adopted_model, _ = self.artifacts.adopt(
-                handoff.workflow_id,
-                version,
-                source_path,
-                model_path,
-                manifest,
+            project = single_part_project(
+                source_digest=source_digest,
+                imported=False,
+                source_filename="main.scad",
             )
-            artifact = ModelArtifact(
+            staging = attempt_dir / "artifact"
+            manifest, files = await asyncio.to_thread(
+                write_project_artifact,
+                directory=staging,
                 workflow_id=handoff.workflow_id,
                 version=version,
-                source_path=adopted_source,
-                model_path=adopted_model,
+                project=project,
+                source_path=source_path,
+                model_path=model_path,
+                mesh=mesh,
+                provenance=provenance,
+                handoff_digest=handoff.digest,
+                diagnostics=diagnostics,
+                imported=False,
+            )
+            adopted = self.artifacts.adopt_project(
+                handoff.workflow_id,
+                version,
+                staging,
+            )
+            manifest_digest = str(manifest["manifest_digest"])
+            artifact = ModelArtifact(
+                schema_version="2",
+                workflow_id=handoff.workflow_id,
+                version=version,
+                source_path=adopted / "project" / "main.scad",
+                model_path=adopted / "outputs" / "model.stl",
+                project_path=adopted / "project" / "project.json",
+                three_mf_path=adopted / "outputs" / "model.3mf",
                 source_digest=source_digest,
-                model_digest=model_digest,
+                model_digest=str(manifest["model_digest"]),
+                project_digest=str(manifest["project_digest"]),
+                three_mf_digest=str(manifest["three_mf_digest"]),
                 manifest_digest=manifest_digest,
                 mesh=mesh,
+                project=project,
+                part_meshes={"base_model": mesh},
+                files=files,
                 provenance=provenance,
             )
             await self.repository.save_artifact(artifact)
@@ -429,30 +459,54 @@ class ModelPipeline:
             raise ValidationError("Selected model exceeds the target printer build volume")
         version = await self.repository.next_artifact_version(workflow_id)
         model_digest = sha256_file(model_path)
-        manifest = {
-            "workflow_id": workflow_id,
-            "artifact_version": version,
-            "source_digest": None,
-            "model_digest": model_digest,
-            "mesh": mesh.model_dump(mode="json"),
-            "provenance": provenance.model_dump(mode="json"),
-        }
-        manifest_digest = canonical_digest(manifest)
-        manifest["manifest_digest"] = manifest_digest
-        _, adopted_model, _ = self.artifacts.adopt(
-            workflow_id,
-            version,
-            None,
-            model_path,
-            manifest,
+        project = single_part_project(
+            source_digest=model_digest,
+            imported=True,
+            source_filename=model_path.name,
         )
-        artifact = ModelArtifact(
+        staging = (
+            self.artifacts.workflow_root(workflow_id)
+            / "staging"
+            / f"artifact-{version}"
+        )
+        manifest, files = await asyncio.to_thread(
+            write_project_artifact,
+            directory=staging,
             workflow_id=workflow_id,
             version=version,
-            model_path=adopted_model,
-            model_digest=model_digest,
+            project=project,
+            source_path=model_path,
+            model_path=model_path,
+            mesh=mesh,
+            provenance=provenance,
+            handoff_digest=None,
+            diagnostics=None,
+            imported=True,
+        )
+        adopted = self.artifacts.adopt_project(
+            workflow_id,
+            version,
+            staging,
+        )
+        source_path = adopted / "project" / "main.scad"
+        manifest_digest = str(manifest["manifest_digest"])
+        artifact = ModelArtifact(
+            schema_version="2",
+            workflow_id=workflow_id,
+            version=version,
+            source_path=source_path,
+            model_path=adopted / "outputs" / "model.stl",
+            project_path=adopted / "project" / "project.json",
+            three_mf_path=adopted / "outputs" / "model.3mf",
+            source_digest=sha256_file(source_path),
+            model_digest=str(manifest["model_digest"]),
+            project_digest=str(manifest["project_digest"]),
+            three_mf_digest=str(manifest["three_mf_digest"]),
             manifest_digest=manifest_digest,
             mesh=mesh,
+            project=project,
+            part_meshes={"base_model": mesh},
+            files=files,
             provenance=provenance,
         )
         await self.repository.save_artifact(artifact)
@@ -461,6 +515,87 @@ class ModelPipeline:
             WorkflowState.AWAITING_APPROVAL,
             event_kind="artifact.ready",
             payload={"artifact_version": version, "manifest_digest": manifest_digest},
+        )
+        return artifact
+
+    async def adopt_existing_3mf(
+        self,
+        workflow_id: str,
+        source_path: Path,
+        provenance: ArtifactProvenance,
+        build_volume: Dimensions,
+    ) -> ModelArtifact:
+        version = await self.repository.next_artifact_version(workflow_id)
+        project, part_meshes, combined_mesh = await asyncio.to_thread(
+            ThreeMFService().read,
+            source_path,
+        )
+        workspace = (
+            self.artifacts.workflow_root(workflow_id)
+            / "staging"
+            / f"three-mf-{version}"
+        )
+        inspection_directory = workspace / "inspection"
+        inspection_directory.mkdir(parents=True, exist_ok=False)
+        combined_path = inspection_directory / "model.stl"
+        await asyncio.to_thread(combined_mesh.export, combined_path)
+        mesh = await self.mesh_inspector.inspect(combined_path)
+        if not mesh.dimensions.fits(build_volume):
+            raise ValidationError("Selected 3MF exceeds the target printer build volume")
+        part_reports: dict[str, MeshReport] = {}
+        for part_id, part_mesh in part_meshes.items():
+            part_path = inspection_directory / f"{part_id}.stl"
+            await asyncio.to_thread(part_mesh.export, part_path)
+            report = await self.mesh_inspector.inspect(part_path)
+            if not report.finite or report.triangle_count <= 0:
+                raise ValidationError(f"3MF part '{part_id}' is invalid")
+            part_reports[part_id] = report
+
+        staging = workspace / "artifact"
+        manifest, files = await asyncio.to_thread(
+            write_structured_import_artifact,
+            directory=staging,
+            workflow_id=workflow_id,
+            version=version,
+            project=project,
+            source_path=source_path,
+            part_meshes=part_meshes,
+            combined_mesh=combined_mesh,
+            mesh=mesh,
+            part_reports=part_reports,
+            provenance=provenance,
+        )
+        adopted = self.artifacts.adopt_project(workflow_id, version, staging)
+        adopted_source = adopted / "project" / "main.scad"
+        artifact = ModelArtifact(
+            schema_version="2",
+            workflow_id=workflow_id,
+            version=version,
+            source_path=adopted_source,
+            model_path=adopted / "outputs" / "model.stl",
+            project_path=adopted / "project" / "project.json",
+            three_mf_path=adopted / "outputs" / "model.3mf",
+            source_digest=sha256_file(adopted_source),
+            model_digest=str(manifest["model_digest"]),
+            project_digest=str(manifest["project_digest"]),
+            three_mf_digest=str(manifest["three_mf_digest"]),
+            manifest_digest=str(manifest["manifest_digest"]),
+            mesh=mesh,
+            project=project,
+            part_meshes=part_reports,
+            files=files,
+            provenance=provenance,
+        )
+        await self.repository.save_artifact(artifact)
+        await self.repository.transition(
+            workflow_id,
+            WorkflowState.AWAITING_APPROVAL,
+            event_kind="artifact.ready",
+            payload={
+                "artifact_version": version,
+                "manifest_digest": artifact.manifest_digest,
+                "part_count": len(project.parts),
+            },
         )
         return artifact
 
