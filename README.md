@@ -1,1 +1,193 @@
-# 3d-printing-agent
+# 3D Printing Agent
+
+A printer-neutral agent that turns a text requirement into an inspected, approved, and printable 3D model.
+
+The system uses two isolated GitHub Copilot SDK sessions:
+
+1. **Discovery** searches Thingiverse through constrained tools, inspects model-page text and creator gallery images, and selects a close model or decides to create one.
+2. **Modeling** receives a validated, immutable handoff and creates or modifies OpenSCAD. It cannot search, access arbitrary files, or contact a printer.
+
+Generated code is rendered and mesh-validated by application code. A user must inspect and approve the exact immutable artifact in the React/Three.js web interface before a printer adapter can submit it.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    UI[React + Three.js] -->|REST + SSE| API[FastAPI]
+    API --> APP[Application workflow]
+    APP --> DISCOVERY[Copilot discovery session]
+    DISCOVERY -->|search / page inspection| TV[Thingiverse adapter]
+    APP --> HANDOFF[Versioned modeling handoff]
+    HANDOFF --> MODELING[Copilot modeling session]
+    MODELING -->|OpenSCAD source tool| PIPELINE[Policy + render + mesh validation]
+    PIPELINE --> ARTIFACT[Immutable STL artifact]
+    ARTIFACT --> APPROVAL[Exact-digest approval]
+    APPROVAL --> REGISTRY[Printer adapter registry]
+    REGISTRY --> SIM[Persistent simulator]
+    REGISTRY -.-> VENDOR[Future printer adapters]
+    APP --> DB[(SQLite + artifact files)]
+```
+
+### Enforced boundaries
+
+- Copilot receives only role-specific Pydantic tools; the SDK runs in `empty` mode without shell, generic filesystem, web, MCP, or printer tools.
+- Thingiverse credentials remain in the server. They are not sent to gallery or download CDN hosts.
+- Catalog content is treated as untrusted evidence. Search/inspection counts, image sizes, download sizes, hosts, and candidate identifiers are validated by server code.
+- Discovery and modeling share no conversation history. Their only bridge is a schema-versioned, canonical-hash `ModelingHandoff`.
+- OpenSCAD source can enter the system only through `submit_openscad_source`. Assistant prose is never adopted.
+- OpenSCAD runs without a shell, in an isolated directory, with fixed arguments and a timeout.
+- Final STL files must be parseable, finite, watertight, positive-volume, dimensionally valid, and within the target build volume.
+- Approval binds to a manifest digest containing the exact source, STL, mesh report, provenance, workflow, and artifact version.
+- Printer submission uses a stable idempotency key to prevent duplicate physical jobs.
+
+## Workflow
+
+1. The web app submits a text requirement and target printer.
+2. The durable worker starts the discovery Copilot session.
+3. Discovery calls `search_model_catalog` and `inspect_model_candidate`. It can refine the query over multiple rounds.
+4. Candidate inspection uses the Thingiverse introduction, instructions, file list, attribution/license, popularity signals, and sanitized creator gallery images. The original STL is not downloaded during comparison.
+5. Discovery selects an inspected model/file or creation from scratch.
+6. A provisional source is downloaded and technically inspected. An invalid file returns the discovery session to search; an accepted one enters an immutable modeling handoff.
+7. A separate modeling session submits complete OpenSCAD. Rejected source receives bounded renderer/mesh diagnostics and may be repaired within the attempt budget.
+8. The web interface displays the final STL, dimensions, mesh metrics, provenance, source, and artifact digest.
+9. The user can refine the current model, search for a different base, or approve the exact artifact.
+10. After approval, the selected printer adapter validates and submits the job. SSE reports status through completion.
+
+## Requirements
+
+- Python 3.11+
+- Node.js 20+
+- [OpenSCAD](https://openscad.org/) available on `PATH` or configured explicitly
+- A GitHub account entitled to use Copilot
+- A [Thingiverse developer token](https://www.thingiverse.com/developers)
+
+## Setup
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python -m pip install -e ".[dev]"
+.\.venv\Scripts\python -m copilot download-runtime
+
+Copy-Item .env.example .env
+# Set PRINTING_AGENT_THINGIVERSE_TOKEN in .env
+
+Set-Location web
+npm.cmd install
+npm.cmd run build
+Set-Location ..
+```
+
+The Copilot SDK uses the currently signed-in Copilot CLI user by default. `PRINTING_AGENT_COPILOT_MODEL` can select a model; leaving it empty uses the SDK default.
+
+For a development frontend with hot reload:
+
+```powershell
+# Terminal 1
+.\.venv\Scripts\printing-agent-api.exe
+
+# Terminal 2
+Set-Location web
+npm.cmd run dev
+```
+
+Open <http://localhost:5173>. Vite proxies `/api` to FastAPI.
+
+For a single local process, build the frontend and run:
+
+```powershell
+Set-Location web
+npm.cmd run build
+Set-Location ..
+.\.venv\Scripts\printing-agent-api.exe
+```
+
+Open <http://127.0.0.1:8000>. FastAPI serves `web/dist` when present.
+
+## Configuration
+
+All settings use the `PRINTING_AGENT_` prefix. See [`.env.example`](.env.example).
+
+| Setting | Purpose |
+|---|---|
+| `THINGIVERSE_TOKEN` | Server-side Thingiverse API token |
+| `OPENSCAD_PATH` | OpenSCAD executable path |
+| `COPILOT_MODEL` | Optional Copilot model identifier |
+| `DATABASE_URL` | SQLite database path |
+| `ARTIFACT_DIR` | Immutable artifact storage |
+| `CANDIDATE_CACHE_DIR` | Sanitized gallery and verified source cache |
+| `SIMULATOR_SPOOL_DIR` | Persistent simulated printer jobs |
+| `SEARCH_BUDGET` | Distinct searches per preparation cycle |
+| `INSPECTION_BUDGET` | Candidate page inspections per cycle |
+| `GENERATION_ATTEMPT_BUDGET` | OpenSCAD submissions per handoff |
+| `CORS_ORIGINS` | Allowed development frontend origins |
+
+## CLI
+
+```powershell
+printing-agent serve
+printing-agent create "Create a 30 mm cable clip in PLA" --printer simulator
+printing-agent get <workflow-id>
+printing-agent approve <workflow-id> <artifact-version> <manifest-digest>
+```
+
+The web interface is the recommended client because it provides mandatory 3D inspection.
+
+## HTTP API
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/workflows` | Start model preparation |
+| `GET` | `/api/v1/workflows/{id}` | Read workflow, artifact metadata, and print job |
+| `GET` | `/api/v1/workflows/{id}/events` | Stream resumable SSE events |
+| `GET` | `/api/v1/workflows/{id}/artifacts/{version}/model.stl` | Load the exact model |
+| `GET` | `/api/v1/workflows/{id}/artifacts/{version}/source.scad` | Inspect adopted source |
+| `GET` | `/api/v1/workflows/{id}/artifacts/{version}/manifest.json` | Inspect the artifact manifest |
+| `POST` | `/api/v1/workflows/{id}/revisions` | Refine current model or search for a new base |
+| `POST` | `/api/v1/workflows/{id}/approval` | Approve an exact artifact digest |
+| `POST` | `/api/v1/workflows/{id}/cancel` | Cancel preparation or a supported print |
+| `GET` | `/api/v1/printers` | List printer capabilities |
+
+## Adding a printer adapter
+
+Implement the `PrinterAdapter` protocol in `src/printing_agent/ports.py`:
+
+```python
+class MyPrinterAdapter:
+    name = "my-printer"
+
+    async def capabilities(self) -> PrinterCapabilitySummary: ...
+    async def validate(self, artifact, settings) -> None: ...
+    async def submit(self, workflow_id, artifact, settings, idempotency_key) -> PrintJob: ...
+    async def status(self, external_id) -> PrintJob: ...
+    async def cancel(self, external_id) -> PrintJob: ...
+```
+
+Register it in `build_container`. Slicing belongs inside the adapter (or a slicer composed by it), because printer families accept different formats and settings. The application core always supplies an approved, printer-neutral STL artifact plus print settings.
+
+Use the simulator and its contract tests as the reference for persistence, idempotency, lifecycle statuses, validation, and cancellation.
+
+## Adding a model catalog
+
+Implement the `ModelCatalog` protocol and expose it through the existing discovery tools. The adapter must normalize provenance/license data and enforce its own host, token, download, and media policies. Copilot should never receive a generic HTTP tool.
+
+## Validation
+
+```powershell
+.\.venv\Scripts\python -m ruff check src tests
+.\.venv\Scripts\python -m pytest
+
+Set-Location web
+npm.cmd run lint
+npm.cmd run build
+```
+
+Tests use fake renderers and mocked Thingiverse responses. Live Thingiverse/Copilot calls require credentials and are intentionally not part of the deterministic suite.
+
+## Initial scope
+
+- Thingiverse is the first catalog.
+- The persistent simulator is the first printer adapter.
+- Source creation/editing uses OpenSCAD and produces STL.
+- One primary STL source file is supported per selected candidate.
+- Browser-side mesh editing and learned mesh-similarity search are out of scope.
+- The initial local deployment records a browser/CLI approver identity but does not implement multi-user authentication.
