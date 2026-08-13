@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import trimesh
 
+from printing_agent.application import PrintingApplication
 from printing_agent.artifact_store import ArtifactStore
 from printing_agent.config import Settings
 from printing_agent.domain import (
@@ -14,10 +16,14 @@ from printing_agent.domain import (
     ModelingHandoff,
     ModelPlan,
     PrinterCapabilitySummary,
+    PrintJob,
+    PrintJobStatus,
+    RevisionMode,
+    RevisionRequest,
     WorkflowState,
     WorkKind,
 )
-from printing_agent.errors import PolicyViolationError
+from printing_agent.errors import ConflictError, NotFoundError, PolicyViolationError
 from printing_agent.modeling import MeshInspector, ModelPipeline, OpenScadSourcePolicy
 from printing_agent.repositories import WorkflowRepository
 
@@ -93,7 +99,47 @@ async def test_source_is_adopted_only_after_mesh_validation(
     assert artifact.mesh.watertight
     assert artifact.manifest_digest
 
-    await repository.approve_and_enqueue(
+    application = SimpleNamespace(
+        repository=repository,
+        artifacts=ArtifactStore(settings.artifact_dir),
+    )
+    copied = await PrintingApplication.copy_workflow(application, workflow.id)  # type: ignore[arg-type]
+    copied_artifact = await repository.get_artifact(copied.id, 1)
+    copied_handoff = await repository.get_handoff(copied.id, 1)
+    assert copied.id != workflow.id
+    assert copied.state == WorkflowState.AWAITING_APPROVAL
+    assert copied_artifact.model_digest == artifact.model_digest
+    assert copied_artifact.manifest_digest != artifact.manifest_digest
+    assert copied_artifact.source_path is not None and copied_artifact.source_path.is_file()
+    assert copied_handoff.workflow_id == copied.id
+    assert artifact.model_path.is_file()
+    with pytest.raises(NotFoundError):
+        await repository.get_approval(copied.id)
+
+    await repository.approve_artifact(
+        ArtifactApproval(
+            workflow_id=copied.id,
+            artifact_version=1,
+            manifest_digest=copied_artifact.manifest_digest,
+            approved_by="test",
+        )
+    )
+    await repository.request_revision(
+        RevisionRequest(
+            workflow_id=copied.id,
+            mode=RevisionMode.REFINE_CURRENT,
+            feedback="Make the top rounder",
+        )
+    )
+    revised = await repository.get_workflow(copied.id)
+    revision_work = await repository.lease_next()
+    assert revised.state == WorkflowState.REVISION_REQUESTED
+    assert revision_work is not None and revision_work.kind == WorkKind.PREPARE
+    await repository.complete_work(revision_work.id)
+    with pytest.raises(NotFoundError):
+        await repository.get_approval(copied.id)
+
+    await repository.approve_artifact(
         ArtifactApproval(
             workflow_id=workflow.id,
             artifact_version=artifact.version,
@@ -102,6 +148,31 @@ async def test_source_is_adopted_only_after_mesh_validation(
         )
     )
     approved = await repository.get_workflow(workflow.id)
+    assert await repository.lease_next() is None
+
+    await repository.enqueue_print_submission(workflow.id)
+    with pytest.raises(ConflictError):
+        await repository.enqueue_print_submission(workflow.id)
     submission = await repository.lease_next()
+    submitting = await repository.get_workflow(workflow.id)
     assert approved.state == WorkflowState.APPROVED
+    assert submitting.state == WorkflowState.SUBMITTING
     assert submission is not None and submission.kind == WorkKind.SUBMIT
+    job = PrintJob(
+        workflow_id=workflow.id,
+        printer_name="simulator",
+        external_id="simulated-job",
+        idempotency_key="submission-key",
+        status=PrintJobStatus.QUEUED,
+        artifact_version=artifact.version,
+    )
+    await repository.finalize_print_submission(job)
+    queued = await repository.get_workflow(workflow.id)
+    assert queued.state == WorkflowState.QUEUED
+    assert (await repository.get_latest_job(workflow.id)) == job
+    await PrintingApplication.submit_print(  # type: ignore[arg-type]
+        SimpleNamespace(repository=repository),
+        workflow.id,
+    )
+    listed = await repository.list_workflows()
+    assert {item.id for item in listed} == {workflow.id, copied.id}

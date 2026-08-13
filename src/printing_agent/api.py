@@ -99,6 +99,32 @@ def create_app(container: Container | None = None) -> FastAPI:
     def get_container(request: Request) -> Container:
         return request.app.state.container
 
+    async def serialize_workflow(
+        container: Container,
+        workflow,
+    ) -> dict[str, object]:
+        artifact = (
+            await container.repository.get_artifact(
+                workflow.id,
+                workflow.active_artifact_version,
+            )
+            if workflow.active_artifact_version is not None
+            else None
+        )
+        job = await container.repository.get_latest_job(workflow.id)
+        artifact_payload = None
+        if artifact is not None:
+            artifact_payload = artifact.model_dump(
+                mode="json",
+                exclude={"source_path", "model_path"},
+            )
+            artifact_payload["source_available"] = artifact.source_path is not None
+        return {
+            "workflow": workflow.model_dump(mode="json"),
+            "artifact": artifact_payload,
+            "job": job.model_dump(mode="json") if job else None,
+        }
+
     @app.get("/api/v1/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -114,31 +140,17 @@ def create_app(container: Container | None = None) -> FastAPI:
         )
         return workflow.model_dump(mode="json")
 
+    @app.get("/api/v1/workflows")
+    async def list_workflows(request: Request) -> list[dict[str, object]]:
+        container = get_container(request)
+        workflows = await container.repository.list_workflows()
+        return [await serialize_workflow(container, workflow) for workflow in workflows]
+
     @app.get("/api/v1/workflows/{workflow_id}")
     async def get_workflow(workflow_id: str, request: Request) -> dict[str, object]:
         container = get_container(request)
         workflow = await container.repository.get_workflow(workflow_id)
-        artifact = (
-            await container.repository.get_artifact(
-                workflow.id,
-                workflow.active_artifact_version,
-            )
-            if workflow.active_artifact_version is not None
-            else None
-        )
-        job = await container.repository.get_latest_job(workflow_id)
-        artifact_payload = None
-        if artifact is not None:
-            artifact_payload = artifact.model_dump(
-                mode="json",
-                exclude={"source_path", "model_path"},
-            )
-            artifact_payload["source_available"] = artifact.source_path is not None
-        return {
-            "workflow": workflow.model_dump(mode="json"),
-            "artifact": artifact_payload,
-            "job": job.model_dump(mode="json") if job else None,
-        }
+        return await serialize_workflow(container, workflow)
 
     @app.get("/api/v1/workflows/{workflow_id}/events")
     async def workflow_events(
@@ -225,6 +237,20 @@ def create_app(container: Container | None = None) -> FastAPI:
             body.feedback,
         )
         return {"status": "revision_queued"}
+
+    @app.post("/api/v1/workflows/{workflow_id}/print", status_code=202)
+    async def request_print(workflow_id: str, request: Request) -> dict[str, str]:
+        await get_container(request).application.request_print(workflow_id)
+        return {"status": "print_queued"}
+
+    @app.post("/api/v1/workflows/{workflow_id}/copies", status_code=201)
+    async def copy_workflow(
+        workflow_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        container = get_container(request)
+        workflow = await container.application.copy_workflow(workflow_id)
+        return await serialize_workflow(container, workflow)
 
     @app.post("/api/v1/workflows/{workflow_id}/cancel", status_code=202)
     async def cancel_workflow(workflow_id: str, request: Request) -> dict[str, str]:

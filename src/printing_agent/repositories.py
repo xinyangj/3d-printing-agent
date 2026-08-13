@@ -257,6 +257,16 @@ class WorkflowRepository:
         finally:
             await db.close()
 
+    async def list_workflows(self) -> list[PrintWorkflow]:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                "SELECT * FROM workflows ORDER BY updated_at DESC, created_at DESC"
+            )
+            return [self._workflow_from_row(row) for row in await cursor.fetchall()]
+        finally:
+            await db.close()
+
     async def transition(
         self,
         workflow_id: str,
@@ -720,7 +730,7 @@ class WorkflowRepository:
         payload = await self._get_composite_payload("artifacts", workflow_id, version)
         return ModelArtifact.model_validate_json(payload)
 
-    async def approve_and_enqueue(self, approval: ArtifactApproval) -> None:
+    async def approve_artifact(self, approval: ArtifactApproval) -> None:
         db = await self._connect()
         try:
             await db.execute("BEGIN IMMEDIATE")
@@ -789,14 +799,82 @@ class WorkflowRepository:
                     "manifest_digest": approval.manifest_digest,
                 },
             )
-            await self._insert_work_item(
-                db,
-                WorkItem(workflow_id=approval.workflow_id, kind=WorkKind.SUBMIT),
-            )
             await db.commit()
         except aiosqlite.IntegrityError as exc:
             await db.rollback()
             raise ConflictError("Workflow already has an approval") from exc
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def enqueue_print_submission(self, workflow_id: str) -> WorkItem:
+        item = WorkItem(workflow_id=workflow_id, kind=WorkKind.SUBMIT)
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT state, version, active_artifact_version FROM workflows WHERE id = ?",
+                (workflow_id,),
+            )
+            workflow = await cursor.fetchone()
+            if workflow is None:
+                raise NotFoundError(f"Workflow '{workflow_id}' was not found")
+            if workflow["state"] != WorkflowState.APPROVED.value:
+                raise ConflictError("Only an approved artifact can be sent to the printer")
+            cursor = await db.execute(
+                """
+                SELECT artifact_version, manifest_digest FROM approvals
+                WHERE workflow_id = ?
+                """,
+                (workflow_id,),
+            )
+            approval = await cursor.fetchone()
+            if (
+                approval is None
+                or approval["artifact_version"] != workflow["active_artifact_version"]
+            ):
+                raise ConflictError("The active artifact does not have a valid approval")
+            cursor = await db.execute(
+                """
+                SELECT manifest_digest FROM artifacts
+                WHERE workflow_id = ? AND version = ?
+                """,
+                (workflow_id, approval["artifact_version"]),
+            )
+            artifact = await cursor.fetchone()
+            if artifact is None or artifact["manifest_digest"] != approval["manifest_digest"]:
+                raise ConflictError("The approved artifact manifest no longer matches")
+            now = utc_now()
+            cursor = await db.execute(
+                """
+                UPDATE workflows
+                SET state = ?, version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    WorkflowState.SUBMITTING.value,
+                    now.isoformat(),
+                    workflow_id,
+                    workflow["version"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed during print submission")
+            await self._insert_event(
+                db,
+                workflow_id,
+                "print.submitting",
+                WorkflowState.SUBMITTING,
+                {
+                    "artifact_version": approval["artifact_version"],
+                    "manifest_digest": approval["manifest_digest"],
+                },
+            )
+            await self._insert_work_item(db, item)
+            await db.commit()
+            return item
         except Exception:
             await db.rollback()
             raise
@@ -841,6 +919,161 @@ class WorkflowRepository:
             )
             await db.execute("DELETE FROM approvals WHERE workflow_id = ?", (revision.workflow_id,))
             await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def request_revision(self, revision: RevisionRequest) -> WorkItem:
+        item = WorkItem(workflow_id=revision.workflow_id, kind=WorkKind.PREPARE)
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT state, version FROM workflows WHERE id = ?",
+                (revision.workflow_id,),
+            )
+            workflow = await cursor.fetchone()
+            if workflow is None:
+                raise NotFoundError(f"Workflow '{revision.workflow_id}' was not found")
+            current_state = WorkflowState(workflow["state"])
+            if current_state not in {
+                WorkflowState.AWAITING_APPROVAL,
+                WorkflowState.APPROVED,
+            }:
+                raise ConflictError("Only an unsubmitted artifact can be revised")
+            assert_transition(current_state, WorkflowState.REVISION_REQUESTED)
+            await db.execute(
+                """
+                INSERT INTO revision_requests (workflow_id, mode, feedback, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    revision.workflow_id,
+                    revision.mode.value,
+                    revision.feedback,
+                    revision.created_at.isoformat(),
+                ),
+            )
+            await db.execute(
+                "DELETE FROM approvals WHERE workflow_id = ?",
+                (revision.workflow_id,),
+            )
+            now = utc_now()
+            cursor = await db.execute(
+                """
+                UPDATE workflows
+                SET state = ?, version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    WorkflowState.REVISION_REQUESTED.value,
+                    now.isoformat(),
+                    revision.workflow_id,
+                    workflow["version"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed during revision request")
+            await self._insert_event(
+                db,
+                revision.workflow_id,
+                "revision.requested",
+                WorkflowState.REVISION_REQUESTED,
+                {"mode": revision.mode.value, "feedback": revision.feedback},
+            )
+            await self._insert_work_item(db, item)
+            await db.commit()
+            return item
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def create_copy(
+        self,
+        workflow: PrintWorkflow,
+        plan: ModelPlan,
+        handoff: ModelingHandoff | None,
+        artifact: ModelArtifact,
+        *,
+        source_workflow_id: str,
+        source_artifact_version: int,
+    ) -> PrintWorkflow:
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """
+                INSERT INTO workflows (
+                    id, requirement, printer_name, state, version,
+                    discovery_session_id, modeling_session_id,
+                    active_handoff_version, active_artifact_version,
+                    failure_code, failure_message, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, ?, ?)
+                """,
+                (
+                    workflow.id,
+                    workflow.requirement,
+                    workflow.printer_name,
+                    workflow.state.value,
+                    workflow.version,
+                    workflow.active_handoff_version,
+                    workflow.active_artifact_version,
+                    workflow.created_at.isoformat(),
+                    workflow.updated_at.isoformat(),
+                ),
+            )
+            await db.execute(
+                """
+                INSERT INTO model_plans (workflow_id, payload_json, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (workflow.id, plan.model_dump_json(), utc_now().isoformat()),
+            )
+            if handoff is not None:
+                await db.execute(
+                    """
+                    INSERT INTO modeling_handoffs (
+                        workflow_id, version, digest, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        workflow.id,
+                        handoff.version,
+                        handoff.digest,
+                        handoff.model_dump_json(),
+                        utc_now().isoformat(),
+                    ),
+                )
+            await db.execute(
+                """
+                INSERT INTO artifacts (
+                    workflow_id, version, manifest_digest, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    workflow.id,
+                    artifact.version,
+                    artifact.manifest_digest,
+                    artifact.model_dump_json(),
+                    artifact.created_at.isoformat(),
+                ),
+            )
+            await self._insert_event(
+                db,
+                workflow.id,
+                "workflow.copied",
+                workflow.state,
+                {
+                    "source_workflow_id": source_workflow_id,
+                    "source_artifact_version": source_artifact_version,
+                },
+            )
+            await db.commit()
+            return workflow
         except Exception:
             await db.rollback()
             raise
@@ -896,6 +1129,78 @@ class WorkflowRepository:
                 ),
             )
             await db.commit()
+        finally:
+            await db.close()
+
+    async def finalize_print_submission(self, job: PrintJob) -> None:
+        refresh = WorkItem(
+            workflow_id=job.workflow_id,
+            kind=WorkKind.REFRESH_PRINT,
+            available_at=utc_now() + timedelta(seconds=2),
+        )
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT state, version FROM workflows WHERE id = ?",
+                (job.workflow_id,),
+            )
+            workflow = await cursor.fetchone()
+            if workflow is None:
+                raise NotFoundError(f"Workflow '{job.workflow_id}' was not found")
+            if workflow["state"] != WorkflowState.SUBMITTING.value:
+                raise ConflictError("Workflow is no longer submitting to a printer")
+            await db.execute(
+                """
+                INSERT INTO print_jobs (
+                    id, workflow_id, printer_name, external_id, idempotency_key,
+                    status, payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    status = excluded.status,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    job.id,
+                    job.workflow_id,
+                    job.printer_name,
+                    job.external_id,
+                    job.idempotency_key,
+                    job.status.value,
+                    job.model_dump_json(),
+                    job.created_at.isoformat(),
+                    job.updated_at.isoformat(),
+                ),
+            )
+            now = utc_now()
+            cursor = await db.execute(
+                """
+                UPDATE workflows
+                SET state = ?, version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    WorkflowState.QUEUED.value,
+                    now.isoformat(),
+                    job.workflow_id,
+                    workflow["version"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed while finalizing print submission")
+            await self._insert_event(
+                db,
+                job.workflow_id,
+                "print.queued",
+                WorkflowState.QUEUED,
+                {"job_id": job.id, "external_id": job.external_id},
+            )
+            await self._insert_work_item(db, refresh)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
         finally:
             await db.close()
 

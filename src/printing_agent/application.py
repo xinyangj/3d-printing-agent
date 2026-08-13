@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 from typing import cast
 
 from printing_agent.artifact_store import ArtifactStore
@@ -15,11 +16,13 @@ from printing_agent.domain import (
     ModelDecision,
     ModelingHandoff,
     PrintJobStatus,
+    PrintWorkflow,
     RevisionMode,
     RevisionRequest,
     SelectedSourceSummary,
     WorkflowState,
     WorkKind,
+    canonical_digest,
 )
 from printing_agent.errors import (
     BudgetExhaustedError,
@@ -265,6 +268,11 @@ class PrintingApplication:
             workflow_id,
             workflow.active_artifact_version,
         )
+        if artifact.source_path is None or not artifact.source_path.is_file():
+            raise ConflictError(
+                "This artifact has no editable OpenSCAD source; search for a new base instead"
+            )
+        current_source = artifact.source_path.read_text(encoding="utf-8")
         version = await self.repository.next_handoff_version(workflow_id)
         handoff = old_handoff.model_copy(
             update={
@@ -274,6 +282,16 @@ class PrintingApplication:
             }
         ).with_digest()
         await self.repository.save_handoff(handoff)
+        await self.repository.patch_workflow(
+            workflow_id,
+            modeling_session_id=None,
+            event_kind="revision.modeling_session_replaced",
+            payload={
+                "previous_handoff_version": old_handoff.version,
+                "handoff_version": version,
+                "artifact_version": artifact.version,
+            },
+        )
         await self.repository.transition(
             workflow_id,
             WorkflowState.HANDOFF_READY,
@@ -285,7 +303,13 @@ class PrintingApplication:
             WorkflowState.GENERATING,
             event_kind="revision.modeling_started",
         )
-        return await self.modeling.revise(handoff, artifact, feedback)
+        return await self.modeling.revise(
+            handoff,
+            artifact,
+            feedback,
+            current_source,
+            old_handoff,
+        )
 
     async def request_revision(
         self,
@@ -294,21 +318,28 @@ class PrintingApplication:
         feedback: str,
     ) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
-        if workflow.state != WorkflowState.AWAITING_APPROVAL:
-            raise ConflictError("Only an artifact awaiting approval can be revised")
+        if workflow.state not in {
+            WorkflowState.AWAITING_APPROVAL,
+            WorkflowState.APPROVED,
+        }:
+            raise ConflictError("Only an unsubmitted artifact can be revised")
+        if mode == RevisionMode.REFINE_CURRENT:
+            if workflow.active_artifact_version is None:
+                raise ConflictError("Workflow has no active artifact to refine")
+            artifact = await self.repository.get_artifact(
+                workflow_id,
+                workflow.active_artifact_version,
+            )
+            if artifact.source_path is None or not artifact.source_path.is_file():
+                raise ConflictError(
+                    "This artifact has no editable OpenSCAD source; search for a new base instead"
+                )
         revision = RevisionRequest(
             workflow_id=workflow_id,
             mode=mode,
             feedback=feedback,
         )
-        await self.repository.save_revision(revision)
-        await self.repository.transition(
-            workflow_id,
-            WorkflowState.REVISION_REQUESTED,
-            event_kind="revision.requested",
-            payload={"mode": mode.value, "feedback": feedback},
-        )
-        await self.repository.enqueue(workflow_id, WorkKind.PREPARE)
+        await self.repository.request_revision(revision)
 
     async def approve(
         self,
@@ -329,7 +360,7 @@ class PrintingApplication:
         adapter = cast(PrinterAdapter, self.printers.get(workflow.printer_name))
         plan = await self.repository.get_plan(workflow_id)
         await adapter.validate(artifact, plan.print_settings)
-        await self.repository.approve_and_enqueue(
+        await self.repository.approve_artifact(
             ArtifactApproval(
                 workflow_id=workflow_id,
                 artifact_version=artifact_version,
@@ -338,8 +369,20 @@ class PrintingApplication:
             )
         )
 
+    async def request_print(self, workflow_id: str) -> None:
+        await self.repository.enqueue_print_submission(workflow_id)
+
     async def submit_print(self, workflow_id: str) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
+        if workflow.state in {
+            WorkflowState.QUEUED,
+            WorkflowState.PRINTING,
+            WorkflowState.COMPLETED,
+        }:
+            if await self.repository.get_latest_job(workflow_id) is not None:
+                return
+        if workflow.state != WorkflowState.SUBMITTING:
+            raise ConflictError("Print submission is not active for this workflow")
         approval = await self.repository.get_approval(workflow_id)
         artifact = await self.repository.get_artifact(
             workflow_id,
@@ -349,11 +392,6 @@ class PrintingApplication:
             raise ValidationError("Approved artifact digest no longer matches")
         adapter = cast(PrinterAdapter, self.printers.get(workflow.printer_name))
         plan = await self.repository.get_plan(workflow_id)
-        await self.repository.transition(
-            workflow_id,
-            WorkflowState.SUBMITTING,
-            event_kind="print.submitting",
-        )
         idempotency_key = hashlib.sha256(
             f"{workflow_id}:{approval.manifest_digest}:{workflow.printer_name}".encode()
         ).hexdigest()
@@ -363,18 +401,92 @@ class PrintingApplication:
             plan.print_settings,
             idempotency_key,
         )
-        await self.repository.save_job(job)
-        await self.repository.transition(
+        await self.repository.finalize_print_submission(job)
+
+    async def copy_workflow(self, workflow_id: str) -> PrintWorkflow:
+        source_workflow = await self.repository.get_workflow(workflow_id)
+        if source_workflow.active_artifact_version is None:
+            raise ConflictError("Workflow has no artifact to copy")
+        source_artifact = await self.repository.get_artifact(
             workflow_id,
-            WorkflowState.QUEUED,
-            event_kind="print.queued",
-            payload={"job_id": job.id, "external_id": job.external_id},
+            source_workflow.active_artifact_version,
         )
-        await self.repository.enqueue(
-            workflow_id,
-            WorkKind.REFRESH_PRINT,
-            delay_seconds=2,
+        source_handoff = (
+            await self.repository.get_handoff(
+                workflow_id,
+                source_workflow.active_handoff_version,
+            )
+            if source_workflow.active_handoff_version is not None
+            else None
         )
+        plan = await self.repository.get_plan(workflow_id)
+        copied_workflow = PrintWorkflow(
+            requirement=source_workflow.requirement,
+            printer_name=source_workflow.printer_name,
+            state=WorkflowState.AWAITING_APPROVAL,
+            active_handoff_version=1 if source_handoff is not None else None,
+            active_artifact_version=1,
+        )
+        copied_handoff = (
+            source_handoff.model_copy(
+                update={
+                    "workflow_id": copied_workflow.id,
+                    "version": 1,
+                    "digest": None,
+                }
+            ).with_digest()
+            if source_handoff is not None
+            else None
+        )
+        manifest = {
+            "workflow_id": copied_workflow.id,
+            "artifact_version": 1,
+            "source_digest": source_artifact.source_digest,
+            "model_digest": source_artifact.model_digest,
+            "mesh": source_artifact.mesh.model_dump(mode="json"),
+            "provenance": source_artifact.provenance.model_dump(mode="json"),
+            "copied_from": {
+                "workflow_id": workflow_id,
+                "artifact_version": source_artifact.version,
+                "manifest_digest": source_artifact.manifest_digest,
+            },
+        }
+        if copied_handoff is not None:
+            manifest["handoff_digest"] = copied_handoff.digest
+        manifest_digest = canonical_digest(manifest)
+        manifest["manifest_digest"] = manifest_digest
+        try:
+            adopted_source, adopted_model, _ = self.artifacts.adopt(
+                copied_workflow.id,
+                1,
+                source_artifact.source_path,
+                source_artifact.model_path,
+                manifest,
+            )
+            copied_artifact = source_artifact.model_copy(
+                update={
+                    "workflow_id": copied_workflow.id,
+                    "version": 1,
+                    "source_path": adopted_source,
+                    "model_path": adopted_model,
+                    "manifest_digest": manifest_digest,
+                }
+            )
+            await self.repository.create_copy(
+                copied_workflow,
+                plan,
+                copied_handoff,
+                copied_artifact,
+                source_workflow_id=workflow_id,
+                source_artifact_version=source_artifact.version,
+            )
+            return copied_workflow
+        except Exception:
+            shutil.rmtree(
+                self.artifacts.workflow_root(copied_workflow.id),
+                ignore_errors=True,
+            )
+            raise
 
     async def refresh_print(self, workflow_id: str) -> None:
         workflow = await self.repository.get_workflow(workflow_id)

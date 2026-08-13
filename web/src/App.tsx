@@ -88,6 +88,42 @@ const INSPECTABLE_STATE = new Set([
   'completed',
   'print_failed',
 ])
+const ACTIVE_STATES = new Set([
+  'received',
+  'planning',
+  'discovering',
+  'searching',
+  'page_inspection',
+  'selecting',
+  'source_validation',
+  'handoff_ready',
+  'generating',
+  'rendering',
+  'validating',
+  'revision_requested',
+  'submitting',
+  'queued',
+  'printing',
+])
+
+type DashboardFilter =
+  | 'all'
+  | 'in_progress'
+  | 'needs_approval'
+  | 'approved'
+  | 'printing'
+  | 'completed'
+  | 'failed'
+
+const FILTERS: { value: DashboardFilter; label: string }[] = [
+  { value: 'all', label: 'All' },
+  { value: 'in_progress', label: 'In progress' },
+  { value: 'needs_approval', label: 'Needs approval' },
+  { value: 'approved', label: 'Approved' },
+  { value: 'printing', label: 'Printing' },
+  { value: 'completed', label: 'Completed' },
+  { value: 'failed', label: 'Failed / cancelled' },
+]
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API}${path}`, {
@@ -110,6 +146,17 @@ function formatState(value: string) {
 
 function formatNumber(value: number, digits = 1) {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: digits }).format(value)
+}
+
+function matchesFilter(state: string, filter: DashboardFilter) {
+  if (filter === 'all') return true
+  if (filter === 'in_progress')
+    return ACTIVE_STATES.has(state) && !['submitting', 'queued', 'printing'].includes(state)
+  if (filter === 'needs_approval') return state === 'awaiting_approval'
+  if (filter === 'approved') return state === 'approved'
+  if (filter === 'printing') return ['submitting', 'queued', 'printing'].includes(state)
+  if (filter === 'completed') return state === 'completed'
+  return ['preparation_failed', 'print_failed', 'cancelled'].includes(state)
 }
 
 function useWorkflowEvents(workflowId: string | null) {
@@ -328,7 +375,7 @@ function StartPanel({ onCreated }: { onCreated: (id: string) => void }) {
   })
 
   return (
-    <main className="start-layout">
+    <section className="start-layout">
       <section className="hero-copy">
         <div className="eyebrow">Copilot-powered fabrication</div>
         <h1>Describe it. Inspect it. Print it.</h1>
@@ -369,6 +416,214 @@ function StartPanel({ onCreated }: { onCreated: (id: string) => void }) {
         </button>
         {create.error && <p className="error-copy">{create.error.message}</p>}
       </section>
+    </section>
+  )
+}
+
+function ModelThumbnail({ url }: { url: string }) {
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+    const scene = new THREE.Scene()
+    scene.background = new THREE.Color('#171b1c')
+    const camera = new THREE.PerspectiveCamera(38, 1.6, 0.1, 5000)
+    const renderer = new THREE.WebGLRenderer({ antialias: true })
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5))
+    renderer.setSize(container.clientWidth, container.clientHeight)
+    container.appendChild(renderer.domElement)
+    scene.add(new THREE.HemisphereLight('#ffffff', '#24332f', 2.4))
+    const key = new THREE.DirectionalLight('#ffffff', 2.5)
+    key.position.set(100, 140, 80)
+    scene.add(key)
+    let mesh: THREE.Mesh | null = null
+    new STLLoader().load(url, (geometry) => {
+      geometry.computeVertexNormals()
+      geometry.center()
+      mesh = new THREE.Mesh(
+        geometry,
+        new THREE.MeshStandardMaterial({ color: '#79e2ca', roughness: 0.48 }),
+      )
+      scene.add(mesh)
+      const size = new THREE.Box3().setFromObject(mesh).getSize(new THREE.Vector3())
+      const span = Math.max(size.x, size.y, size.z)
+      camera.position.set(span * 1.5, span * 1.1, span * 1.5)
+      camera.lookAt(0, 0, 0)
+    })
+    let frame = 0
+    const render = () => {
+      if (mesh) mesh.rotation.y += 0.003
+      renderer.render(scene, camera)
+      frame = requestAnimationFrame(render)
+    }
+    render()
+    return () => {
+      cancelAnimationFrame(frame)
+      if (mesh) {
+        mesh.geometry.dispose()
+        if (Array.isArray(mesh.material)) mesh.material.forEach((item) => item.dispose())
+        else mesh.material.dispose()
+      }
+      renderer.dispose()
+      container.removeChild(renderer.domElement)
+    }
+  }, [url])
+
+  return <div className="model-thumbnail" ref={containerRef} aria-label="3D model preview" />
+}
+
+function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
+  const queryClient = useQueryClient()
+  const [filter, setFilter] = useState<DashboardFilter>('all')
+  const workflows = useQuery({
+    queryKey: ['workflows'],
+    queryFn: () => api<WorkflowResponse[]>('/workflows'),
+    refetchInterval: (query) =>
+      query.state.data?.some((item) => ACTIVE_STATES.has(item.workflow.state)) ? 2500 : false,
+  })
+  const copy = useMutation({
+    mutationFn: (id: string) =>
+      api<WorkflowResponse>(`/workflows/${id}/copies`, { method: 'POST' }),
+    onSuccess: (data) => {
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+      onOpen(data.workflow.id)
+    },
+  })
+  const print = useMutation({
+    mutationFn: (id: string) => api(`/workflows/${id}/print`, { method: 'POST' }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflows'] }),
+  })
+  const items = (workflows.data ?? []).filter((item) =>
+    matchesFilter(item.workflow.state, filter),
+  )
+
+  return (
+    <main className="dashboard-layout">
+      <header className="dashboard-header">
+        <div>
+          <span className="eyebrow">Local model library</span>
+          <h1>Models &amp; print status</h1>
+          <p>Inspect, version, approve, copy, and print every durable model workflow.</p>
+        </div>
+        <a className="primary-action create-link" href="#create-model">
+          Create model <span>＋</span>
+        </a>
+      </header>
+
+      <div className="filter-row" role="tablist" aria-label="Model status filters">
+        {FILTERS.map((item) => (
+          <button
+            className={filter === item.value ? 'active' : ''}
+            key={item.value}
+            onClick={() => setFilter(item.value)}
+          >
+            {item.label}
+            <span>
+              {(workflows.data ?? []).filter((entry) =>
+                matchesFilter(entry.workflow.state, item.value),
+              ).length}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      {workflows.isLoading && <div className="empty-dashboard">Loading models…</div>}
+      {workflows.error && <div className="failure-panel">{workflows.error.message}</div>}
+      {!workflows.isLoading && items.length === 0 && (
+        <div className="empty-dashboard">No models match this lifecycle filter.</div>
+      )}
+      <section className="model-grid">
+        {items.map(({ workflow, artifact, job }) => {
+          const modelUrl = artifact
+            ? `${API}/workflows/${workflow.id}/artifacts/${artifact.version}/model.stl`
+            : null
+          return (
+            <article className="model-card" key={workflow.id}>
+              {modelUrl ? (
+                <ModelThumbnail url={modelUrl} />
+              ) : (
+                <div className={`model-placeholder state-${workflow.state}`}>
+                  <span>{ACTIVE_STATES.has(workflow.state) ? '◇' : '!'}</span>
+                  {formatState(workflow.state)}
+                </div>
+              )}
+              <div className="model-card-body">
+                <div className="card-state-row">
+                  <span className={`state-pill state-${workflow.state}`}>
+                    <span />
+                    {formatState(workflow.state)}
+                  </span>
+                  <time>{new Date(workflow.updated_at).toLocaleString()}</time>
+                </div>
+                <h2>{workflow.requirement}</h2>
+                <div className="card-metadata">
+                  <span>#{workflow.id.slice(0, 8)}</span>
+                  <span>{workflow.printer_name}</span>
+                  {artifact && <span>artifact v{artifact.version}</span>}
+                  {artifact && (
+                    <span>
+                      {formatNumber(artifact.mesh.dimensions.width_mm, 0)} ×{' '}
+                      {formatNumber(artifact.mesh.dimensions.depth_mm, 0)} ×{' '}
+                      {formatNumber(artifact.mesh.dimensions.height_mm, 0)} mm
+                    </span>
+                  )}
+                </div>
+                <p className="card-provenance">
+                  {artifact
+                    ? artifact.provenance.kind === 'generated'
+                      ? 'Generated model'
+                      : `Catalog · ${artifact.provenance.creator ?? 'unknown creator'}`
+                    : workflow.failure_message ?? 'Preparing durable artifact'}
+                  {job && ` · Print ${formatState(job.status)}`}
+                </p>
+                <div className="card-actions">
+                  <button className="secondary-action" onClick={() => onOpen(workflow.id)}>
+                    {workflow.state === 'awaiting_approval'
+                      ? 'Inspect & approve'
+                      : ['submitting', 'queued', 'printing', 'completed', 'print_failed'].includes(
+                            workflow.state,
+                          )
+                        ? 'View print status'
+                        : 'Open'}
+                  </button>
+                  {artifact && (
+                    <button
+                      className="text-button"
+                      disabled={copy.isPending}
+                      onClick={() => copy.mutate(workflow.id)}
+                    >
+                      Make a copy
+                    </button>
+                  )}
+                  {['awaiting_approval', 'approved'].includes(workflow.state) &&
+                    artifact?.source_available && (
+                      <button className="text-button" onClick={() => onOpen(workflow.id)}>
+                        Edit existing
+                      </button>
+                    )}
+                  {workflow.state === 'approved' && (
+                    <button
+                      className="primary-action"
+                      disabled={print.isPending}
+                      onClick={() => print.mutate(workflow.id)}
+                    >
+                      Send to printer <span>→</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </article>
+          )
+        })}
+      </section>
+      {(copy.error || print.error) && (
+        <p className="error-copy">{copy.error?.message ?? print.error?.message}</p>
+      )}
+
+      <div id="create-model" className="create-section">
+        <StartPanel onCreated={onOpen} />
+      </div>
     </main>
   )
 }
@@ -417,7 +672,10 @@ function WorkflowPanel({
           approved_by: 'local-web',
         }),
       }),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+    },
   })
   const revise = useMutation({
     mutationFn: (mode: 'refine_current' | 'search_new_base') =>
@@ -428,6 +686,22 @@ function WorkflowPanel({
     onSuccess: () => {
       setFeedback('')
       void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+    },
+  })
+  const print = useMutation({
+    mutationFn: () => api(`/workflows/${workflowId}/print`, { method: 'POST' }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+    },
+  })
+  const copy = useMutation({
+    mutationFn: () =>
+      api<WorkflowResponse>(`/workflows/${workflowId}/copies`, { method: 'POST' }),
+    onSuccess: (copied) => {
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+      window.location.hash = `/workflows/${copied.workflow.id}`
     },
   })
   const cancel = useMutation({
@@ -448,7 +722,7 @@ function WorkflowPanel({
       <header className="workflow-header">
         <div>
           <button className="text-button" onClick={onReset}>
-            ← New request
+            ← Model dashboard
           </button>
           <div className="eyebrow">Workflow {workflow.id.slice(0, 8)}</div>
           <h1>{canInspect ? 'Inspect final model' : 'Preparing your model'}</h1>
@@ -557,11 +831,17 @@ function WorkflowPanel({
             </section>
           )}
 
-          {workflow.state === 'awaiting_approval' && (
+          {['awaiting_approval', 'approved'].includes(workflow.state) && (
             <section className="approval-panel">
               <div>
-                <span className="section-label">Human approval required</span>
-                <h2>Does this exact model look ready to print?</h2>
+                <span className="section-label">
+                  {workflow.state === 'approved' ? 'Artifact approved' : 'Human approval required'}
+                </span>
+                <h2>
+                  {workflow.state === 'approved'
+                    ? `Artifact v${artifact.version} is approved`
+                    : 'Does this exact model look ready?'}
+                </h2>
                 <p>
                   Approval is bound to artifact v{artifact.version} and its manifest digest.
                   Any revision creates a new artifact that must be inspected again.
@@ -577,10 +857,15 @@ function WorkflowPanel({
                 <div>
                   <button
                     className="secondary-action"
-                    disabled={!feedback.trim() || revise.isPending}
+                    disabled={!feedback.trim() || revise.isPending || !artifact.source_available}
                     onClick={() => revise.mutate('refine_current')}
+                    title={
+                      artifact.source_available
+                        ? 'Edit this artifact from its exact OpenSCAD source'
+                        : 'This STL-only artifact has no editable OpenSCAD source'
+                    }
                   >
-                    Refine current
+                    Edit existing
                   </button>
                   <button
                     className="secondary-action"
@@ -589,17 +874,36 @@ function WorkflowPanel({
                   >
                     Search new base
                   </button>
-                  <button
-                    className="primary-action"
-                    disabled={approve.isPending}
-                    onClick={() => approve.mutate()}
-                  >
-                    {approve.isPending ? 'Approving…' : 'Approve & print'}
-                    <span>→</span>
+                  <button className="secondary-action" disabled={copy.isPending} onClick={() => copy.mutate()}>
+                    Make a copy
                   </button>
+                  {workflow.state === 'awaiting_approval' ? (
+                    <button
+                      className="primary-action"
+                      disabled={approve.isPending}
+                      onClick={() => approve.mutate()}
+                    >
+                      {approve.isPending ? 'Approving…' : 'Approve model'}
+                      <span>✓</span>
+                    </button>
+                  ) : (
+                    <button
+                      className="primary-action"
+                      disabled={print.isPending}
+                      onClick={() => print.mutate()}
+                    >
+                      {print.isPending ? 'Queuing…' : 'Send to printer'}
+                      <span>→</span>
+                    </button>
+                  )}
                 </div>
-                {(approve.error || revise.error) && (
-                  <p className="error-copy">{approve.error?.message ?? revise.error?.message}</p>
+                {(approve.error || revise.error || print.error || copy.error) && (
+                  <p className="error-copy">
+                    {approve.error?.message ??
+                      revise.error?.message ??
+                      print.error?.message ??
+                      copy.error?.message}
+                  </p>
                 )}
               </div>
             </section>
@@ -645,6 +949,15 @@ function App() {
     setWorkflowId(id)
   }
 
+  useEffect(() => {
+    const syncRoute = () => {
+      const value = window.location.hash.match(/^#\/workflows\/(.+)$/)
+      setWorkflowId(value?.[1] ?? null)
+    }
+    window.addEventListener('hashchange', syncRoute)
+    return () => window.removeEventListener('hashchange', syncRoute)
+  }, [])
+
   return (
     <>
       <nav className="topbar">
@@ -663,7 +976,7 @@ function App() {
       {workflowId ? (
         <WorkflowPanel workflowId={workflowId} onReset={() => navigate(null)} />
       ) : (
-        <StartPanel onCreated={(id) => navigate(id)} />
+        <DashboardPanel onOpen={(id) => navigate(id)} />
       )}
     </>
   )

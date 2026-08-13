@@ -226,6 +226,193 @@ select:focus {
   padding: 45px 4vw 90px;
 }
 
+.dashboard-layout {
+  margin: 0 auto;
+  max-width: 1440px;
+  padding: 56px 4vw 100px;
+}
+
+.dashboard-header {
+  align-items: flex-end;
+  display: flex;
+  gap: 40px;
+  justify-content: space-between;
+}
+
+.dashboard-header h1 {
+  color: var(--ink);
+  font-family: var(--display);
+  font-size: clamp(42px, 5.5vw, 76px);
+  letter-spacing: -0.05em;
+  line-height: 1;
+  margin: 14px 0 16px;
+}
+
+.dashboard-header p {
+  color: var(--muted);
+  font-size: 17px;
+  margin: 0;
+}
+
+.create-link {
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.filter-row {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 4px;
+  margin: 42px 0 26px;
+  overflow-x: auto;
+}
+
+.filter-row button {
+  background: transparent;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  color: var(--muted);
+  padding: 12px 14px;
+  white-space: nowrap;
+}
+
+.filter-row button.active {
+  border-bottom-color: var(--teal);
+  color: var(--ink);
+  font-weight: 750;
+}
+
+.filter-row button span {
+  background: var(--shadow-block);
+  border-radius: 12px;
+  font-family: var(--mono);
+  font-size: 10px;
+  margin-left: 7px;
+  padding: 3px 6px;
+}
+
+.model-grid {
+  display: grid;
+  gap: 20px;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+}
+
+.model-card {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  min-width: 0;
+}
+
+.model-thumbnail,
+.model-placeholder {
+  height: 220px;
+  overflow: hidden;
+}
+
+.model-thumbnail canvas {
+  display: block;
+}
+
+.model-placeholder {
+  align-items: center;
+  background: #171b1c;
+  color: #9ba7a2;
+  display: flex;
+  flex-direction: column;
+  font-family: var(--mono);
+  font-size: 11px;
+  gap: 12px;
+  justify-content: center;
+  text-transform: uppercase;
+}
+
+.model-placeholder span {
+  color: var(--orange);
+  font-family: var(--display);
+  font-size: 42px;
+}
+
+.model-card-body {
+  padding: 21px;
+}
+
+.card-state-row {
+  align-items: center;
+  display: flex;
+  gap: 15px;
+  justify-content: space-between;
+}
+
+.card-state-row .state-pill {
+  display: inline-flex;
+  padding: 6px 8px;
+}
+
+.card-state-row time {
+  color: var(--muted-light);
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
+.model-card h2 {
+  color: var(--ink);
+  display: -webkit-box;
+  font-family: var(--display);
+  font-size: 21px;
+  line-height: 1.25;
+  margin: 18px 0 14px;
+  min-height: 52px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.card-metadata {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.card-metadata span {
+  background: var(--canvas);
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 9px;
+  padding: 5px 7px;
+}
+
+.card-provenance {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 14px 0 18px;
+}
+
+.card-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.card-actions .primary-action {
+  flex-basis: 100%;
+}
+
+.empty-dashboard {
+  background: var(--paper);
+  border: 1px dashed var(--line-strong);
+  color: var(--muted);
+  margin-bottom: 24px;
+  padding: 50px;
+  text-align: center;
+}
+
+.create-section {
+  border-top: 1px solid var(--line);
+  margin-top: 80px;
+  scroll-margin-top: 30px;
+}
+
 .workflow-header {
   align-items: flex-end;
   display: flex;
@@ -264,7 +451,8 @@ select:focus {
 }
 
 .state-completed span,
-.state-awaiting_approval span {
+.state-awaiting_approval span,
+.state-approved span {
   animation: none;
   background: var(--teal);
 }
@@ -626,8 +814,14 @@ select:focus {
 
   .start-layout,
   .inspection-grid,
-  .approval-panel {
+  .approval-panel,
+  .dashboard-header {
     grid-template-columns: 1fr;
+  }
+
+  .dashboard-header {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .start-layout {

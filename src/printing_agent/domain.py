@@ -392,6 +392,7 @@ _ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
         WorkflowState.CANCELLED,
     },
     WorkflowState.APPROVED: {
+        WorkflowState.REVISION_REQUESTED,
         WorkflowState.SUBMITTING,
         WorkflowState.PRINT_FAILED,
         WorkflowState.CANCELLED,

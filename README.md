@@ -50,8 +50,8 @@ flowchart LR
 6. A provisional source is downloaded and technically inspected. An invalid file returns the discovery session to search; an accepted one enters an immutable modeling handoff.
 7. A separate modeling session submits complete OpenSCAD. Rejected source receives bounded renderer/mesh diagnostics and may be repaired within the attempt budget.
 8. The web interface displays the final STL, dimensions, mesh metrics, provenance, source, and artifact digest.
-9. The user can refine the current model, search for a different base, or approve the exact artifact.
-10. After approval, the selected printer adapter validates and submits the job. SSE reports status through completion.
+9. The dashboard lets the user edit the current model, search for a different base, make an independent copy, or approve the exact artifact.
+10. Approval does not print automatically. The user explicitly sends an approved artifact to the selected printer, and SSE reports status through completion.
 
 ## Requirements
 
@@ -222,6 +222,7 @@ printing-agent serve
 printing-agent create "Create a 30 mm cable clip in PLA" --printer simulator
 printing-agent get <workflow-id>
 printing-agent approve <workflow-id> <artifact-version> <manifest-digest>
+printing-agent print <workflow-id>
 ```
 
 The web interface is the recommended client because it provides mandatory 3D inspection.
@@ -231,6 +232,7 @@ The web interface is the recommended client because it provides mandatory 3D ins
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `POST` | `/api/v1/workflows` | Start model preparation |
+| `GET` | `/api/v1/workflows` | List all workflows for the model dashboard |
 | `GET` | `/api/v1/workflows/{id}` | Read workflow, artifact metadata, and print job |
 | `GET` | `/api/v1/workflows/{id}/events` | Stream resumable SSE events |
 | `GET` | `/api/v1/workflows/{id}/artifacts/{version}/model.stl` | Load the exact model |
@@ -238,6 +240,8 @@ The web interface is the recommended client because it provides mandatory 3D ins
 | `GET` | `/api/v1/workflows/{id}/artifacts/{version}/manifest.json` | Inspect the artifact manifest |
 | `POST` | `/api/v1/workflows/{id}/revisions` | Refine current model or search for a new base |
 | `POST` | `/api/v1/workflows/{id}/approval` | Approve an exact artifact digest |
+| `POST` | `/api/v1/workflows/{id}/print` | Send an approved artifact to the printer |
+| `POST` | `/api/v1/workflows/{id}/copies` | Create an independent copy of an artifact |
 | `POST` | `/api/v1/workflows/{id}/cancel` | Cancel preparation or a supported print |
 | `GET` | `/api/v1/printers` | List printer capabilities |
 

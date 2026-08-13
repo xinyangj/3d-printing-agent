@@ -239,21 +239,36 @@ class CopilotDiscoveryAgent:
     ) -> DiscoveryDecision:
         workflow = await self.repository.get_workflow(workflow_id)
         plan = await self.repository.get_plan(workflow_id)
+        artifact = (
+            await self.repository.get_artifact(workflow_id, workflow.active_artifact_version)
+            if workflow.active_artifact_version is not None
+            else None
+        )
+        rejected_candidate_id = artifact.provenance.candidate_id if artifact else None
         state = _DiscoveryToolState(workflow=workflow, plan=plan)
+        await self.repository.patch_workflow(
+            workflow_id,
+            discovery_session_id=None,
+            event_kind="revision.discovery_session_replaced",
+            payload={"rejected_candidate_id": rejected_candidate_id},
+        )
         await self.runtime.run(
             workflow,
             "discovery",
             self._build_tools(state, allow_plan=False),
             (
-                "The user rejected the current base model and requested a new search. Continue "
-                "discovery using the original plan and this feedback. Search and inspect new "
-                "candidates, then make a new selection or choose creation.\n\n"
+                "The user rejected the current base model and requested a new search. Start a "
+                "clean discovery cycle using the complete context below. Search and inspect new "
+                "candidates, then make a new selection or choose creation. Do not select the "
+                "rejected candidate again.\n\n"
                 f"Original requirement: {workflow.requirement}\n"
                 f"Persisted model plan: {plan.model_dump_json(indent=2)}\n"
+                f"Current artifact: {artifact.model_dump_json(indent=2) if artifact else 'none'}\n"
+                f"Rejected candidate ID: {rejected_candidate_id or 'none'}\n"
                 f"Feedback: {feedback}"
             ),
             self._system_message(),
-            resume=True,
+            resume=False,
         )
         if state.decision is None:
             raise ExternalServiceError("Discovery did not produce a revised decision")
@@ -550,6 +565,8 @@ class CopilotModelingAgent:
         handoff: ModelingHandoff,
         artifact: ModelArtifact,
         feedback: str,
+        current_source: str,
+        previous_handoff: ModelingHandoff,
     ) -> ModelArtifact:
         workflow = await self.repository.get_workflow(handoff.workflow_id)
         state = _ModelingToolState(handoff=handoff)
@@ -558,14 +575,19 @@ class CopilotModelingAgent:
             "modeling",
             [self._source_tool(state)],
             (
-                "Revise the model according to user feedback, then submit complete replacement "
-                "OpenSCAD.\n\n"
+                "Revise the exact current OpenSCAD source according to the user feedback. Return "
+                "a complete replacement through submit_openscad_source. Preserve every feature "
+                "not targeted by the feedback and continue to satisfy all original constraints.\n\n"
+                f"Original requirement: {workflow.requirement}\n"
                 f"Feedback: {feedback}\n"
                 f"Current artifact: {artifact.model_dump_json(indent=2)}\n"
-                f"Handoff: {handoff.model_dump_json(indent=2)}"
+                f"Previous handoff: {previous_handoff.model_dump_json(indent=2)}\n"
+                f"New handoff: {handoff.model_dump_json(indent=2)}\n"
+                "Complete current OpenSCAD source:\n"
+                f"```openscad\n{current_source}\n```"
             ),
             self._system_message(),
-            resume=True,
+            resume=False,
         )
         if state.artifact is None:
             raise ExternalServiceError("Modeling revision ended without an adopted artifact")

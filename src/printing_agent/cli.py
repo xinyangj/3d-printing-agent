@@ -28,6 +28,9 @@ async def _run(args: argparse.Namespace) -> None:
                 args.approved_by,
             )
             print(json.dumps({"status": "approved"}))
+        elif args.command == "print":
+            await container.application.request_print(args.workflow_id)
+            print(json.dumps({"status": "print_queued"}))
     finally:
         await container.catalog.close()
 
@@ -46,6 +49,8 @@ def main() -> None:
     approve.add_argument("version", type=int)
     approve.add_argument("digest")
     approve.add_argument("--approved-by", default="local-cli")
+    submit_print = subparsers.add_parser("print")
+    submit_print.add_argument("workflow_id")
     args = parser.parse_args()
     if args.command == "serve":
         serve()
