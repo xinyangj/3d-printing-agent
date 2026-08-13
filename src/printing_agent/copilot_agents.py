@@ -452,7 +452,6 @@ class CopilotDiscoveryAgent:
                 "unchanged, or choose creation when no close match exists."
             ),
             defer="never",
-            is_terminal=True,
         )
         async def select_model_candidate(params: SelectCandidateParams) -> ToolResult:
             try:
@@ -579,7 +578,6 @@ class CopilotModelingAgent:
                 "inspection, and immutable artifact adoption."
             ),
             defer="never",
-            is_terminal=True,
         )
         async def submit_open_scad_source(
             params: SubmitOpenScadSourceParams,

@@ -95,6 +95,7 @@ if (-not (Test-Path ".venv\Scripts\python.exe" -PathType Leaf)) {
 }
 $python = Join-Path $script:RepoRoot ".venv\Scripts\python.exe"
 Invoke-Checked -Executable $python -Arguments @("-m", "pip", "install", "-e", ".[dev]")
+Invoke-Checked -Executable $python -Arguments @("-m", "copilot", "download-runtime")
 
 Push-Location (Join-Path $script:RepoRoot "web")
 try {

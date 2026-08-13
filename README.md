@@ -66,6 +66,7 @@ flowchart LR
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python -m pip install -e ".[dev]"
+.\.venv\Scripts\python -m copilot download-runtime
 
 Copy-Item .env.example .env
 # Set PRINTING_AGENT_THINGIVERSE_TOKEN in .env
@@ -77,7 +78,7 @@ Set-Location ..
 ```
 
 The Copilot SDK uses the currently signed-in Copilot CLI user by default. `PRINTING_AGENT_COPILOT_MODEL` can select a model; leaving it empty uses the SDK default.
-The SDK package includes its matching Copilot runtime.
+The SDK command downloads and caches its matching Copilot runtime.
 
 For a development frontend with hot reload:
 
@@ -130,8 +131,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 The installer:
 
 - installs Node.js LTS, OpenSCAD, Tailscale, and Caddy with WinGet when missing;
-- creates `.venv` and installs Python, development, and bundled Copilot runtime
-  dependencies;
+- creates `.venv`, installs Python and development dependencies, and downloads the
+  matching Copilot runtime;
 - builds `web\dist`;
 - creates a protected `.env` and records the detected OpenSCAD path;
 - prompts twice for a web password and stores only Caddy's password hash under
