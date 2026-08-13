@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -39,7 +40,7 @@ from printing_agent.domain import (
 )
 from printing_agent.errors import ConflictError, NotFoundError, PolicyViolationError
 from printing_agent.modeling import MeshInspector, ModelPipeline, OpenScadSourcePolicy
-from printing_agent.multipart import ThreeMFService
+from printing_agent.multipart import ThreeMFService, _module_name
 from printing_agent.printers import SimulatedPrinterAdapter
 from printing_agent.repositories import WorkflowRepository
 
@@ -68,6 +69,15 @@ def test_source_policy_rejects_external_capabilities() -> None:
 
     policy.validate("cube([10, 10, 10]);", None)
     policy.validate('import("source.stl");', "source.stl")
+
+
+def test_openscad_module_names_are_valid_and_collision_resistant() -> None:
+    hyphenated = _module_name("front-wheel")
+    underscored = _module_name("front_wheel")
+
+    assert hyphenated != underscored
+    assert hyphenated[0].isalpha()
+    assert all(character.isalnum() or character == "_" for character in hyphenated)
 
 
 def test_artifact_store_preserves_legacy_root_file_aliases(tmp_path: Path) -> None:
@@ -341,7 +351,15 @@ async def test_source_set_publishes_separate_parts_instances_and_package(
     assert "combined_stl" not in {item.role for item in artifact.files}
     assert artifact.three_mf_path is not None and artifact.three_mf_path.is_file()
     store = ArtifactStore(settings.artifact_dir)
-    first_bundle = store.build_artifact_bundle(workflow.id, artifact.version)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        bundles = list(
+            executor.map(
+                lambda _: store.build_artifact_bundle(workflow.id, artifact.version),
+                range(4),
+            )
+        )
+    assert len({path.read_bytes() for path in bundles}) == 1
+    first_bundle = bundles[0]
     first_bytes = first_bundle.read_bytes()
     assert store.build_artifact_bundle(workflow.id, artifact.version).read_bytes() == first_bytes
     with zipfile.ZipFile(first_bundle) as archive:
@@ -428,6 +446,7 @@ async def test_source_set_publishes_separate_parts_instances_and_package(
         inspector,
     )
     unchanged_body_digest = sha256_file(artifact.model_path.parent / "body.stl")
+    original_main_source = artifact.source_path.read_text(encoding="utf-8")
     original_axle_transform = next(
         instance.transform
         for instance in artifact.project.instances
@@ -456,6 +475,7 @@ async def test_source_set_publishes_separate_parts_instances_and_package(
         for instance in revised.project.instances
         if instance.part_id == "axle"
     ) != original_axle_transform
+    assert revised.source_path.read_text(encoding="utf-8") != original_main_source
     assert revised.three_mf_path is not None and revised.three_mf_path.is_file()
 
 

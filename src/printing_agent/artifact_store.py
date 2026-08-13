@@ -4,9 +4,10 @@ import hashlib
 import json
 import os
 import shutil
+import threading
 import zipfile
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from printing_agent.errors import PolicyViolationError
 
@@ -23,6 +24,7 @@ class ArtifactStore:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self._bundle_lock = threading.Lock()
 
     def workflow_root(self, workflow_id: str) -> Path:
         UUID(workflow_id)
@@ -246,22 +248,25 @@ class ArtifactStore:
                 indent=2,
             ).encode(),
         }
-        temporary = destination.with_suffix(".tmp")
-        try:
-            with zipfile.ZipFile(
-                temporary,
-                "w",
-                compression=zipfile.ZIP_DEFLATED,
-                compresslevel=9,
-            ) as archive:
-                for relative, path in entries:
-                    self._write_zip_entry(archive, relative, path.read_bytes())
-                for relative, data in sorted(generated.items()):
-                    self._write_zip_entry(archive, relative, data)
-            temporary.replace(destination)
-        except Exception:
-            temporary.unlink(missing_ok=True)
-            raise
+        with self._bundle_lock:
+            if destination.is_file():
+                return destination
+            temporary = destination.with_name(f"{destination.name}.{uuid4().hex}.tmp")
+            try:
+                with zipfile.ZipFile(
+                    temporary,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    compresslevel=9,
+                ) as archive:
+                    for relative, path in entries:
+                        self._write_zip_entry(archive, relative, path.read_bytes())
+                    for relative, data in sorted(generated.items()):
+                        self._write_zip_entry(archive, relative, data)
+                temporary.replace(destination)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
         return destination
 
     @staticmethod

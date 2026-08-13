@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -41,7 +42,8 @@ def _module_name(part_id: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_]+", "_", part_id)
     if not normalized or normalized[0].isdigit():
         normalized = f"part_{normalized}"
-    return normalized[:64]
+    suffix = hashlib.sha256(part_id.encode()).hexdigest()[:8]
+    return f"{normalized[:54]}_{suffix}"
 
 
 def _safe_color(value: str) -> Lib3MF.Color:
@@ -127,6 +129,26 @@ def repack_project_instances(
         max_width=max_layout_width,
     )
     return project.model_copy(update={"instances": instances}), layout
+
+
+def _write_source_set_main(project_directory: Path, project: PartProject) -> None:
+    module_names = {part.id: part.module_name for part in project.parts}
+    if any(name is None for name in module_names.values()):
+        raise ValidationError("Every source-set part requires an OpenSCAD module name")
+    source_lines = [f"use <parts/{part.id}.scad>" for part in project.parts]
+    source_lines.append("")
+    for instance in project.instances:
+        matrix = [
+            list(instance.transform[index : index + 4])
+            for index in range(0, 16, 4)
+        ]
+        source_lines.append(
+            f"multmatrix({json.dumps(matrix)}) {module_names[instance.part_id]}();"
+        )
+    (project_directory / "main.scad").write_text(
+        "\n".join(source_lines) + "\n",
+        encoding="utf-8",
+    )
 
 
 def build_source_set_project(
@@ -265,7 +287,6 @@ def write_source_set_artifact(
         selection.file_id: (selection, file, path)
         for selection, file, path, _ in selected
     }
-    source_lines: list[str] = []
     for asset in project.source_assets:
         selection, _, source = selected_by_id[asset.id.removeprefix("source_")]
         stored_filename = Path(asset.path).name
@@ -291,24 +312,10 @@ def write_source_set_artifact(
             "}\n",
             encoding="utf-8",
         )
-        source_lines.append(f"use <parts/{selection.part_id}.scad>")
         part_meshes[selection.part_id].export(
             parts_directory / f"{selection.part_id}.stl"
         )
-    source_lines.append("")
-    for instance in project.instances:
-        matrix = [
-            list(instance.transform[index : index + 4])
-            for index in range(0, 16, 4)
-        ]
-        module_name = next(
-            part.module_name for part in project.parts if part.id == instance.part_id
-        )
-        source_lines.append(f"multmatrix({json.dumps(matrix)}) {module_name}();")
-    (project_directory / "main.scad").write_text(
-        "\n".join(source_lines) + "\n",
-        encoding="utf-8",
-    )
+    _write_source_set_main(project_directory, project)
     project_path = project_directory / "project.json"
     project_path.write_text(
         json.dumps(project.model_dump(mode="json"), sort_keys=True, indent=2),
@@ -410,6 +417,7 @@ def rebuild_part_project_artifact(
     classification: list[dict[str, object]],
     handoff_digest: str,
 ) -> tuple[dict[str, object], list[ArtifactFile]]:
+    _write_source_set_main(directory / "project", project)
     project_path = directory / "project" / "project.json"
     project_path.write_text(
         json.dumps(project.model_dump(mode="json"), sort_keys=True, indent=2),
