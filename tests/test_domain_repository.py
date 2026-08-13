@@ -8,12 +8,14 @@ import pytest
 from printing_agent.domain import (
     ArtifactApproval,
     Dimensions,
+    ModelCandidate,
     ModelDecision,
     ModelingHandoff,
     ModelPlan,
     PrinterCapabilitySummary,
     RevisionMode,
     RevisionRequest,
+    SearchRound,
     WorkflowState,
     WorkKind,
 )
@@ -33,6 +35,31 @@ async def test_workflow_transitions_are_persisted_with_events(
         WorkflowState.RECEIVED,
         WorkflowState.PLANNING,
     ]
+
+
+async def test_search_round_persists_model_candidate_objects(
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Print a toy truck", "simulator")
+    candidate = ModelCandidate(
+        id="truck-1",
+        title="Printable toy truck",
+        source_url="https://www.thingiverse.com/thing:truck-1",
+        license="cc-by",
+        allows_derivatives=True,
+    )
+    search_round = SearchRound(
+        workflow_id=workflow.id,
+        query="toy truck",
+        page=1,
+        candidate_ids=[candidate.id],
+    )
+
+    await repository.save_search_round(search_round, [candidate])
+    loaded_round, candidates = await repository.get_search_round(search_round.id)
+
+    assert loaded_round == search_round
+    assert candidates[0]["title"] == candidate.title
 
 
 async def test_illegal_transition_is_rejected(repository: WorkflowRepository) -> None:
