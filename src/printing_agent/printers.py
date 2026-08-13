@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 from datetime import timedelta
 from pathlib import Path
+
+import numpy as np
+import trimesh
 
 from printing_agent.domain import (
     Dimensions,
@@ -52,6 +56,36 @@ def select_submission_file(
     if "stl" in capabilities.accepted_formats and artifact.model_path.is_file():
         return artifact.model_path
     raise ValidationError("Printer does not accept an available artifact format")
+
+
+def export_print_layout_stl(artifact: ModelArtifact, destination: Path) -> None:
+    if artifact.project is None or len(artifact.project.parts) <= 1:
+        shutil.copy2(artifact.model_path, destination)
+        return
+    artifact_root = (
+        artifact.project_path.parent.parent
+        if artifact.project_path is not None
+        else artifact.model_path.parent.parent
+    )
+    part_files = {
+        item.part_id: artifact_root / item.path
+        for item in artifact.files
+        if item.role == "part_stl" and item.part_id
+    }
+    placed: list[trimesh.Trimesh] = []
+    for instance in artifact.project.instances:
+        path = part_files.get(instance.part_id)
+        if path is None or not path.is_file():
+            raise ValidationError(f"Part STL '{instance.part_id}' is unavailable")
+        loaded = trimesh.load(path, file_type="stl", force="mesh")
+        mesh = (
+            trimesh.util.concatenate(tuple(loaded.geometry.values()))
+            if isinstance(loaded, trimesh.Scene)
+            else loaded
+        )
+        mesh.apply_transform(np.asarray(instance.transform).reshape((4, 4)))
+        placed.append(mesh)
+    trimesh.util.concatenate(placed).export(destination)
 
 
 class SimulatedPrinterAdapter:
@@ -107,8 +141,16 @@ class SimulatedPrinterAdapter:
         external_id = new_id()
         job_dir = self.spool_dir / external_id
         job_dir.mkdir(parents=False, exist_ok=False)
-        selected = select_submission_file(artifact, await self.capabilities())
-        shutil.copy2(selected, job_dir / selected.name)
+        capabilities = await self.capabilities()
+        selected = select_submission_file(artifact, capabilities)
+        if artifact.project is not None and len(artifact.project.parts) > 1:
+            await asyncio.to_thread(
+                export_print_layout_stl,
+                artifact,
+                job_dir / "model.stl",
+            )
+        else:
+            shutil.copy2(selected, job_dir / selected.name)
         now = utc_now()
         job = PrintJob(
             workflow_id=workflow_id,

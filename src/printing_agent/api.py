@@ -139,9 +139,22 @@ def create_app(container: Container | None = None) -> FastAPI:
                     "part_project",
                     "multipart_3mf",
                     "combined_stl",
+                    "publisher_combined_stl",
                     "part_stl",
                 }
             ]
+            bundle = container.artifacts.build_artifact_bundle(
+                artifact.workflow_id,
+                artifact.version,
+            )
+            artifact_payload["package"] = {
+                "url": (
+                    f"/api/v1/workflows/{artifact.workflow_id}/artifacts/"
+                    f"{artifact.version}/package"
+                ),
+                "size_bytes": bundle.stat().st_size,
+                "filename": f"artifact-{artifact.workflow_id[:8]}-v{artifact.version}.zip",
+            }
         return {
             "workflow": workflow.model_dump(mode="json"),
             "artifact": artifact_payload,
@@ -209,6 +222,23 @@ def create_app(container: Container | None = None) -> FastAPI:
             stream(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get(
+        "/api/v1/workflows/{workflow_id}/artifacts/{version}/package",
+        response_class=FileResponse,
+    )
+    async def artifact_package(
+        workflow_id: str,
+        version: int,
+        request: Request,
+    ) -> FileResponse:
+        await get_container(request).repository.get_artifact(workflow_id, version)
+        path = get_container(request).artifacts.build_artifact_bundle(workflow_id, version)
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename=f"artifact-{workflow_id[:8]}-v{version}.zip",
         )
 
     @app.get(

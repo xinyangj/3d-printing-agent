@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 import shutil
 from pathlib import Path
@@ -11,13 +12,18 @@ import trimesh
 from printing_agent.artifact_store import ArtifactStore, sha256_file
 from printing_agent.config import Settings
 from printing_agent.domain import (
+    AnnotationOrigin,
     ArtifactProvenance,
+    CandidateFile,
     Dimensions,
     MeshReport,
     ModelArtifact,
     ModelDecision,
     ModelingHandoff,
+    PartGeometryKind,
+    SelectedCandidateFile,
     SelectedSourceInspection,
+    SourceAsset,
     WorkflowState,
 )
 from printing_agent.errors import (
@@ -28,8 +34,12 @@ from printing_agent.errors import (
 )
 from printing_agent.multipart import (
     ThreeMFService,
+    build_source_set_project,
+    rebuild_part_project_artifact,
+    repack_project_instances,
     single_part_project,
     write_project_artifact,
+    write_source_set_artifact,
     write_structured_import_artifact,
 )
 from printing_agent.repositories import WorkflowRepository
@@ -445,6 +455,214 @@ class ModelPipeline:
                 )
             raise
 
+    async def adopt_part_revision(
+        self,
+        handoff: ModelingHandoff,
+        artifact: ModelArtifact,
+        part_id: str,
+        source_code: str,
+    ) -> ModelArtifact:
+        if artifact.project is None or len(artifact.project.parts) < 2:
+            raise ValidationError("Part-scoped revision requires a multipart artifact")
+        if artifact.project.assembly_status != "not_provided":
+            raise ValidationError(
+                "Part-scoped mesh revisions currently require a separated print-layout project"
+            )
+        part = next((item for item in artifact.project.parts if item.id == part_id), None)
+        if part is None:
+            raise ValidationError(f"Unknown target part '{part_id}'")
+        attempts = await self.repository.count_source_attempts(
+            handoff.workflow_id, handoff.version
+        )
+        if attempts >= self.settings.generation_attempt_budget:
+            raise BudgetExhaustedError("OpenSCAD generation attempt budget was exhausted")
+        attempt = await self.repository.next_source_attempt(
+            handoff.workflow_id, handoff.version
+        )
+        module_name = part.module_name or f"part_{part_id}"
+        canonical_source = (
+            f"module {module_name}() {{\n{source_code}\n}}\n{module_name}();\n"
+        )
+        source_digest = hashlib.sha256(canonical_source.encode()).hexdigest()
+        await self.repository.save_source_attempt(
+            handoff.workflow_id,
+            handoff.version,
+            attempt,
+            "received",
+            source_digest,
+        )
+        try:
+            self.source_policy.validate(source_code, "source.stl")
+            attempt_dir = self.artifacts.attempt_directory(
+                handoff.workflow_id, handoff.version, attempt
+            )
+            source_path = attempt_dir / "source.scad"
+            source_path.write_text(canonical_source, encoding="utf-8")
+            shutil.copy2(
+                artifact.model_path.parent / f"{part_id}.stl",
+                attempt_dir / "source.stl",
+            )
+            await self.repository.transition(
+                handoff.workflow_id,
+                WorkflowState.RENDERING,
+                event_kind="model.part_rendering",
+                payload={"part_id": part_id, "attempt": attempt},
+            )
+            temporary_model = attempt_dir / "part.tmp.stl"
+            await self.renderer.render(source_path, temporary_model)
+            await self.repository.transition(
+                handoff.workflow_id,
+                WorkflowState.VALIDATING,
+                event_kind="model.part_validating",
+                payload={"part_id": part_id, "attempt": attempt},
+            )
+            report = await self.mesh_inspector.inspect(temporary_model)
+            if not report.watertight or report.volume_mm3 <= 0:
+                raise ValidationError("Revised part must be watertight with positive volume")
+
+            version = await self.repository.next_artifact_version(handoff.workflow_id)
+            source_directory = artifact.project_path.parent.parent
+            staging = attempt_dir / "artifact"
+            shutil.copytree(source_directory, staging)
+            imports_directory = staging / "project" / "imports"
+            derived_name = f"{part_id}-revision-source-v{artifact.version}.stl"
+            derived_path = imports_directory / derived_name
+            shutil.copy2(
+                source_directory / "outputs" / "parts" / f"{part_id}.stl",
+                derived_path,
+            )
+            revised_path = staging / "outputs" / "parts" / f"{part_id}.stl"
+            temporary_model.replace(revised_path)
+            canonical_part_source = canonical_source.replace(
+                "source.stl", f"../imports/{derived_name}"
+            )
+            (staging / "project" / "parts" / f"{part_id}.scad").write_text(
+                canonical_part_source, encoding="utf-8"
+            )
+
+            asset_id = f"revision-{part_id[:40]}-{version}"
+            revised_asset = SourceAsset(
+                id=asset_id,
+                filename=derived_name,
+                format="stl",
+                digest=sha256_file(derived_path),
+                path=f"project/imports/{derived_name}",
+                role="revision_input",
+                original_cad=False,
+                annotation_origin=AnnotationOrigin.AGENT_INFERENCE,
+            )
+            revised_part = part.model_copy(
+                update={
+                    "geometry_kind": PartGeometryKind.DERIVED_MESH,
+                    "source_asset_id": asset_id,
+                    "annotation_origin": AnnotationOrigin.AGENT_INFERENCE,
+                }
+            )
+            revised_parts = [
+                revised_part if item.id == part_id else item
+                for item in artifact.project.parts
+            ]
+            project = artifact.project.model_copy(
+                update={
+                    "parts": revised_parts,
+                    "source_assets": [*artifact.project.source_assets, revised_asset],
+                }
+            )
+            part_reports = dict(artifact.part_meshes)
+            part_reports[part_id] = report
+            meshes: dict[str, trimesh.Trimesh] = {}
+            for project_part in project.parts:
+                loaded = trimesh.load_mesh(
+                    staging / "outputs" / "parts" / f"{project_part.id}.stl",
+                    force="mesh",
+                )
+                meshes[project_part.id] = loaded
+            project, layout = repack_project_instances(
+                project,
+                meshes,
+                max_layout_width=handoff.target_printer.build_volume.width_mm,
+            )
+            layout_path = attempt_dir / "layout.stl"
+            await asyncio.to_thread(layout.export, layout_path)
+            mesh = await self.mesh_inspector.inspect(layout_path)
+            if not mesh.dimensions.fits(handoff.target_printer.build_volume):
+                raise ValidationError("Revised print layout exceeds the target build volume")
+            old_manifest = artifact.project_path.parent.parent / "manifest.json"
+            old_data = json.loads(old_manifest.read_text(encoding="utf-8"))
+            manifest, files = await asyncio.to_thread(
+                rebuild_part_project_artifact,
+                directory=staging,
+                workflow_id=handoff.workflow_id,
+                version=version,
+                project=project,
+                mesh=mesh,
+                part_reports=part_reports,
+                provenance=artifact.provenance,
+                classification=list(old_data.get("source_set_classification", [])),
+                handoff_digest=handoff.digest or "",
+            )
+            adopted = self.artifacts.adopt_project(
+                handoff.workflow_id, version, staging
+            )
+            primary_part = project.parts[0].id
+            adopted_source = adopted / "project" / "main.scad"
+            revised_artifact = ModelArtifact(
+                schema_version="2",
+                workflow_id=handoff.workflow_id,
+                version=version,
+                source_path=adopted_source,
+                model_path=adopted / "outputs" / "parts" / f"{primary_part}.stl",
+                project_path=adopted / "project" / "project.json",
+                three_mf_path=adopted / "outputs" / "model.3mf",
+                source_digest=sha256_file(adopted_source),
+                model_digest=str(manifest["model_digest"]),
+                project_digest=str(manifest["project_digest"]),
+                three_mf_digest=str(manifest["three_mf_digest"]),
+                manifest_digest=str(manifest["manifest_digest"]),
+                mesh=mesh,
+                project=project,
+                part_meshes=part_reports,
+                files=files,
+                provenance=artifact.provenance,
+            )
+            await self.repository.save_artifact(revised_artifact)
+            await self.repository.save_source_attempt(
+                handoff.workflow_id,
+                handoff.version,
+                attempt,
+                "adopted",
+                source_digest,
+            )
+            await self.repository.transition(
+                handoff.workflow_id,
+                WorkflowState.AWAITING_APPROVAL,
+                event_kind="artifact.part_revision_ready",
+                payload={
+                    "artifact_version": version,
+                    "part_id": part_id,
+                    "manifest_digest": revised_artifact.manifest_digest,
+                },
+            )
+            return revised_artifact
+        except Exception as exc:
+            await self.repository.save_source_attempt(
+                handoff.workflow_id,
+                handoff.version,
+                attempt,
+                "rejected",
+                source_digest,
+                str(exc)[-2_000:],
+            )
+            workflow = await self.repository.get_workflow(handoff.workflow_id)
+            if workflow.state in {WorkflowState.RENDERING, WorkflowState.VALIDATING}:
+                await self.repository.transition(
+                    handoff.workflow_id,
+                    WorkflowState.GENERATING,
+                    event_kind="model.part_repair_requested",
+                    payload={"part_id": part_id, "diagnostics": str(exc)[-2_000:]},
+                )
+            raise
+
     async def adopt_existing(
         self,
         workflow_id: str,
@@ -597,6 +815,102 @@ class ModelPipeline:
                 "part_count": len(project.parts),
             },
         )
+        return artifact
+
+    async def adopt_existing_set(
+        self,
+        workflow_id: str,
+        selected: list[
+            tuple[SelectedCandidateFile, CandidateFile, Path, MeshReport]
+        ],
+        provenance: ArtifactProvenance,
+        build_volume: Dimensions,
+        *,
+        shared_scale: float,
+        description: str,
+        classification: list[SelectedCandidateFile],
+    ) -> ModelArtifact:
+        version = await self.repository.next_artifact_version(workflow_id)
+        project, part_meshes, layout_mesh = await asyncio.to_thread(
+            build_source_set_project,
+            selected,
+            shared_scale=shared_scale,
+            max_layout_width=build_volume.width_mm,
+            description=description,
+        )
+        workspace = (
+            self.artifacts.workflow_root(workflow_id)
+            / "staging"
+            / f"source-set-{version}"
+        )
+        inspection_directory = workspace / "inspection"
+        inspection_directory.mkdir(parents=True, exist_ok=False)
+        part_reports: dict[str, MeshReport] = {}
+        for part_id, part_mesh in part_meshes.items():
+            part_path = inspection_directory / f"{part_id}.stl"
+            await asyncio.to_thread(part_mesh.export, part_path)
+            report = await self.mesh_inspector.inspect(part_path)
+            if not report.watertight or report.volume_mm3 <= 0:
+                raise ValidationError(f"Source-set part '{part_id}' must be watertight")
+            part_reports[part_id] = report
+        layout_path = inspection_directory / "layout.stl"
+        await asyncio.to_thread(layout_mesh.export, layout_path)
+        mesh = await self.mesh_inspector.inspect(layout_path)
+        if not mesh.dimensions.fits(build_volume):
+            raise ValidationError("Source-set print layout exceeds the target build volume")
+
+        staging = workspace / "artifact"
+        manifest, files = await asyncio.to_thread(
+            write_source_set_artifact,
+            directory=staging,
+            workflow_id=workflow_id,
+            version=version,
+            project=project,
+            selected=selected,
+            part_meshes=part_meshes,
+            layout_mesh=layout_mesh,
+            mesh=mesh,
+            part_reports=part_reports,
+            provenance=provenance,
+            classification=classification,
+        )
+        adopted = self.artifacts.adopt_project(workflow_id, version, staging)
+        shutil.rmtree(workspace, ignore_errors=True)
+        primary_part = project.parts[0].id
+        source_path = adopted / "project" / "main.scad"
+        artifact = ModelArtifact(
+            schema_version="2",
+            workflow_id=workflow_id,
+            version=version,
+            source_path=source_path,
+            model_path=adopted / "outputs" / "parts" / f"{primary_part}.stl",
+            project_path=adopted / "project" / "project.json",
+            three_mf_path=adopted / "outputs" / "model.3mf",
+            source_digest=sha256_file(source_path),
+            model_digest=str(manifest["model_digest"]),
+            project_digest=str(manifest["project_digest"]),
+            three_mf_digest=str(manifest["three_mf_digest"]),
+            manifest_digest=str(manifest["manifest_digest"]),
+            mesh=mesh,
+            project=project,
+            part_meshes=part_reports,
+            files=files,
+            provenance=provenance,
+        )
+        await self.repository.save_artifact(artifact)
+        workflow = await self.repository.get_workflow(workflow_id)
+        if workflow.state == WorkflowState.VALIDATING:
+            await self.repository.transition(
+                workflow_id,
+                WorkflowState.AWAITING_APPROVAL,
+                event_kind="artifact.ready",
+                payload={
+                    "artifact_version": version,
+                    "manifest_digest": artifact.manifest_digest,
+                    "part_count": len(project.parts),
+                    "instance_count": len(project.instances),
+                },
+            )
         return artifact
 
     @staticmethod

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import zipfile
 from pathlib import Path
 from uuid import UUID
 
@@ -142,3 +143,135 @@ class ArtifactStore:
         if artifact_directory.resolve() not in path.parents or not path.is_file():
             raise PolicyViolationError("Artifact path is not available")
         return path
+
+    def build_artifact_bundle(self, workflow_id: str, version: int) -> Path:
+        artifact_directory = self.artifact_directory(workflow_id, version).resolve()
+        manifest_path = artifact_directory / "manifest.json"
+        if not manifest_path.is_file():
+            raise PolicyViolationError("Artifact manifest is missing")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, TypeError) as exc:
+            raise PolicyViolationError("Artifact manifest is invalid") from exc
+        manifest_digest = str(manifest.get("manifest_digest") or sha256_file(manifest_path))
+        bundle_directory = self.workflow_root(workflow_id) / "bundles"
+        bundle_directory.mkdir(parents=True, exist_ok=True)
+        destination = bundle_directory / f"artifact-v{version}-{manifest_digest[:12]}.zip"
+        if destination.is_file():
+            return destination
+
+        listed_files = manifest.get("files", [])
+        relative_paths = {"manifest.json"}
+        if isinstance(listed_files, list):
+            relative_paths.update(
+                item["path"]
+                for item in listed_files
+                if isinstance(item, dict) and isinstance(item.get("path"), str)
+            )
+        if len(relative_paths) == 1:
+            relative_paths.update(
+                name
+                for name in ("source.scad", "model.stl")
+                if (artifact_directory / name).is_file()
+            )
+        entries: list[tuple[str, Path]] = []
+        total_size = 0
+        for relative in sorted(relative_paths):
+            normalized = relative.replace("\\", "/")
+            if Path(normalized).is_absolute() or ".." in Path(normalized).parts:
+                raise PolicyViolationError("Artifact manifest contains an unsafe path")
+            path = (artifact_directory / normalized).resolve()
+            if artifact_directory not in path.parents or not path.is_file() or path.is_symlink():
+                raise PolicyViolationError("Artifact package file is unavailable")
+            total_size += path.stat().st_size
+            if total_size > 500 * 1024 * 1024:
+                raise PolicyViolationError("Artifact package exceeds the size limit")
+            entries.append((normalized, path))
+
+        project = manifest.get("project") if isinstance(manifest.get("project"), dict) else {}
+        parts = project.get("parts", []) if isinstance(project, dict) else []
+        instances = project.get("instances", []) if isinstance(project, dict) else []
+        warnings = project.get("warnings", []) if isinstance(project, dict) else []
+        quantities: dict[str, int] = {}
+        for instance in instances if isinstance(instances, list) else []:
+            if isinstance(instance, dict) and isinstance(instance.get("part_id"), str):
+                part_id = instance["part_id"]
+                quantities[part_id] = quantities.get(part_id, 0) + 1
+        part_lines = [
+            f"- {part.get('name', part.get('id', 'Part'))}: quantity "
+            f"{quantities.get(str(part.get('id')), 1)}"
+            for part in parts
+            if isinstance(part, dict)
+        ]
+        readme = "\n".join(
+            [
+                f"3D Printing Agent artifact v{version}",
+                "",
+                "This package is bound to manifest digest:",
+                manifest_digest,
+                "",
+                "Parts:",
+                *(part_lines or ["- Historical single-file artifact"]),
+                "",
+                "Important:",
+                "- Multipart transforms describe a separated print layout, not physical assembly.",
+                *[
+                    f"- {warning}"
+                    for warning in warnings
+                    if isinstance(warning, str)
+                ],
+                "",
+                "Provenance:",
+                json.dumps(manifest.get("provenance", {}), sort_keys=True),
+                "",
+            ]
+        ).encode()
+        index = {
+            "artifact_version": version,
+            "manifest_digest": manifest_digest,
+            "files": [
+                {
+                    "path": relative,
+                    "digest": sha256_file(path),
+                    "size_bytes": path.stat().st_size,
+                }
+                for relative, path in entries
+            ],
+        }
+        generated = {
+            "README.txt": readme,
+            "package-index.json": json.dumps(
+                index,
+                sort_keys=True,
+                indent=2,
+            ).encode(),
+        }
+        temporary = destination.with_suffix(".tmp")
+        try:
+            with zipfile.ZipFile(
+                temporary,
+                "w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+            ) as archive:
+                for relative, path in entries:
+                    self._write_zip_entry(archive, relative, path.read_bytes())
+                for relative, data in sorted(generated.items()):
+                    self._write_zip_entry(archive, relative, data)
+            temporary.replace(destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        return destination
+
+    @staticmethod
+    def _write_zip_entry(
+        archive: zipfile.ZipFile,
+        relative_path: str,
+        data: bytes,
+    ) -> None:
+        info = zipfile.ZipInfo(relative_path, date_time=(1980, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.create_system = 3
+        info.external_attr = 0o100644 << 16
+        archive.writestr(info, data)

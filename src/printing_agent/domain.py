@@ -94,6 +94,21 @@ class AnnotationOrigin(StrEnum):
     AGENT_INFERENCE = "agent_inference"
 
 
+class SelectedFileRole(StrEnum):
+    UNIQUE_PART = "unique_part"
+    COMBINED_MODEL = "combined_model"
+    ALTERNATE = "alternate"
+    SUPPORT = "support"
+    EXCLUDED = "excluded"
+
+
+class InterfaceEvidence(StrEnum):
+    AUTHORITATIVE = "authoritative"
+    VERIFIED_INFERENCE = "verified_inference"
+    CANDIDATE = "candidate"
+    UNKNOWN = "unknown"
+
+
 class Dimensions(FrozenModel):
     width_mm: float = Field(gt=0)
     depth_mm: float = Field(gt=0)
@@ -185,20 +200,52 @@ class SelectedSourceInspection(FrozenModel):
     inspected_at: datetime = Field(default_factory=utc_now)
 
 
+class SelectedCandidateFile(FrozenModel):
+    file_id: str = Field(min_length=1, max_length=100)
+    role: SelectedFileRole
+    part_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    part_name: str | None = Field(default=None, min_length=1, max_length=200)
+    quantity: int = Field(default=1, ge=1, le=100)
+    color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    rationale: str = Field(min_length=1, max_length=1000)
+    confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_role(self) -> SelectedCandidateFile:
+        if self.role == SelectedFileRole.UNIQUE_PART:
+            if not self.part_id or not self.part_name:
+                raise ValueError("Unique part files require part_id and part_name")
+        elif self.part_id is not None or self.part_name is not None or self.quantity != 1:
+            raise ValueError("Only unique part files may define part identity or quantity")
+        return self
+
+
 class DiscoveryDecision(FrozenModel):
     decision: ModelDecision
     candidate_id: str | None = None
     file_id: str | None = None
+    selected_files: list[SelectedCandidateFile] = Field(default_factory=list, max_length=100)
+    shared_scale: float = Field(default=1, gt=0, le=1000)
     rationale: str = Field(min_length=1, max_length=2000)
     required_changes: list[str] = Field(default_factory=list, max_length=20)
 
     @model_validator(mode="after")
     def validate_source_choice(self) -> DiscoveryDecision:
         if self.decision == ModelDecision.CREATE:
-            if self.candidate_id is not None or self.file_id is not None:
+            if self.candidate_id is not None or self.file_id is not None or self.selected_files:
                 raise ValueError("Creation decisions cannot select a candidate file")
-        elif not self.candidate_id or not self.file_id:
-            raise ValueError("A candidate and file are required for modify/use_as_is")
+        elif not self.candidate_id or (not self.file_id and not self.selected_files):
+            raise ValueError("A candidate and at least one file are required")
+        selected_ids = [item.file_id for item in self.selected_files]
+        if len(selected_ids) != len(set(selected_ids)):
+            raise ValueError("Selected source-set file IDs must be unique")
+        part_ids = [
+            item.part_id
+            for item in self.selected_files
+            if item.role == SelectedFileRole.UNIQUE_PART
+        ]
+        if len(part_ids) != len(set(part_ids)):
+            raise ValueError("Selected source-set part IDs must be unique")
         return self
 
 
@@ -319,6 +366,15 @@ class PartInstance(FrozenModel):
     confidence: float = Field(ge=0, le=1)
 
 
+class MatingInterface(FrozenModel):
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    part_ids: list[str] = Field(min_length=2, max_length=10)
+    interface_type: str = Field(min_length=1, max_length=100)
+    evidence: InterfaceEvidence
+    rationale: str = Field(min_length=1, max_length=1000)
+    fit_verified: bool = False
+
+
 class PartProject(FrozenModel):
     schema_version: Literal["1"] = "1"
     units: Literal["millimeter"] = "millimeter"
@@ -326,6 +382,8 @@ class PartProject(FrozenModel):
     instances: list[PartInstance] = Field(min_length=1, max_length=5_000)
     materials: list[MaterialDefinition] = Field(default_factory=list, max_length=100)
     source_assets: list[SourceAsset] = Field(default_factory=list, max_length=500)
+    assembly_status: Literal["provided", "not_provided", "unknown"] = "unknown"
+    interfaces: list[MatingInterface] = Field(default_factory=list, max_length=200)
     warnings: list[str] = Field(default_factory=list, max_length=100)
 
     @model_validator(mode="after")
@@ -348,6 +406,12 @@ class PartProject(FrozenModel):
             if part.source_asset_id
         ):
             raise ValueError("Every part source asset must reference a known source asset")
+        if any(
+            part_id not in part_ids
+            for interface in self.interfaces
+            for part_id in interface.part_ids
+        ):
+            raise ValueError("Every mating interface must reference known parts")
         return self
 
 

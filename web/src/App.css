@@ -651,6 +651,25 @@ select:focus {
   color: var(--teal);
 }
 
+.viewer-notice,
+.viewer-errors {
+  background: rgba(17, 21, 25, 0.9);
+  bottom: 14px;
+  color: #f2b45e;
+  font-family: var(--mono);
+  font-size: 10px;
+  left: 14px;
+  padding: 8px 10px;
+  position: absolute;
+  text-transform: uppercase;
+  z-index: 2;
+}
+
+.viewer-errors {
+  bottom: 48px;
+  color: #ff9b9b;
+}
+
 .dimension-ribbon {
   bottom: 15px;
   display: flex;
@@ -743,6 +762,11 @@ select:focus {
   color: var(--teal-dark);
   font-size: 12px;
   text-transform: capitalize;
+}
+
+.package-download {
+  margin-top: 12px;
+  text-decoration: none;
 }
 
 .metric-grid {

@@ -4,6 +4,7 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
 import './App.css'
+import { MultipartPartsViewer } from './MultipartModelViewer'
 
 type Dimensions = {
   width_mm: number
@@ -52,8 +53,22 @@ type Artifact = {
       confidence: number
       material_id: string | null
     }>
-    instances: Array<{ id: string; part_id: string; name: string }>
+    instances: Array<{
+      id: string
+      part_id: string
+      name: string
+      transform: number[]
+    }>
     materials: Array<{ id: string; name: string; color: string }>
+    assembly_status: 'provided' | 'not_provided' | 'unknown'
+    interfaces: Array<{
+      id: string
+      part_ids: string[]
+      interface_type: string
+      evidence: string
+      rationale: string
+      fit_verified: boolean
+    }>
     warnings: string[]
   } | null
   downloads: Array<{
@@ -62,6 +77,11 @@ type Artifact = {
     media_type: string
     part_id: string | null
   }>
+  package: {
+    url: string
+    size_bytes: number
+    filename: string
+  }
 }
 
 type PrintJob = {
@@ -93,6 +113,12 @@ type WorkflowEvent = {
 }
 
 const API = '/api/v1'
+
+function artifactPreviewUrl(workflowId: string, artifact: Artifact): string {
+  const firstPart = artifact.downloads.find((item) => item.role === 'part_stl')
+  const path = firstPart?.path ?? 'model.stl'
+  return `${API}/workflows/${workflowId}/artifacts/${artifact.version}/${path}`
+}
 const TERMINAL_STATES = new Set([
   'completed',
   'cancelled',
@@ -327,6 +353,198 @@ function ModelViewer({
           camera.bottom = -span
           camera.updateProjectionMatrix()
         }
+
+        function MultipartModelViewer({
+          artifact,
+          workflowId,
+          selectedPartId,
+          onSelectPart,
+        }: {
+          artifact: Artifact
+          workflowId: string
+          selectedPartId: string | null
+          onSelectPart: (partId: string) => void
+        }) {
+          const containerRef = useRef<HTMLDivElement>(null)
+          const [mode, setMode] = useState<'unique' | 'quantities'>('unique')
+          const [wireframe, setWireframe] = useState(false)
+          const [errors, setErrors] = useState<string[]>([])
+
+          useEffect(() => {
+            const container = containerRef.current
+            const project = artifact.project
+            if (!container || !project) return
+            const width = container.clientWidth
+            const height = container.clientHeight
+            const scene = new THREE.Scene()
+            scene.background = new THREE.Color('#111519')
+            const camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 5000)
+            camera.position.set(180, 150, 180)
+            const renderer = new THREE.WebGLRenderer({ antialias: true })
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+            renderer.setSize(width, height)
+            renderer.outputColorSpace = THREE.SRGBColorSpace
+            container.appendChild(renderer.domElement)
+            const controls = new OrbitControls(camera, renderer.domElement)
+            controls.enableDamping = true
+            const ambient = new THREE.HemisphereLight('#eaf7ff', '#25301d', 2.1)
+            scene.add(ambient)
+            const key = new THREE.DirectionalLight('#ffffff', 3.2)
+            key.position.set(120, 180, 100)
+            scene.add(key)
+            scene.add(new THREE.GridHelper(300, 24, '#4e645f', '#25302e'))
+
+            const loader = new STLLoader()
+            const meshes: THREE.Mesh[] = []
+            let disposed = false
+            let frame = 0
+            const load = async () => {
+              const failures: string[] = []
+              const geometries = new Map<string, THREE.BufferGeometry>()
+              await Promise.all(
+                project.parts.map(async (part) => {
+                  const download = artifact.downloads.find(
+                    (item) => item.role === 'part_stl' && item.part_id === part.id,
+                  )
+                  if (!download) {
+                    failures.push(`${part.name}: STL unavailable`)
+                    return
+                  }
+                  try {
+                    const geometry = await loader.loadAsync(
+                      `${API}/workflows/${workflowId}/artifacts/${artifact.version}/${download.path}`,
+                    )
+                    geometry.computeVertexNormals()
+                    geometries.set(part.id, geometry)
+                  } catch {
+                    failures.push(`${part.name}: failed to load`)
+                  }
+                }),
+              )
+              if (disposed) {
+                geometries.forEach((geometry) => geometry.dispose())
+                return
+              }
+              setErrors(failures)
+              const materialColors = new Map(
+                project.materials.map((material) => [material.id, material.color]),
+              )
+              let cursor = 0
+              const renderItems =
+                mode === 'quantities'
+                  ? project.instances
+                  : project.parts.map((part) => ({
+                      id: `${part.id}_unique`,
+                      part_id: part.id,
+                      name: part.name,
+                      transform: null,
+                    }))
+              renderItems.forEach((item) => {
+                const part = project.parts.find((candidate) => candidate.id === item.part_id)
+                const source = geometries.get(item.part_id)
+                if (!part || !source) return
+                const geometry = source.clone()
+                geometry.computeBoundingBox()
+                const bounds = geometry.boundingBox!
+                const material = new THREE.MeshStandardMaterial({
+                  color:
+                    selectedPartId === part.id
+                      ? '#f2b45e'
+                      : (materialColors.get(part.material_id ?? '') ?? '#79e2ca'),
+                  roughness: 0.42,
+                  metalness: 0.08,
+                  wireframe,
+                })
+                const mesh = new THREE.Mesh(geometry, material)
+                mesh.userData.partId = part.id
+                mesh.userData.instanceId = item.id
+                if (mode === 'quantities' && item.transform) {
+                  mesh.matrixAutoUpdate = false
+                  mesh.matrix.fromArray(item.transform).transpose()
+                } else {
+                  mesh.position.set(cursor - bounds.min.x, -bounds.min.y, -bounds.min.z)
+                  cursor += bounds.max.x - bounds.min.x + 8
+                }
+                scene.add(mesh)
+                meshes.push(mesh)
+              })
+              geometries.forEach((geometry) => geometry.dispose())
+              const visibleBounds = new THREE.Box3()
+              meshes.forEach((mesh) => visibleBounds.expandByObject(mesh))
+              if (!visibleBounds.isEmpty()) {
+                const size = visibleBounds.getSize(new THREE.Vector3())
+                const center = visibleBounds.getCenter(new THREE.Vector3())
+                const span = Math.max(size.x, size.y, size.z, 20)
+                camera.position.set(center.x + span * 1.5, center.y + span, center.z + span * 1.5)
+                controls.target.copy(center)
+              }
+            }
+            void load()
+
+            const raycaster = new THREE.Raycaster()
+            const pointer = new THREE.Vector2()
+            const selectMesh = (event: PointerEvent) => {
+              const rect = renderer.domElement.getBoundingClientRect()
+              pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
+              pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
+              raycaster.setFromCamera(pointer, camera)
+              const hit = raycaster.intersectObjects(meshes, false)[0]
+              if (hit?.object.userData.partId) onSelectPart(hit.object.userData.partId)
+            }
+            renderer.domElement.addEventListener('pointerdown', selectMesh)
+            const resize = new ResizeObserver(() => {
+              const nextWidth = container.clientWidth
+              const nextHeight = container.clientHeight
+              renderer.setSize(nextWidth, nextHeight)
+              camera.aspect = nextWidth / nextHeight
+              camera.updateProjectionMatrix()
+            })
+            resize.observe(container)
+            const animate = () => {
+              controls.update()
+              renderer.render(scene, camera)
+              frame = requestAnimationFrame(animate)
+            }
+            animate()
+            return () => {
+              disposed = true
+              cancelAnimationFrame(frame)
+              resize.disconnect()
+              renderer.domElement.removeEventListener('pointerdown', selectMesh)
+              controls.dispose()
+              meshes.forEach((mesh) => {
+                mesh.geometry.dispose()
+                if (Array.isArray(mesh.material)) mesh.material.forEach((item) => item.dispose())
+                else mesh.material.dispose()
+              })
+              renderer.dispose()
+              container.removeChild(renderer.domElement)
+            }
+          }, [artifact, mode, onSelectPart, selectedPartId, wireframe, workflowId])
+
+          return (
+            <div className="viewer-shell">
+              <div className="viewer-toolbar">
+                <button className={mode === 'unique' ? 'active' : ''} onClick={() => setMode('unique')}>
+                  Unique parts
+                </button>
+                <button
+                  className={mode === 'quantities' ? 'active' : ''}
+                  onClick={() => setMode('quantities')}
+                >
+                  Print quantities
+                </button>
+                <button className={wireframe ? 'active' : ''} onClick={() => setWireframe(!wireframe)}>
+                  Wireframe
+                </button>
+              </div>
+              <div className="model-viewer" ref={containerRef} aria-label="Separated multipart STL viewer" />
+              <div className="viewer-notice">Separated parts / print layout—not assembled</div>
+              {errors.length > 0 && <div className="viewer-errors">{errors.join(' · ')}</div>}
+            </div>
+          )
+        }
+        void MultipartModelViewer
         controls.update()
         scene.add(new THREE.Box3Helper(bounds, new THREE.Color('#f2b45e')))
       },
@@ -592,7 +810,7 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
       <section className="model-grid">
         {items.map(({ workflow, artifact, job }) => {
           const modelUrl = artifact
-            ? `${API}/workflows/${workflow.id}/artifacts/${artifact.version}/model.stl`
+            ? artifactPreviewUrl(workflow.id, artifact)
             : null
           return (
             <article
@@ -742,7 +960,7 @@ function WorkflowPanel({
   }, [artifact, selectedPartId])
   const canInspect = Boolean(workflow && artifact && INSPECTABLE_STATE.has(workflow.state))
   const modelUrl = artifact
-    ? `${API}/workflows/${workflowId}/artifacts/${artifact.version}/model.stl`
+    ? artifactPreviewUrl(workflowId, artifact)
     : ''
   const sourceQuery = useQuery({
     queryKey: ['source', workflowId, artifact?.version],
@@ -919,7 +1137,35 @@ function WorkflowPanel({
       {canInspect && artifact && (
         <>
           <section className="inspection-grid">
-            <ModelViewer url={modelUrl} dimensions={artifact.mesh.dimensions} />
+            {artifact.project && artifact.project.parts.length > 1 ? (
+              <MultipartPartsViewer
+                parts={artifact.project.parts.map((part) => {
+                  const download = artifact.downloads.find(
+                    (item) => item.role === 'part_stl' && item.part_id === part.id,
+                  )
+                  const material = artifact.project!.materials.find(
+                    (item) => item.id === part.material_id,
+                  )
+                  return {
+                    id: part.id,
+                    name: part.name,
+                    color: material?.color ?? '#79e2ca',
+                    url: download
+                      ? `${API}/workflows/${workflowId}/artifacts/${artifact.version}/${download.path}`
+                      : '',
+                  }
+                })}
+                instances={artifact.project.instances.map((instance) => ({
+                  id: instance.id,
+                  partId: instance.part_id,
+                  transform: instance.transform,
+                }))}
+                selectedPartId={selectedPartId}
+                onSelectPart={setSelectedPartId}
+              />
+            ) : (
+              <ModelViewer url={modelUrl} dimensions={artifact.mesh.dimensions} />
+            )}
             <aside className="inspection-panel">
               <div className="panel-section">
                 <span className="section-label">Original request</span>
@@ -996,6 +1242,13 @@ function WorkflowPanel({
                       {warning}
                     </p>
                   ))}
+                  {artifact.project.interfaces.map((item) => (
+                    <p className="part-warning" key={item.id}>
+                      <strong>{item.interface_type.replaceAll('_', ' ')}</strong> ·{' '}
+                      {item.fit_verified ? 'fit verified' : 'physical fit not verified'} ·{' '}
+                      {item.rationale}
+                    </p>
+                  ))}
                 </div>
               )}
               {artifact.downloads.length > 0 && (
@@ -1013,6 +1266,14 @@ function WorkflowPanel({
                       </a>
                     ))}
                   </div>
+                  <a
+                    className="secondary-action package-download"
+                    href={artifact.package.url}
+                    download={artifact.package.filename}
+                  >
+                    Download all artifacts (.zip) ·{' '}
+                    {formatNumber(artifact.package.size_bytes / 1024, 0)} KB
+                  </a>
                 </div>
               )}
               <div className="digest">

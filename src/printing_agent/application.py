@@ -5,7 +5,7 @@ import json
 import shutil
 from typing import cast
 
-from printing_agent.artifact_store import ArtifactStore
+from printing_agent.artifact_store import ArtifactStore, sha256_file
 from printing_agent.catalogs import ThingiverseCatalog
 from printing_agent.config import Settings
 from printing_agent.copilot_agents import CopilotDiscoveryAgent, CopilotModelingAgent
@@ -20,6 +20,7 @@ from printing_agent.domain import (
     PrintWorkflow,
     RevisionMode,
     RevisionRequest,
+    SelectedFileRole,
     SelectedSourceSummary,
     WorkflowState,
     WorkKind,
@@ -122,6 +123,25 @@ class PrintingApplication:
                 str(decision.candidate_id),
             )
             candidate = page.candidate
+            included_source_files = [
+                item
+                for item in decision.selected_files
+                if item.role in {
+                    SelectedFileRole.UNIQUE_PART,
+                    SelectedFileRole.COMBINED_MODEL,
+                }
+            ]
+            if decision.selected_files and included_source_files:
+                if decision.decision != ModelDecision.USE_AS_IS:
+                    raise ValidationError(
+                        "Multipart source sets must be adopted before part-scoped revisions"
+                    )
+                return await self._adopt_source_set(
+                    workflow_id,
+                    candidate,
+                    decision,
+                    printer.build_volume,
+                )
             selected_file = next(
                 (item for item in candidate.files if item.id == str(decision.file_id)),
                 None,
@@ -242,6 +262,122 @@ class PrintingApplication:
                 selected_source=selected_source,
             )
 
+    async def _adopt_source_set(
+        self,
+        workflow_id: str,
+        candidate,
+        decision: DiscoveryDecision,
+        build_volume,
+    ) -> ModelArtifact:
+        selected = [
+            item
+            for item in decision.selected_files
+            if item.role in {
+                SelectedFileRole.UNIQUE_PART,
+                SelectedFileRole.COMBINED_MODEL,
+            }
+        ]
+        candidate_files = {item.id: item for item in candidate.files}
+        await self.repository.transition(
+            workflow_id,
+            WorkflowState.SOURCE_VALIDATION,
+            event_kind="source_set.download_started",
+            payload={
+                "candidate_id": candidate.id,
+                "file_ids": [item.file_id for item in selected],
+            },
+        )
+        prepared = []
+        incoming = (
+            self.settings.candidate_cache_dir
+            / "models"
+            / "incoming"
+            / workflow_id
+        )
+        try:
+            for selection in selected:
+                candidate_file = candidate_files[selection.file_id]
+                source_format = candidate_file.format.casefold().lstrip(".")
+                if source_format != "stl":
+                    raise ValidationError(
+                        "Multi-file source sets currently require STL part files"
+                    )
+                source_path = incoming / f"{candidate_file.id}.{source_format}"
+                await self.catalog.download_file(candidate, candidate_file.id, source_path)
+                inspection = await self.source_inspector.inspect(
+                    workflow_id,
+                    candidate.id,
+                    candidate_file.id,
+                    source_path,
+                    build_volume,
+                )
+                await self.repository.save_source_inspection(inspection)
+                if not inspection.accepted:
+                    raise ValidationError(
+                        inspection.rejection_reason
+                        or f"Source part '{candidate_file.name}' is invalid"
+                    )
+                cache_path = (
+                    self.settings.candidate_cache_dir
+                    / "models"
+                    / f"{inspection.source_digest}.stl"
+                )
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                if not cache_path.exists():
+                    source_path.replace(cache_path)
+                else:
+                    source_path.unlink(missing_ok=True)
+                prepared.append(
+                    (
+                        selection,
+                        candidate_file,
+                        cache_path,
+                        inspection.mesh,
+                    )
+                )
+        except Exception:
+            shutil.rmtree(incoming, ignore_errors=True)
+            raise
+        finally:
+            if incoming.exists() and not any(incoming.iterdir()):
+                incoming.rmdir()
+
+        source_set_digest = canonical_digest(
+            {
+                "files": [
+                    {
+                        "file_id": selection.file_id,
+                        "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    }
+                    for selection, _, path, _ in prepared
+                ],
+                "shared_scale": decision.shared_scale,
+            }
+        )
+        provenance = ArtifactProvenance(
+            kind="catalog",
+            candidate_id=candidate.id,
+            source_url=candidate.source_url,
+            creator=candidate.creator,
+            license=candidate.license,
+            source_digest=source_set_digest,
+        )
+        await self.repository.transition(
+            workflow_id,
+            WorkflowState.VALIDATING,
+            event_kind="source_set.adopting",
+            payload={"part_count": len(prepared)},
+        )
+        return await self.model_pipeline.adopt_existing_set(
+            workflow_id,
+            prepared,
+            provenance,
+            build_volume,
+            shared_scale=decision.shared_scale,
+            description=f"{candidate.introduction}\n{candidate.instructions}",
+            classification=decision.selected_files,
+        )
+
     async def _create_with_modeling(
         self,
         workflow_id: str,
@@ -298,21 +434,60 @@ class PrintingApplication:
         part_id: str | None,
     ) -> ModelArtifact:
         workflow = await self.repository.get_workflow(workflow_id)
-        if workflow.active_handoff_version is None or workflow.active_artifact_version is None:
-            raise ConflictError("Current artifact was not produced by a modeling handoff")
-        old_handoff = await self.repository.get_handoff(
-            workflow_id,
-            workflow.active_handoff_version,
-        )
+        if workflow.active_artifact_version is None:
+            raise ConflictError("Workflow has no active artifact")
         artifact = await self.repository.get_artifact(
             workflow_id,
             workflow.active_artifact_version,
         )
-        if artifact.source_path is None or not artifact.source_path.is_file():
-            raise ConflictError(
-                "This artifact has no editable OpenSCAD source; search for a new base instead"
+        if artifact.project is not None and len(artifact.project.parts) > 1:
+            if part_id is None:
+                raise ValidationError("Select one part before refining a multipart artifact")
+            part = next(
+                (candidate for candidate in artifact.project.parts if candidate.id == part_id),
+                None,
             )
-        current_source = artifact.source_path.read_text(encoding="utf-8")
+            if part is None:
+                raise ValidationError(f"Part '{part_id}' is not present in the artifact")
+            adapter = cast(PrinterAdapter, self.printers.get(workflow.printer_name))
+            printer = await adapter.capabilities()
+            selected_source = SelectedSourceSummary(
+                filename=f"{part_id}.stl",
+                candidate_id=artifact.provenance.candidate_id or workflow_id,
+                file_id=part_id,
+                title=part.name,
+                creator=artifact.provenance.creator or "unknown",
+                license=artifact.provenance.license or "unknown",
+                attribution_url=artifact.provenance.source_url or "local-artifact",
+                source_digest=sha256_file(
+                    artifact.model_path.parent / f"{part_id}.stl"
+                ),
+                mesh=artifact.part_meshes[part_id],
+            )
+            old_handoff = ModelingHandoff(
+                workflow_id=workflow_id,
+                version=max(workflow.active_handoff_version or 1, 1),
+                requirement=workflow.requirement,
+                model_plan=await self.repository.get_plan(workflow_id),
+                decision=ModelDecision.MODIFY,
+                selected_source=selected_source,
+                target_printer=printer,
+                discovery_rationale="Refine one retained source-set part.",
+                evidence_digests=[selected_source.source_digest],
+            ).with_digest()
+            current_source = 'import("source.stl");\n'
+        else:
+            if workflow.active_handoff_version is None:
+                raise ConflictError("Current artifact was not produced by a modeling handoff")
+            old_handoff = await self.repository.get_handoff(
+                workflow_id,
+                workflow.active_handoff_version,
+            )
+            if artifact.source_path is None or not artifact.source_path.is_file():
+                raise ConflictError(
+                    "This artifact has no editable OpenSCAD source; search for a new base instead"
+                )
+            current_source = artifact.source_path.read_text(encoding="utf-8")
         version = await self.repository.next_handoff_version(workflow_id)
         handoff = old_handoff.model_copy(
             update={
@@ -378,6 +553,11 @@ class PrintingApplication:
                 raise ConflictError(
                     "This artifact has no editable OpenSCAD source; search for a new base instead"
                 )
+            if artifact.project is not None and len(artifact.project.parts) > 1:
+                if part_id is None:
+                    raise ValidationError(
+                        "Select one part before refining a multipart artifact"
+                    )
             if part_id is not None and (
                 artifact.project is None
                 or all(part.id != part_id for part in artifact.project.parts)
@@ -536,14 +716,32 @@ class PrintingApplication:
                     encoding="utf-8",
                 )
                 adopted = self.artifacts.adopt_project(copied_workflow.id, 1, staging)
+                source_relative = (
+                    source_artifact.source_path.relative_to(source_directory)
+                    if source_artifact.source_path is not None
+                    else None
+                )
+                model_relative = source_artifact.model_path.relative_to(source_directory)
+                project_relative = (
+                    source_artifact.project_path.relative_to(source_directory)
+                    if source_artifact.project_path is not None
+                    else None
+                )
+                three_mf_relative = (
+                    source_artifact.three_mf_path.relative_to(source_directory)
+                    if source_artifact.three_mf_path is not None
+                    else None
+                )
                 copied_artifact = source_artifact.model_copy(
                     update={
                         "workflow_id": copied_workflow.id,
                         "version": 1,
-                        "source_path": adopted / "project" / "main.scad",
-                        "model_path": adopted / "outputs" / "model.stl",
-                        "project_path": adopted / "project" / "project.json",
-                        "three_mf_path": adopted / "outputs" / "model.3mf",
+                        "source_path": adopted / source_relative if source_relative else None,
+                        "model_path": adopted / model_relative,
+                        "project_path": adopted / project_relative if project_relative else None,
+                        "three_mf_path": (
+                            adopted / three_mf_relative if three_mf_relative else None
+                        ),
                         "manifest_digest": manifest_digest,
                     }
                 )
