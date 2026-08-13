@@ -62,8 +62,14 @@ class PrintingApplication:
         self.printers.get(printer_name)
         return await self.repository.create_workflow(requirement, printer_name)
 
+    @staticmethod
+    def _ensure_not_archived(workflow: PrintWorkflow) -> None:
+        if workflow.archived_at is not None:
+            raise ConflictError("Restore the archived workflow before changing it")
+
     async def prepare(self, workflow_id: str) -> ModelArtifact:
         workflow = await self.repository.get_workflow(workflow_id)
+        PrintingApplication._ensure_not_archived(workflow)
         adapter = cast(PrinterAdapter, self.printers.get(workflow.printer_name))
         printer = await adapter.capabilities()
 
@@ -318,6 +324,7 @@ class PrintingApplication:
         feedback: str,
     ) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
+        PrintingApplication._ensure_not_archived(workflow)
         if workflow.state not in {
             WorkflowState.AWAITING_APPROVAL,
             WorkflowState.APPROVED,
@@ -349,6 +356,7 @@ class PrintingApplication:
         approved_by: str,
     ) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
+        PrintingApplication._ensure_not_archived(workflow)
         if (
             workflow.state != WorkflowState.AWAITING_APPROVAL
             or workflow.active_artifact_version != artifact_version
@@ -370,10 +378,19 @@ class PrintingApplication:
         )
 
     async def request_print(self, workflow_id: str) -> None:
+        workflow = await self.repository.get_workflow(workflow_id)
+        PrintingApplication._ensure_not_archived(workflow)
         await self.repository.enqueue_print_submission(workflow_id)
+
+    async def archive_workflow(self, workflow_id: str) -> PrintWorkflow:
+        return await self.repository.archive_workflow(workflow_id)
+
+    async def restore_workflow(self, workflow_id: str) -> PrintWorkflow:
+        return await self.repository.restore_workflow(workflow_id)
 
     async def submit_print(self, workflow_id: str) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
+        PrintingApplication._ensure_not_archived(workflow)
         if workflow.state in {
             WorkflowState.QUEUED,
             WorkflowState.PRINTING,
@@ -405,6 +422,7 @@ class PrintingApplication:
 
     async def copy_workflow(self, workflow_id: str) -> PrintWorkflow:
         source_workflow = await self.repository.get_workflow(workflow_id)
+        PrintingApplication._ensure_not_archived(source_workflow)
         if source_workflow.active_artifact_version is None:
             raise ConflictError("Workflow has no artifact to copy")
         source_artifact = await self.repository.get_artifact(
@@ -490,6 +508,7 @@ class PrintingApplication:
 
     async def refresh_print(self, workflow_id: str) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
+        PrintingApplication._ensure_not_archived(workflow)
         job = await self.repository.get_latest_job(workflow_id)
         if job is None:
             raise ConflictError("Workflow has no printer job")
@@ -519,6 +538,7 @@ class PrintingApplication:
 
     async def cancel(self, workflow_id: str) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
+        PrintingApplication._ensure_not_archived(workflow)
         if workflow.state in {WorkflowState.QUEUED, WorkflowState.PRINTING}:
             job = await self.repository.get_latest_job(workflow_id)
             if job is None:

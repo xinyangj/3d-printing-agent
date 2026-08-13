@@ -49,9 +49,10 @@ flowchart LR
 5. Discovery selects an inspected model/file or creation from scratch.
 6. A provisional source is downloaded and technically inspected. An invalid file returns the discovery session to search; an accepted one enters an immutable modeling handoff.
 7. A separate modeling session submits complete OpenSCAD. Rejected source receives bounded renderer/mesh diagnostics and may be repaired within the attempt budget.
-8. The web interface displays the final STL, dimensions, mesh metrics, provenance, source, and artifact digest.
-9. The dashboard lets the user edit the current model, search for a different base, make an independent copy, or approve the exact artifact.
-10. Approval does not print automatically. The user explicitly sends an approved artifact to the selected printer, and SSE reports status through completion.
+8. The Create page starts new workflows; the separate Models dashboard tracks every model and print.
+9. The workflow interface displays the final STL, dimensions, mesh metrics, provenance, source, and artifact digest.
+10. The dashboard lets the user edit the current model, search for a different base, make an independent copy, archive/restore it, or approve the exact artifact.
+11. Approval does not print automatically. The user explicitly sends an approved artifact to the selected printer, and SSE reports status through completion.
 
 ## Requirements
 
@@ -242,6 +243,8 @@ The web interface is the recommended client because it provides mandatory 3D ins
 | `POST` | `/api/v1/workflows/{id}/approval` | Approve an exact artifact digest |
 | `POST` | `/api/v1/workflows/{id}/print` | Send an approved artifact to the printer |
 | `POST` | `/api/v1/workflows/{id}/copies` | Create an independent copy of an artifact |
+| `POST` | `/api/v1/workflows/{id}/archive` | Hide a stable workflow while preserving files and history |
+| `POST` | `/api/v1/workflows/{id}/restore` | Restore an archived workflow to normal dashboard views |
 | `POST` | `/api/v1/workflows/{id}/cancel` | Cancel preparation or a supported print |
 | `GET` | `/api/v1/printers` | List printer capabilities |
 

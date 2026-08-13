@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS workflows (
     active_artifact_version INTEGER,
     failure_code TEXT,
     failure_message TEXT,
+    archived_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -193,6 +194,10 @@ class WorkflowRepository:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.database_path) as db:
             await db.executescript(_SCHEMA)
+            cursor = await db.execute("PRAGMA table_info(workflows)")
+            columns = {row[1] for row in await cursor.fetchall()}
+            if "archived_at" not in columns:
+                await db.execute("ALTER TABLE workflows ADD COLUMN archived_at TEXT")
             await db.commit()
 
     async def _connect(self) -> aiosqlite.Connection:
@@ -217,8 +222,8 @@ class WorkflowRepository:
                     id, requirement, printer_name, state, version,
                     discovery_session_id, modeling_session_id,
                     active_handoff_version, active_artifact_version,
-                    failure_code, failure_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+                    failure_code, failure_message, archived_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
                 """,
                 (
                     workflow.id,
@@ -267,6 +272,116 @@ class WorkflowRepository:
         finally:
             await db.close()
 
+    async def archive_workflow(self, workflow_id: str) -> PrintWorkflow:
+        allowed_states = {
+            WorkflowState.AWAITING_APPROVAL,
+            WorkflowState.APPROVED,
+            WorkflowState.COMPLETED,
+            WorkflowState.PREPARATION_FAILED,
+            WorkflowState.PRINT_FAILED,
+            WorkflowState.CANCELLED,
+        }
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT * FROM workflows WHERE id = ?", (workflow_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError(f"Workflow '{workflow_id}' was not found")
+            workflow = self._workflow_from_row(row)
+            if workflow.archived_at is not None:
+                raise ConflictError("Workflow is already archived")
+            if workflow.state not in allowed_states:
+                raise ConflictError(
+                    "Workflow cannot be archived while preparation or printing is active"
+                )
+            cursor = await db.execute(
+                """
+                SELECT COUNT(*) AS count FROM work_items
+                WHERE workflow_id = ? AND status IN ('queued', 'running')
+                """,
+                (workflow_id,),
+            )
+            active_work = int((await cursor.fetchone())["count"])
+            if active_work:
+                raise ConflictError(
+                    "Workflow cannot be archived while background work is still active"
+                )
+            now = utc_now()
+            cursor = await db.execute(
+                """
+                UPDATE workflows
+                SET archived_at = ?, version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ? AND archived_at IS NULL
+                """,
+                (now.isoformat(), now.isoformat(), workflow_id, workflow.version),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed during archive")
+            await self._insert_event(
+                db,
+                workflow_id,
+                "workflow.archived",
+                workflow.state,
+                {"archived_at": now.isoformat()},
+            )
+            await db.commit()
+            return workflow.model_copy(
+                update={
+                    "archived_at": now,
+                    "version": workflow.version + 1,
+                    "updated_at": now,
+                }
+            )
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def restore_workflow(self, workflow_id: str) -> PrintWorkflow:
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("SELECT * FROM workflows WHERE id = ?", (workflow_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError(f"Workflow '{workflow_id}' was not found")
+            workflow = self._workflow_from_row(row)
+            if workflow.archived_at is None:
+                raise ConflictError("Workflow is not archived")
+            now = utc_now()
+            cursor = await db.execute(
+                """
+                UPDATE workflows
+                SET archived_at = NULL, version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ? AND archived_at IS NOT NULL
+                """,
+                (now.isoformat(), workflow_id, workflow.version),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed during restore")
+            await self._insert_event(
+                db,
+                workflow_id,
+                "workflow.restored",
+                workflow.state,
+                {},
+            )
+            await db.commit()
+            return workflow.model_copy(
+                update={
+                    "archived_at": None,
+                    "version": workflow.version + 1,
+                    "updated_at": now,
+                }
+            )
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
     async def transition(
         self,
         workflow_id: str,
@@ -288,6 +403,8 @@ class WorkflowRepository:
             if row is None:
                 raise NotFoundError(f"Workflow '{workflow_id}' was not found")
             current = self._workflow_from_row(row)
+            if current.archived_at is not None:
+                raise ConflictError("Restore the archived workflow before changing it")
             assert_transition(current.state, target)
             now = utc_now()
             cursor = await db.execute(
@@ -737,6 +854,7 @@ class WorkflowRepository:
             cursor = await db.execute(
                 """
                 SELECT state, version, active_artifact_version
+                     , archived_at
                 FROM workflows WHERE id = ?
                 """,
                 (approval.workflow_id,),
@@ -744,6 +862,8 @@ class WorkflowRepository:
             workflow = await cursor.fetchone()
             if workflow is None:
                 raise NotFoundError(f"Workflow '{approval.workflow_id}' was not found")
+            if workflow["archived_at"] is not None:
+                raise ConflictError("Restore the archived workflow before changing it")
             if (
                 workflow["state"] != WorkflowState.AWAITING_APPROVAL.value
                 or workflow["active_artifact_version"] != approval.artifact_version
@@ -815,12 +935,17 @@ class WorkflowRepository:
         try:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
-                "SELECT state, version, active_artifact_version FROM workflows WHERE id = ?",
+                """
+                SELECT state, version, active_artifact_version, archived_at
+                FROM workflows WHERE id = ?
+                """,
                 (workflow_id,),
             )
             workflow = await cursor.fetchone()
             if workflow is None:
                 raise NotFoundError(f"Workflow '{workflow_id}' was not found")
+            if workflow["archived_at"] is not None:
+                raise ConflictError("Restore the archived workflow before changing it")
             if workflow["state"] != WorkflowState.APPROVED.value:
                 raise ConflictError("Only an approved artifact can be sent to the printer")
             cursor = await db.execute(
@@ -931,12 +1056,14 @@ class WorkflowRepository:
         try:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
-                "SELECT state, version FROM workflows WHERE id = ?",
+                "SELECT state, version, archived_at FROM workflows WHERE id = ?",
                 (revision.workflow_id,),
             )
             workflow = await cursor.fetchone()
             if workflow is None:
                 raise NotFoundError(f"Workflow '{revision.workflow_id}' was not found")
+            if workflow["archived_at"] is not None:
+                raise ConflictError("Restore the archived workflow before changing it")
             current_state = WorkflowState(workflow["state"])
             if current_state not in {
                 WorkflowState.AWAITING_APPROVAL,
@@ -1005,14 +1132,23 @@ class WorkflowRepository:
         db = await self._connect()
         try:
             await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT archived_at FROM workflows WHERE id = ?",
+                (source_workflow_id,),
+            )
+            source = await cursor.fetchone()
+            if source is None:
+                raise NotFoundError(f"Workflow '{source_workflow_id}' was not found")
+            if source["archived_at"] is not None:
+                raise ConflictError("Restore the archived workflow before copying it")
             await db.execute(
                 """
                 INSERT INTO workflows (
                     id, requirement, printer_name, state, version,
                     discovery_session_id, modeling_session_id,
                     active_handoff_version, active_artifact_version,
-                    failure_code, failure_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, ?, ?)
+                    failure_code, failure_message, archived_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, NULL, ?, ?)
                 """,
                 (
                     workflow.id,

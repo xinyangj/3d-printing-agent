@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 import pytest
 
 from printing_agent.domain import (
+    ArtifactApproval,
     Dimensions,
     ModelDecision,
     ModelingHandoff,
     ModelPlan,
     PrinterCapabilitySummary,
+    RevisionMode,
+    RevisionRequest,
     WorkflowState,
     WorkKind,
 )
-from printing_agent.errors import InvalidTransitionError
+from printing_agent.errors import ConflictError, InvalidTransitionError
 from printing_agent.repositories import WorkflowRepository
 
 
@@ -55,6 +61,124 @@ async def test_approved_workflow_can_record_submission_failure(
         workflow = await repository.transition(workflow.id, state)
 
     assert workflow.state == WorkflowState.PRINT_FAILED
+
+
+async def test_workflow_archive_and_restore_preserve_state(
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Print a small cube", "simulator")
+    pending = await repository.lease_next()
+    assert pending is not None
+    await repository.complete_work(pending.id)
+    for state in (
+        WorkflowState.PLANNING,
+        WorkflowState.DISCOVERING,
+        WorkflowState.SELECTING,
+        WorkflowState.VALIDATING,
+        WorkflowState.AWAITING_APPROVAL,
+    ):
+        workflow = await repository.transition(workflow.id, state)
+
+    archived = await repository.archive_workflow(workflow.id)
+
+    assert archived.state == WorkflowState.AWAITING_APPROVAL
+    assert archived.archived_at is not None
+    assert (await repository.get_workflow(workflow.id)).archived_at == archived.archived_at
+    with pytest.raises(ConflictError, match="already archived"):
+        await repository.archive_workflow(workflow.id)
+    with pytest.raises(ConflictError, match="Restore the archived workflow"):
+        await repository.transition(workflow.id, WorkflowState.APPROVED)
+    with pytest.raises(ConflictError, match="Restore the archived workflow"):
+        await repository.approve_artifact(
+            ArtifactApproval(
+                workflow_id=workflow.id,
+                artifact_version=1,
+                manifest_digest="a" * 64,
+                approved_by="test",
+            )
+        )
+    with pytest.raises(ConflictError, match="Restore the archived workflow"):
+        await repository.request_revision(
+            RevisionRequest(
+                workflow_id=workflow.id,
+                mode=RevisionMode.SEARCH_NEW_BASE,
+                feedback="Find a rounder model",
+            )
+        )
+    with pytest.raises(ConflictError, match="Restore the archived workflow"):
+        await repository.enqueue_print_submission(workflow.id)
+
+    restored = await repository.restore_workflow(workflow.id)
+
+    assert restored.state == WorkflowState.AWAITING_APPROVAL
+    assert restored.archived_at is None
+    assert [event.kind for event in await repository.list_events(workflow.id)][-2:] == [
+        "workflow.archived",
+        "workflow.restored",
+    ]
+    with pytest.raises(ConflictError, match="not archived"):
+        await repository.restore_workflow(workflow.id)
+
+
+async def test_active_workflow_cannot_be_archived(repository: WorkflowRepository) -> None:
+    workflow = await repository.create_workflow("Print a small cube", "simulator")
+
+    with pytest.raises(ConflictError, match="preparation or printing is active"):
+        await repository.archive_workflow(workflow.id)
+
+
+async def test_cancelled_workflow_waits_for_durable_work_to_finish(
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Print a small cube", "simulator")
+    await repository.transition(workflow.id, WorkflowState.CANCELLED)
+
+    with pytest.raises(ConflictError, match="background work is still active"):
+        await repository.archive_workflow(workflow.id)
+
+    pending = await repository.lease_next()
+    assert pending is not None
+    await repository.complete_work(pending.id)
+
+    archived = await repository.archive_workflow(workflow.id)
+    assert archived.archived_at is not None
+
+
+async def test_initialize_migrates_existing_workflow_table(tmp_path: Path) -> None:
+    database_path = tmp_path / "legacy.db"
+    with sqlite3.connect(database_path) as db:
+        db.executescript(
+            """
+            CREATE TABLE workflows (
+                id TEXT PRIMARY KEY,
+                requirement TEXT NOT NULL,
+                printer_name TEXT NOT NULL,
+                state TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                discovery_session_id TEXT,
+                modeling_session_id TEXT,
+                active_handoff_version INTEGER,
+                active_artifact_version INTEGER,
+                failure_code TEXT,
+                failure_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO workflows (
+                id, requirement, printer_name, state, version, created_at, updated_at
+            ) VALUES (
+                'legacy-workflow', 'Create a cube', 'simulator', 'completed', 3,
+                '2026-01-01T00:00:00+00:00', '2026-01-02T00:00:00+00:00'
+            );
+            """
+        )
+    repository = WorkflowRepository(database_path)
+
+    await repository.initialize()
+    workflow = await repository.get_workflow("legacy-workflow")
+
+    assert workflow.archived_at is None
+    assert workflow.state == WorkflowState.COMPLETED
 
 
 def test_modeling_handoff_digest_is_stable_and_mode_is_validated() -> None:

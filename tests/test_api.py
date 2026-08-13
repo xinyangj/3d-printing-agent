@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from printing_agent.api import create_app
 from printing_agent.bootstrap import build_container
 from printing_agent.config import Settings
+from printing_agent.domain import WorkflowState
 
 
 async def test_health_and_printer_discovery(settings: Settings) -> None:
@@ -36,3 +37,40 @@ async def test_workflow_list_uses_detail_payload_shape(settings: Settings) -> No
     assert listing.json() == [detail.json()]
     assert listing.json()[0]["artifact"] is None
     assert listing.json()[0]["job"] is None
+
+
+async def test_workflow_can_be_archived_and_restored(settings: Settings) -> None:
+    container = await build_container(settings)
+    workflow = await container.repository.create_workflow("Create a cable guide", "simulator")
+    pending = await container.repository.lease_next()
+    assert pending is not None
+    await container.repository.complete_work(pending.id)
+    for state in (
+        WorkflowState.PLANNING,
+        WorkflowState.DISCOVERING,
+        WorkflowState.SELECTING,
+        WorkflowState.VALIDATING,
+        WorkflowState.AWAITING_APPROVAL,
+    ):
+        await container.repository.transition(workflow.id, state)
+    app = create_app(container)
+
+    with TestClient(app) as client:
+        archived = client.post(f"/api/v1/workflows/{workflow.id}/archive")
+        blocked = client.post(
+            f"/api/v1/workflows/{workflow.id}/approval",
+            json={
+                "artifact_version": 1,
+                "manifest_digest": "a" * 64,
+                "approved_by": "test",
+            },
+        )
+        restored = client.post(f"/api/v1/workflows/{workflow.id}/restore")
+
+    assert archived.status_code == 200
+    assert archived.json()["workflow"]["archived_at"] is not None
+    assert archived.json()["workflow"]["state"] == "awaiting_approval"
+    assert blocked.status_code == 409
+    assert "Restore the archived workflow" in blocked.json()["error"]["message"]
+    assert restored.status_code == 200
+    assert restored.json()["workflow"]["archived_at"] is None

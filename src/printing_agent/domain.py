@@ -268,6 +268,7 @@ class PrintWorkflow(FrozenModel):
     active_artifact_version: int | None = None
     failure_code: str | None = None
     failure_message: str | None = None
+    archived_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

@@ -44,20 +44,26 @@ button:disabled {
   font-size: 25px;
 }
 
-.architecture-badge {
+.nav-tabs {
   align-items: center;
-  color: var(--muted);
   display: flex;
-  font-family: var(--mono);
-  font-size: 11px;
-  gap: 10px;
-  text-transform: uppercase;
+  gap: 4px;
 }
 
-.architecture-badge i {
-  background: var(--line-strong);
-  height: 1px;
-  width: 20px;
+.nav-tabs button {
+  background: transparent;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 750;
+  height: 72px;
+  padding: 0 22px;
+}
+
+.nav-tabs button.active {
+  border-bottom-color: var(--teal);
+  color: var(--ink);
 }
 
 .start-layout {
@@ -303,6 +309,16 @@ select:focus {
   min-width: 0;
 }
 
+.model-card-archived {
+  border-style: dashed;
+}
+
+.model-card-archived .model-thumbnail,
+.model-card-archived .model-placeholder {
+  filter: grayscale(0.75);
+  opacity: 0.72;
+}
+
 .model-thumbnail,
 .model-placeholder {
   height: 220px;
@@ -341,6 +357,13 @@ select:focus {
   display: flex;
   gap: 15px;
   justify-content: space-between;
+}
+
+.card-badges {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .card-state-row .state-pill {
@@ -398,6 +421,10 @@ select:focus {
   flex-basis: 100%;
 }
 
+.archive-action {
+  color: #9d423c;
+}
+
 .empty-dashboard {
   background: var(--paper);
   border: 1px dashed var(--line-strong);
@@ -407,17 +434,42 @@ select:focus {
   text-align: center;
 }
 
-.create-section {
-  border-top: 1px solid var(--line);
-  margin-top: 80px;
-  scroll-margin-top: 30px;
-}
-
 .workflow-header {
   align-items: flex-end;
   display: flex;
   justify-content: space-between;
   margin-bottom: 34px;
+}
+
+.workflow-header-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  justify-content: flex-end;
+}
+
+.archive-pill {
+  background: #ebeae3;
+  border: 1px dashed var(--line-strong);
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 7px 9px;
+  text-transform: uppercase;
+}
+
+.archive-notice {
+  background: #f1f0e9;
+  border: 1px dashed var(--line-strong);
+  color: var(--ink-soft);
+  margin-bottom: 20px;
+  padding: 18px 22px;
+}
+
+.archive-notice p {
+  font-size: 13px;
+  margin: 6px 0 0;
 }
 
 .workflow-header h1 {
@@ -808,10 +860,6 @@ select:focus {
 }
 
 @media (max-width: 900px) {
-  .architecture-badge {
-    display: none;
-  }
-
   .start-layout,
   .inspection-grid,
   .approval-panel,
@@ -836,6 +884,10 @@ select:focus {
     align-items: flex-start;
     flex-direction: column;
     gap: 20px;
+  }
+
+  .workflow-header-actions {
+    justify-content: flex-start;
   }
 
   .progress-grid {

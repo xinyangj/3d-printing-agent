@@ -252,6 +252,24 @@ def create_app(container: Container | None = None) -> FastAPI:
         workflow = await container.application.copy_workflow(workflow_id)
         return await serialize_workflow(container, workflow)
 
+    @app.post("/api/v1/workflows/{workflow_id}/archive")
+    async def archive_workflow(
+        workflow_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        container = get_container(request)
+        workflow = await container.application.archive_workflow(workflow_id)
+        return await serialize_workflow(container, workflow)
+
+    @app.post("/api/v1/workflows/{workflow_id}/restore")
+    async def restore_workflow(
+        workflow_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        container = get_container(request)
+        workflow = await container.application.restore_workflow(workflow_id)
+        return await serialize_workflow(container, workflow)
+
     @app.post("/api/v1/workflows/{workflow_id}/cancel", status_code=202)
     async def cancel_workflow(workflow_id: str, request: Request) -> dict[str, str]:
         await get_container(request).application.cancel(workflow_id)

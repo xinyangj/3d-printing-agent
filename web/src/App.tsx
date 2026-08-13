@@ -18,6 +18,7 @@ type Workflow = {
   state: string
   active_artifact_version: number | null
   failure_message: string | null
+  archived_at: string | null
   created_at: string
   updated_at: string
 }
@@ -105,6 +106,14 @@ const ACTIVE_STATES = new Set([
   'queued',
   'printing',
 ])
+const ARCHIVABLE_STATES = new Set([
+  'awaiting_approval',
+  'approved',
+  'completed',
+  'preparation_failed',
+  'print_failed',
+  'cancelled',
+])
 
 type DashboardFilter =
   | 'all'
@@ -114,6 +123,7 @@ type DashboardFilter =
   | 'printing'
   | 'completed'
   | 'failed'
+  | 'archived'
 
 const FILTERS: { value: DashboardFilter; label: string }[] = [
   { value: 'all', label: 'All' },
@@ -123,6 +133,7 @@ const FILTERS: { value: DashboardFilter; label: string }[] = [
   { value: 'printing', label: 'Printing' },
   { value: 'completed', label: 'Completed' },
   { value: 'failed', label: 'Failed / cancelled' },
+  { value: 'archived', label: 'Archived' },
 ]
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
@@ -148,7 +159,10 @@ function formatNumber(value: number, digits = 1) {
   return new Intl.NumberFormat(undefined, { maximumFractionDigits: digits }).format(value)
 }
 
-function matchesFilter(state: string, filter: DashboardFilter) {
+function matchesFilter(workflow: Workflow, filter: DashboardFilter) {
+  if (filter === 'archived') return workflow.archived_at !== null
+  if (workflow.archived_at !== null) return false
+  const state = workflow.state
   if (filter === 'all') return true
   if (filter === 'in_progress')
     return ACTIVE_STATES.has(state) && !['submitting', 'queued', 'printing'].includes(state)
@@ -200,6 +214,8 @@ function useWorkflowEvents(workflowId: string | null) {
       'print.printing',
       'print.completed',
       'workflow.failed',
+      'workflow.archived',
+      'workflow.restored',
     ]
     knownEvents.forEach((name) => source.addEventListener(name, handleEvent as EventListener))
     return () => source.close()
@@ -480,7 +496,11 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
     queryKey: ['workflows'],
     queryFn: () => api<WorkflowResponse[]>('/workflows'),
     refetchInterval: (query) =>
-      query.state.data?.some((item) => ACTIVE_STATES.has(item.workflow.state)) ? 2500 : false,
+      query.state.data?.some(
+        (item) => !item.workflow.archived_at && ACTIVE_STATES.has(item.workflow.state),
+      )
+        ? 2500
+        : 10000,
   })
   const copy = useMutation({
     mutationFn: (id: string) =>
@@ -494,9 +514,26 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
     mutationFn: (id: string) => api(`/workflows/${id}/print`, { method: 'POST' }),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflows'] }),
   })
+  const archive = useMutation({
+    mutationFn: ({ id, restore }: { id: string; restore: boolean }) =>
+      api<WorkflowResponse>(`/workflows/${id}/${restore ? 'restore' : 'archive'}`, {
+        method: 'POST',
+      }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflows'] }),
+  })
   const items = (workflows.data ?? []).filter((item) =>
-    matchesFilter(item.workflow.state, filter),
+    matchesFilter(item.workflow, filter),
   )
+
+  const archiveModel = (workflow: Workflow) => {
+    if (
+      window.confirm(
+        'Archive this model? It will be hidden from normal views, but its artifact and history will be preserved.',
+      )
+    ) {
+      archive.mutate({ id: workflow.id, restore: false })
+    }
+  }
 
   return (
     <main className="dashboard-layout">
@@ -506,7 +543,7 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
           <h1>Models &amp; print status</h1>
           <p>Inspect, version, approve, copy, and print every durable model workflow.</p>
         </div>
-        <a className="primary-action create-link" href="#create-model">
+        <a className="primary-action create-link" href="#/">
           Create model <span>＋</span>
         </a>
       </header>
@@ -521,7 +558,7 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
             {item.label}
             <span>
               {(workflows.data ?? []).filter((entry) =>
-                matchesFilter(entry.workflow.state, item.value),
+                matchesFilter(entry.workflow, item.value),
               ).length}
             </span>
           </button>
@@ -539,7 +576,10 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
             ? `${API}/workflows/${workflow.id}/artifacts/${artifact.version}/model.stl`
             : null
           return (
-            <article className="model-card" key={workflow.id}>
+            <article
+              className={`model-card ${workflow.archived_at ? 'model-card-archived' : ''}`}
+              key={workflow.id}
+            >
               {modelUrl ? (
                 <ModelThumbnail url={modelUrl} />
               ) : (
@@ -550,10 +590,13 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
               )}
               <div className="model-card-body">
                 <div className="card-state-row">
-                  <span className={`state-pill state-${workflow.state}`}>
-                    <span />
-                    {formatState(workflow.state)}
-                  </span>
+                  <div className="card-badges">
+                    <span className={`state-pill state-${workflow.state}`}>
+                      <span />
+                      {formatState(workflow.state)}
+                    </span>
+                    {workflow.archived_at && <span className="archive-pill">Archived</span>}
+                  </div>
                   <time>{new Date(workflow.updated_at).toLocaleString()}</time>
                 </div>
                 <h2>{workflow.requirement}</h2>
@@ -587,29 +630,50 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
                         ? 'View print status'
                         : 'Open'}
                   </button>
-                  {artifact && (
-                    <button
-                      className="text-button"
-                      disabled={copy.isPending}
-                      onClick={() => copy.mutate(workflow.id)}
-                    >
-                      Make a copy
-                    </button>
-                  )}
-                  {['awaiting_approval', 'approved'].includes(workflow.state) &&
-                    artifact?.source_available && (
-                      <button className="text-button" onClick={() => onOpen(workflow.id)}>
-                        Edit existing
-                      </button>
-                    )}
-                  {workflow.state === 'approved' && (
+                  {workflow.archived_at ? (
                     <button
                       className="primary-action"
-                      disabled={print.isPending}
-                      onClick={() => print.mutate(workflow.id)}
+                      disabled={archive.isPending}
+                      onClick={() => archive.mutate({ id: workflow.id, restore: true })}
                     >
-                      Send to printer <span>→</span>
+                      Restore model <span>↺</span>
                     </button>
+                  ) : (
+                    <>
+                      {artifact && (
+                        <button
+                          className="text-button"
+                          disabled={copy.isPending}
+                          onClick={() => copy.mutate(workflow.id)}
+                        >
+                          Make a copy
+                        </button>
+                      )}
+                      {['awaiting_approval', 'approved'].includes(workflow.state) &&
+                        artifact?.source_available && (
+                          <button className="text-button" onClick={() => onOpen(workflow.id)}>
+                            Edit existing
+                          </button>
+                        )}
+                      {ARCHIVABLE_STATES.has(workflow.state) && (
+                        <button
+                          className="text-button archive-action"
+                          disabled={archive.isPending}
+                          onClick={() => archiveModel(workflow)}
+                        >
+                          Archive model
+                        </button>
+                      )}
+                      {workflow.state === 'approved' && (
+                        <button
+                          className="primary-action"
+                          disabled={print.isPending}
+                          onClick={() => print.mutate(workflow.id)}
+                        >
+                          Send to printer <span>→</span>
+                        </button>
+                      )}
+                    </>
                   )}
                 </div>
               </div>
@@ -617,13 +681,11 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
           )
         })}
       </section>
-      {(copy.error || print.error) && (
-        <p className="error-copy">{copy.error?.message ?? print.error?.message}</p>
+      {(copy.error || print.error || archive.error) && (
+        <p className="error-copy">
+          {copy.error?.message ?? print.error?.message ?? archive.error?.message}
+        </p>
       )}
-
-      <div id="create-model" className="create-section">
-        <StartPanel onCreated={onOpen} />
-      </div>
     </main>
   )
 }
@@ -642,7 +704,11 @@ function WorkflowPanel({
     queryKey: ['workflow', workflowId],
     queryFn: () => api<WorkflowResponse>(`/workflows/${workflowId}`),
     refetchInterval: (query) =>
-      query.state.data && TERMINAL_STATES.has(query.state.data.workflow.state) ? false : 2500,
+      query.state.data &&
+      (query.state.data.workflow.archived_at ||
+        TERMINAL_STATES.has(query.state.data.workflow.state))
+        ? 10000
+        : 2500,
   })
   const events = useWorkflowEvents(workflowId)
   const data = workflowQuery.data
@@ -708,6 +774,26 @@ function WorkflowPanel({
     mutationFn: () => api(`/workflows/${workflowId}/cancel`, { method: 'POST' }),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
   })
+  const archive = useMutation({
+    mutationFn: (restore: boolean) =>
+      api<WorkflowResponse>(`/workflows/${workflowId}/${restore ? 'restore' : 'archive'}`, {
+        method: 'POST',
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+    },
+  })
+
+  const archiveModel = () => {
+    if (
+      window.confirm(
+        'Archive this model? It will be hidden from normal views, but its artifact and history will be preserved.',
+      )
+    ) {
+      archive.mutate(false)
+    }
+  }
 
   if (workflowQuery.isLoading) return <div className="center-message">Loading workflow…</div>
   if (workflowQuery.error || !workflow)
@@ -727,11 +813,45 @@ function WorkflowPanel({
           <div className="eyebrow">Workflow {workflow.id.slice(0, 8)}</div>
           <h1>{canInspect ? 'Inspect final model' : 'Preparing your model'}</h1>
         </div>
-        <div className={`state-pill state-${workflow.state}`}>
-          <span />
-          {formatState(workflow.state)}
+        <div className="workflow-header-actions">
+          <div className={`state-pill state-${workflow.state}`}>
+            <span />
+            {formatState(workflow.state)}
+          </div>
+          {workflow.archived_at ? (
+            <>
+              <span className="archive-pill">Archived</span>
+              <button
+                className="primary-action"
+                disabled={archive.isPending}
+                onClick={() => archive.mutate(true)}
+              >
+                Restore model <span>↺</span>
+              </button>
+            </>
+          ) : (
+            ARCHIVABLE_STATES.has(workflow.state) && (
+              <button
+                className="danger-action"
+                disabled={archive.isPending}
+                onClick={archiveModel}
+              >
+                Archive model
+              </button>
+            )
+          )}
         </div>
       </header>
+
+      {workflow.archived_at && (
+        <section className="archive-notice">
+          <strong>This model is archived.</strong>
+          <p>
+            Its artifact and full workflow history are preserved. Restore it before making any
+            changes.
+          </p>
+        </section>
+      )}
 
       {!canInspect && (
         <section className="progress-grid">
@@ -831,7 +951,8 @@ function WorkflowPanel({
             </section>
           )}
 
-          {['awaiting_approval', 'approved'].includes(workflow.state) && (
+          {!workflow.archived_at &&
+            ['awaiting_approval', 'approved'].includes(workflow.state) && (
             <section className="approval-panel">
               <div>
                 <span className="section-label">
@@ -918,7 +1039,7 @@ function WorkflowPanel({
                 <p>{data.job.message}</p>
                 <code>{data.job.external_id}</code>
               </div>
-              {['queued', 'printing'].includes(data.job.status) && (
+              {!workflow.archived_at && ['queued', 'printing'].includes(data.job.status) && (
                 <button className="danger-action" onClick={() => cancel.mutate()}>
                   Cancel print
                 </button>
@@ -934,26 +1055,33 @@ function WorkflowPanel({
           <p>{workflow.failure_message}</p>
         </section>
       )}
+      {archive.error && <p className="error-copy">{archive.error.message}</p>}
     </main>
   )
 }
 
-function App() {
-  const [workflowId, setWorkflowId] = useState<string | null>(() => {
-    const value = window.location.hash.match(/^#\/workflows\/(.+)$/)
-    return value?.[1] ?? null
-  })
+type AppRoute =
+  | { page: 'create' }
+  | { page: 'models' }
+  | { page: 'workflow'; workflowId: string }
 
-  const navigate = (id: string | null) => {
-    window.location.hash = id ? `/workflows/${id}` : ''
-    setWorkflowId(id)
+function readRoute(): AppRoute {
+  const workflow = window.location.hash.match(/^#\/workflows\/(.+)$/)
+  if (workflow) return { page: 'workflow', workflowId: workflow[1] }
+  if (window.location.hash === '#/models') return { page: 'models' }
+  return { page: 'create' }
+}
+
+function App() {
+  const [route, setRoute] = useState<AppRoute>(readRoute)
+
+  const navigate = (path: '/' | '/models' | `/workflows/${string}`) => {
+    window.location.hash = path
+    setRoute(readRoute())
   }
 
   useEffect(() => {
-    const syncRoute = () => {
-      const value = window.location.hash.match(/^#\/workflows\/(.+)$/)
-      setWorkflowId(value?.[1] ?? null)
-    }
+    const syncRoute = () => setRoute(readRoute())
     window.addEventListener('hashchange', syncRoute)
     return () => window.removeEventListener('hashchange', syncRoute)
   }, [])
@@ -961,22 +1089,33 @@ function App() {
   return (
     <>
       <nav className="topbar">
-        <button className="brand" onClick={() => navigate(null)}>
+        <button className="brand" onClick={() => navigate('/')}>
           <span className="brand-cube">⬡</span>
           Form &amp; Function
         </button>
-        <div className="architecture-badge">
-          <span>Discovery</span>
-          <i />
-          <span>Modeling</span>
-          <i />
-          <span>Printer adapter</span>
+        <div className="nav-tabs" aria-label="Primary navigation">
+          <button
+            className={route.page === 'create' ? 'active' : ''}
+            aria-current={route.page === 'create' ? 'page' : undefined}
+            onClick={() => navigate('/')}
+          >
+            Create
+          </button>
+          <button
+            className={route.page !== 'create' ? 'active' : ''}
+            aria-current={route.page !== 'create' ? 'page' : undefined}
+            onClick={() => navigate('/models')}
+          >
+            Models
+          </button>
         </div>
       </nav>
-      {workflowId ? (
-        <WorkflowPanel workflowId={workflowId} onReset={() => navigate(null)} />
+      {route.page === 'workflow' ? (
+        <WorkflowPanel workflowId={route.workflowId} onReset={() => navigate('/models')} />
+      ) : route.page === 'models' ? (
+        <DashboardPanel onOpen={(id) => navigate(`/workflows/${id}`)} />
       ) : (
-        <DashboardPanel onOpen={(id) => navigate(id)} />
+        <StartPanel onCreated={(id) => navigate(`/workflows/${id}`)} />
       )}
     </>
   )
