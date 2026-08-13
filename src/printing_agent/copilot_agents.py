@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from copilot import CopilotClient, define_tool
+from copilot.generated.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
 from copilot.generated.session_events import PermissionRequest
 from copilot.session import PermissionRequestResult
 from copilot.tools import Tool, ToolBinaryResult, ToolResult
@@ -79,8 +80,8 @@ def _role_permission_handler(allowed: set[str]):
         invocation: dict[str, str],
     ) -> PermissionRequestResult:
         if request.tool_name in allowed:
-            return PermissionRequestResult(kind="approve-once")
-        return PermissionRequestResult(kind="reject")
+            return PermissionDecisionApproveOnce()
+        return PermissionDecisionReject(feedback="Tool is unavailable to this session role")
 
     return handler
 
