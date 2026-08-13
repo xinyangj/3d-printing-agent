@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 import trimesh
@@ -53,6 +54,22 @@ def test_source_policy_rejects_external_capabilities() -> None:
 
     policy.validate("cube([10, 10, 10]);", None)
     policy.validate('import("source.stl");', "source.stl")
+
+
+def test_artifact_store_preserves_legacy_root_file_aliases(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    workflow_id = str(uuid4())
+    directory = store.artifact_directory(workflow_id, 1)
+    directory.mkdir(parents=True)
+    (directory / "model.stl").write_bytes(b"legacy")
+    (directory / "source.scad").write_text("cube(1);", encoding="utf-8")
+    (directory / "manifest.json").write_text("{}", encoding="utf-8")
+
+    assert store.resolve_artifact_file(workflow_id, 1, "model.stl").read_bytes() == b"legacy"
+    assert (
+        store.resolve_artifact_file(workflow_id, 1, "source.scad").read_text(encoding="utf-8")
+        == "cube(1);"
+    )
 
 
 async def test_source_is_adopted_only_after_mesh_validation(

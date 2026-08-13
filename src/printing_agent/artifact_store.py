@@ -109,26 +109,33 @@ class ArtifactStore:
         filename: str,
     ) -> Path:
         artifact_directory = self.artifact_directory(workflow_id, version)
+        manifest_path = artifact_directory / "manifest.json"
+        manifest: dict[str, object] = {}
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError, TypeError) as exc:
+                raise PolicyViolationError("Artifact manifest is invalid") from exc
         aliases = {
             "source.scad": "project/main.scad",
             "model.stl": "outputs/model.stl",
             "model.3mf": "outputs/model.3mf",
         }
-        requested = aliases.get(filename, filename).replace("\\", "/")
+        requested = (
+            aliases.get(filename, filename)
+            if manifest.get("schema_version") == "2"
+            else filename
+        ).replace("\\", "/")
         if Path(requested).is_absolute() or ".." in Path(requested).parts:
             raise PolicyViolationError("Unsupported artifact filename")
-        manifest_path = artifact_directory / "manifest.json"
         allowed = {"manifest.json", "source.scad", "model.stl"}
-        if manifest_path.is_file():
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                allowed.update(
-                    item["path"]
-                    for item in manifest.get("files", [])
-                    if isinstance(item, dict) and isinstance(item.get("path"), str)
-                )
-            except (json.JSONDecodeError, OSError, TypeError) as exc:
-                raise PolicyViolationError("Artifact manifest is invalid") from exc
+        files = manifest.get("files", [])
+        if isinstance(files, list):
+            allowed.update(
+                item["path"]
+                for item in files
+                if isinstance(item, dict) and isinstance(item.get("path"), str)
+            )
         if requested not in allowed and filename not in allowed:
             raise PolicyViolationError("Artifact file is not listed in the manifest")
         path = (artifact_directory / requested).resolve()
