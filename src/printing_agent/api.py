@@ -351,4 +351,10 @@ app = create_app()
 
 
 def main() -> None:
-    uvicorn.run("printing_agent.api:app", host="127.0.0.1", port=8000, reload=False)
+    settings = get_settings()
+    uvicorn.run(
+        "printing_agent.api:app",
+        host=settings.api_host,
+        port=settings.api_port,
+        reload=False,
+    )

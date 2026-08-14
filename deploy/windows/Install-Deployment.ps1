@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$AuthUsername = "printing-agent",
+    [switch]$EnableLanAccess,
     [switch]$SkipPackageInstall,
     [switch]$SkipScheduledTasks,
     [switch]$SkipFunnel
@@ -114,6 +115,24 @@ $envLines = Set-EnvironmentEntry `
     -Lines $envLines `
     -Name "PRINTING_AGENT_OPENSCAD_PATH" `
     -Value $openscad
+if ($EnableLanAccess) {
+    $envLines = Set-EnvironmentEntry `
+        -Lines $envLines `
+        -Name "PRINTING_AGENT_API_HOST" `
+        -Value "0.0.0.0"
+    $existingRule = Get-NetFirewallRule `
+        -DisplayName $script:LanFirewallRuleName `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $existingRule) {
+        New-NetFirewallRule `
+            -DisplayName $script:LanFirewallRuleName `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 8000 `
+            -Profile Private | Out-Null
+    }
+}
 $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllLines($envPath, $envLines, $utf8WithoutBom)
 Protect-DeploymentFile -Path $envPath
@@ -155,3 +174,6 @@ Write-Host ""
 Write-Host "Deployment installation completed."
 Write-Host "Set PRINTING_AGENT_THINGIVERSE_TOKEN in .env before creating live workflows."
 Write-Host "Run Get-DeploymentStatus.ps1 to inspect the services and Funnel."
+if ($EnableLanAccess) {
+    Write-Host "LAN access is enabled on TCP port 8000 for Private network profiles."
+}

@@ -105,6 +105,24 @@ Set-Location ..
 
 Open <http://127.0.0.1:8000>. FastAPI serves `web/dist` when present.
 
+### Private LAN access
+
+To make the WebUI reachable from other devices on a trusted Windows Private network,
+set the bind address in `.env`:
+
+```dotenv
+PRINTING_AGENT_API_HOST=0.0.0.0
+PRINTING_AGENT_API_PORT=8000
+```
+
+Restart the API, add an inbound TCP/8000 Windows Firewall rule limited to the Private
+profile, then open `http://<this-computer's-ip>:8000` from another device. The Windows
+installer performs both configuration steps when run with `-EnableLanAccess`.
+
+> [!WARNING]
+> Port 8000 has no application-level authentication. Do not allow this rule on Public
+> profiles or expose it directly to the internet.
+
 ## Windows deployment with Tailscale Funnel
 
 The production-style Windows deployment keeps FastAPI and Caddy on loopback and uses

@@ -7,6 +7,7 @@ $script:LogDir = Join-Path $script:RepoRoot "var\logs"
 $script:CaddyfilePath = Join-Path $script:RuntimeDir "Caddyfile"
 $script:AppTaskName = "3D Printing Agent"
 $script:CaddyTaskName = "3D Printing Agent Proxy"
+$script:LanFirewallRuleName = "3D Printing Agent LAN"
 
 function Update-ProcessPath {
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")

@@ -13,6 +13,12 @@ foreach ($name in @($script:CaddyTaskName, $script:AppTaskName)) {
     }
 }
 Stop-DeploymentProcesses
+$firewallRule = Get-NetFirewallRule `
+    -DisplayName $script:LanFirewallRuleName `
+    -ErrorAction SilentlyContinue
+if ($null -ne $firewallRule) {
+    $firewallRule | Remove-NetFirewallRule
+}
 
 if ($ResetFunnel) {
     Update-ProcessPath

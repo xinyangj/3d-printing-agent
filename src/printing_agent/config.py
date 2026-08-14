@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     artifact_dir: Path = Path("var/artifacts")
     candidate_cache_dir: Path = Path("var/candidate-cache")
     simulator_spool_dir: Path = Path("var/simulator")
+    api_host: str = Field(default="127.0.0.1", min_length=1, max_length=255)
+    api_port: int = Field(default=8000, ge=1, le=65535)
     thingiverse_token: str | None = None
     thingiverse_api_url: str = "https://api.thingiverse.com"
     openscad_path: str = "openscad"
