@@ -485,6 +485,17 @@ class PrintingApplication:
             ).with_digest()
             current_source = 'import("source.stl");\n'
         else:
+            if allowed_part_ids is not None:
+                part_ids = (
+                    {part.id for part in artifact.project.parts}
+                    if artifact.project is not None
+                    else set()
+                )
+                if not set(allowed_part_ids).issubset(part_ids):
+                    unknown = sorted(set(allowed_part_ids) - part_ids)
+                    raise ValidationError(
+                        f"Unknown edit-scope parts: {', '.join(unknown)}"
+                    )
             if workflow.active_handoff_version is None:
                 raise ConflictError("Current artifact was not produced by a modeling handoff")
             old_handoff = await self.repository.get_handoff(
@@ -571,9 +582,16 @@ class PrintingApplication:
                         f"Unknown edit-scope parts: {', '.join(unknown)}"
                     )
             elif allowed_part_ids is not None:
-                raise ValidationError(
-                    "Explicit part scopes are available only for multipart artifacts"
+                part_ids = (
+                    {part.id for part in artifact.project.parts}
+                    if artifact.project is not None
+                    else set()
                 )
+                if not set(allowed_part_ids).issubset(part_ids):
+                    unknown = sorted(set(allowed_part_ids) - part_ids)
+                    raise ValidationError(
+                        f"Unknown edit-scope parts: {', '.join(unknown)}"
+                    )
         revision = RevisionRequest(
             workflow_id=workflow_id,
             mode=mode,
