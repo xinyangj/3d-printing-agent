@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -38,7 +39,12 @@ from printing_agent.domain import (
     WorkflowState,
     WorkKind,
 )
-from printing_agent.errors import ConflictError, NotFoundError, PolicyViolationError
+from printing_agent.errors import (
+    ConflictError,
+    NotFoundError,
+    PolicyViolationError,
+    ValidationError,
+)
 from printing_agent.modeling import MeshInspector, ModelPipeline, OpenScadSourcePolicy
 from printing_agent.multipart import ThreeMFService, _module_name
 from printing_agent.printers import SimulatedPrinterAdapter
@@ -53,8 +59,17 @@ class BoxRenderer:
 
 class PartRenderer:
     async def render(self, source_path: Path, output_path: Path) -> str:
-        trimesh.creation.box(extents=(6, 6, 4)).export(output_path)
+        mesh = trimesh.load_mesh(source_path.parent / "source.stl", force="mesh")
+        mesh.apply_scale(3)
+        mesh.export(output_path)
         return "rendered revised part"
+
+
+class FailingPartRenderer(PartRenderer):
+    async def render(self, source_path: Path, output_path: Path) -> str:
+        if source_path.parent.name == "axle":
+            raise ValidationError("fixture axle render failed")
+        return await super().render(source_path, output_path)
 
 
 def test_source_policy_rejects_external_capabilities() -> None:
@@ -404,8 +419,7 @@ async def test_source_set_publishes_separate_parts_instances_and_package(
         RevisionRequest(
             workflow_id=workflow.id,
             mode=RevisionMode.REFINE_CURRENT,
-            feedback="Make the wheel square",
-            part_id="wheel",
+            feedback="Make the wheels and axles three times bigger",
         )
     )
     handoff = ModelingHandoff(
@@ -414,7 +428,7 @@ async def test_source_set_publishes_separate_parts_instances_and_package(
         requirement=workflow.requirement,
         model_plan=plan,
         decision=ModelDecision.MODIFY,
-        required_changes=["Make the wheel square"],
+        required_changes=["Make the wheels and axles three times bigger"],
         selected_source=SelectedSourceSummary(
             filename="wheel.stl",
             candidate_id="truck",
@@ -433,7 +447,7 @@ async def test_source_set_publishes_separate_parts_instances_and_package(
             build_volume=Dimensions(width_mm=220, depth_mm=220, height_mm=250),
             accepted_formats={"stl"},
         ),
-        discovery_rationale="Revise only the selected wheel part",
+        discovery_rationale="Revise the affected source-set parts",
     ).with_digest()
     await repository.save_handoff(handoff)
     await repository.transition(workflow.id, WorkflowState.HANDOFF_READY)
@@ -453,17 +467,25 @@ async def test_source_set_publishes_separate_parts_instances_and_package(
         if instance.part_id == "axle"
     )
 
-    revised = await revision_pipeline.adopt_part_revision(
+    revised = await revision_pipeline.adopt_part_revisions(
         handoff,
         artifact,
-        "wheel",
-        'import("source.stl");',
+        [
+            ("wheel", 'import("source.stl");', "Scale every wheel uniformly by three"),
+            ("axle", 'import("source.stl");', "Scale every axle uniformly by three"),
+        ],
+        feedback="Make the wheels and axles three times bigger",
+        rationale="The request explicitly names both wheel and axle parts.",
+        allowed_part_ids=None,
     )
 
     assert revised.version == 2
     assert revised.project is not None
     assert len(revised.project.instances) == 7
     assert next(part for part in revised.project.parts if part.id == "wheel").geometry_kind == (
+        PartGeometryKind.DERIVED_MESH
+    )
+    assert next(part for part in revised.project.parts if part.id == "axle").geometry_kind == (
         PartGeometryKind.DERIVED_MESH
     )
     assert sha256_file(revised.model_path.parent / "body.stl") == unchanged_body_digest
@@ -477,6 +499,74 @@ async def test_source_set_publishes_separate_parts_instances_and_package(
     ) != original_axle_transform
     assert revised.source_path.read_text(encoding="utf-8") != original_main_source
     assert revised.three_mf_path is not None and revised.three_mf_path.is_file()
+    assert revised.revision is not None
+    assert revised.revision.affected_part_ids == ["wheel", "axle"]
+    assert revised.revision.allowed_part_ids is None
+    assert revised.part_meshes["wheel"].dimensions.width_mm == pytest.approx(
+        artifact.part_meshes["wheel"].dimensions.width_mm * 3
+    )
+    assert revised.part_meshes["axle"].dimensions.height_mm == pytest.approx(
+        artifact.part_meshes["axle"].dimensions.height_mm * 3
+    )
+    manifest = json.loads(
+        (revised.project_path.parent.parent / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["revision"]["affected_part_ids"] == ["wheel", "axle"]
+    with pytest.raises(ValidationError, match="outside the allowed edit scope"):
+        await revision_pipeline.adopt_part_revisions(
+            handoff,
+            revised,
+            [("axle", 'import("source.stl");', "Change the axle")],
+            feedback="Change the axle",
+            rationale="Axle requested",
+            allowed_part_ids=["wheel"],
+        )
+
+    await repository.request_revision(
+        RevisionRequest(
+            workflow_id=workflow.id,
+            mode=RevisionMode.REFINE_CURRENT,
+            feedback="Change the wheels and axles again",
+            allowed_part_ids=["wheel", "axle"],
+        )
+    )
+    failed_handoff = handoff.model_copy(
+        update={
+            "version": 2,
+            "required_changes": [
+                *handoff.required_changes,
+                "Change the wheels and axles again",
+            ],
+            "digest": None,
+        }
+    ).with_digest()
+    await repository.save_handoff(failed_handoff)
+    await repository.transition(workflow.id, WorkflowState.HANDOFF_READY)
+    await repository.transition(workflow.id, WorkflowState.GENERATING)
+    failing_pipeline = ModelPipeline(
+        settings,
+        repository,
+        ArtifactStore(settings.artifact_dir),
+        FailingPartRenderer(),  # type: ignore[arg-type]
+        inspector,
+    )
+
+    with pytest.raises(ValidationError, match="fixture axle render failed"):
+        await failing_pipeline.adopt_part_revisions(
+            failed_handoff,
+            revised,
+            [
+                ("wheel", 'import("source.stl");', "Change wheel"),
+                ("axle", 'import("source.stl");', "Change axle"),
+            ],
+            feedback="Change the wheels and axles again",
+            rationale="Both named parts are affected.",
+            allowed_part_ids=["wheel", "axle"],
+        )
+
+    assert (await repository.get_workflow(workflow.id)).active_artifact_version == 2
+    with pytest.raises(NotFoundError):
+        await repository.get_artifact(workflow.id, 3)
 
 
 def test_three_mf_round_trip_preserves_named_parts_instances_and_colors(tmp_path: Path) -> None:

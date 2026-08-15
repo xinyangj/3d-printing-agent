@@ -65,6 +65,17 @@ class SubmitOpenScadSourceParams(BaseModel):
     design_summary: str = Field(min_length=1, max_length=2_000)
 
 
+class MultipartPartRevisionParams(BaseModel):
+    part_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    source_code: str = Field(min_length=1, max_length=100_000)
+    design_summary: str = Field(min_length=1, max_length=2_000)
+
+
+class SubmitMultipartRevisionParams(BaseModel):
+    revisions: list[MultipartPartRevisionParams] = Field(min_length=1, max_length=100)
+    rationale: str = Field(min_length=1, max_length=2_000)
+
+
 @dataclass
 class _DiscoveryToolState:
     workflow: PrintWorkflow
@@ -75,8 +86,9 @@ class _DiscoveryToolState:
 @dataclass
 class _ModelingToolState:
     handoff: ModelingHandoff
-    target_part_id: str | None = None
+    allowed_part_ids: list[str] | None = None
     base_artifact: ModelArtifact | None = None
+    feedback: str | None = None
     artifact: ModelArtifact | None = None
     failures: list[str] = field(default_factory=list)
 
@@ -606,25 +618,32 @@ class CopilotModelingAgent:
         feedback: str,
         current_source: str,
         previous_handoff: ModelingHandoff,
-        part_id: str | None = None,
+        allowed_part_ids: list[str] | None = None,
     ) -> ModelArtifact:
         workflow = await self.repository.get_workflow(handoff.workflow_id)
+        multipart = artifact.project is not None and len(artifact.project.parts) > 1
         state = _ModelingToolState(
             handoff=handoff,
-            target_part_id=part_id,
+            allowed_part_ids=allowed_part_ids,
             base_artifact=artifact,
+            feedback=feedback,
         )
         await self.runtime.run(
             workflow,
             "modeling",
-            [self._source_tool(state)],
+            [self._multipart_revision_tool(state) if multipart else self._source_tool(state)],
             (
-                "Revise the exact current OpenSCAD source according to the user feedback. Return "
-                "a complete replacement through submit_openscad_source. Preserve every feature "
-                "not targeted by the feedback and continue to satisfy all original constraints.\n\n"
+                "Revise the current artifact according to the user feedback. For a multipart "
+                "artifact, infer the minimal affected part set from the complete project inventory "
+                "and submit all replacements together through submit_multipart_revision. If an "
+                "allowed edit scope is supplied, never target a part outside it. Each replacement "
+                'may import only its own current mesh as "source.stl". Preserve every unselected '
+                "part and never merge separate part geometry. For a single-part artifact, return "
+                "a complete replacement through submit_openscad_source.\n\n"
                 f"Original requirement: {workflow.requirement}\n"
                 f"Feedback: {feedback}\n"
-                f"Target part ID: {part_id or 'entire model'}\n"
+                "Allowed edit scope: "
+                f"{allowed_part_ids if allowed_part_ids is not None else 'agent decides'}\n"
                 f"Current artifact: {artifact.model_dump_json(indent=2)}\n"
                 f"Previous handoff: {previous_handoff.model_dump_json(indent=2)}\n"
                 f"New handoff: {handoff.model_dump_json(indent=2)}\n"
@@ -637,6 +656,90 @@ class CopilotModelingAgent:
         if state.artifact is None:
             raise ExternalServiceError("Modeling revision ended without an adopted artifact")
         return state.artifact
+
+    def _multipart_revision_tool(self, state: _ModelingToolState) -> Tool:
+        @define_tool(
+            name="submit_multipart_revision",
+            description=(
+                "Submit all affected multipart OpenSCAD replacements in one atomic batch. "
+                "Every part remains a separate object and unselected parts are preserved."
+            ),
+            defer="never",
+        )
+        async def submit_multipart_revision(
+            params: SubmitMultipartRevisionParams,
+        ) -> ToolResult:
+            if state.base_artifact is None or state.base_artifact.project is None:
+                return ToolResult(
+                    result_type="denied",
+                    text_result_for_llm="Multipart base artifact is unavailable.",
+                )
+            part_ids = [item.part_id for item in params.revisions]
+            if len(part_ids) != len(set(part_ids)):
+                return ToolResult(
+                    result_type="rejected",
+                    text_result_for_llm="Each affected part may appear only once.",
+                )
+            known_ids = {part.id for part in state.base_artifact.project.parts}
+            unknown = sorted(set(part_ids) - known_ids)
+            if unknown:
+                return ToolResult(
+                    result_type="rejected",
+                    text_result_for_llm=f"Unknown part IDs: {', '.join(unknown)}.",
+                )
+            if state.allowed_part_ids is not None:
+                outside_scope = sorted(set(part_ids) - set(state.allowed_part_ids))
+                if outside_scope:
+                    return ToolResult(
+                        result_type="rejected",
+                        text_result_for_llm=(
+                            "Parts outside the allowed edit scope: "
+                            f"{', '.join(outside_scope)}."
+                        ),
+                    )
+            workflow = await self.repository.get_workflow(state.handoff.workflow_id)
+            active_handoff = await self.repository.get_handoff(
+                state.handoff.workflow_id,
+                state.handoff.version,
+            )
+            if (
+                workflow.state != WorkflowState.GENERATING
+                or active_handoff.digest != state.handoff.digest
+            ):
+                return ToolResult(
+                    result_type="denied",
+                    text_result_for_llm="Handoff is stale or generation is not active.",
+                )
+            try:
+                state.artifact = await self.pipeline.adopt_part_revisions(
+                    state.handoff,
+                    state.base_artifact,
+                    [
+                        (item.part_id, item.source_code, item.design_summary)
+                        for item in params.revisions
+                    ],
+                    feedback=state.feedback or "Multipart revision",
+                    rationale=params.rationale,
+                    allowed_part_ids=state.allowed_part_ids,
+                )
+                return ToolResult(
+                    text_result_for_llm=(
+                        f"Artifact {state.artifact.version} adopted with affected parts "
+                        f"{', '.join(part_ids)}."
+                    )
+                )
+            except BudgetExhaustedError as exc:
+                state.failures.append(exc.message)
+                return ToolResult(result_type="denied", text_result_for_llm=exc.message)
+            except Exception as exc:
+                diagnostic = str(exc)[-2_000:]
+                state.failures.append(diagnostic)
+                return ToolResult(
+                    result_type="failure",
+                    text_result_for_llm=f"Multipart revision rejected: {diagnostic}",
+                )
+
+        return submit_multipart_revision
 
     def _source_tool(self, state: _ModelingToolState) -> Tool:
         @define_tool(
@@ -658,12 +761,10 @@ class CopilotModelingAgent:
                     result_type="rejected",
                     text_result_for_llm=f"Expected mode '{expected_mode}'.",
                 )
-            if params.part_id != state.target_part_id:
+            if params.part_id is not None:
                 return ToolResult(
                     result_type="rejected",
-                    text_result_for_llm=(
-                        f"Expected target part '{state.target_part_id or 'entire model'}'."
-                    ),
+                    text_result_for_llm="Single-part submissions must omit part_id.",
                 )
             workflow = await self.repository.get_workflow(state.handoff.workflow_id)
             active_handoff = await self.repository.get_handoff(
@@ -679,18 +780,10 @@ class CopilotModelingAgent:
                     text_result_for_llm="Handoff is stale or generation is not active.",
                 )
             try:
-                if state.target_part_id is not None and state.base_artifact is not None:
-                    state.artifact = await self.pipeline.adopt_part_revision(
-                        state.handoff,
-                        state.base_artifact,
-                        state.target_part_id,
-                        params.source_code,
-                    )
-                else:
-                    state.artifact = await self.pipeline.adopt_source(
-                        state.handoff,
-                        params.source_code,
-                    )
+                state.artifact = await self.pipeline.adopt_source(
+                    state.handoff,
+                    params.source_code,
+                )
                 return ToolResult(
                     text_result_for_llm=(
                         f"Artifact {state.artifact.version} adopted with manifest "
@@ -715,8 +808,8 @@ class CopilotModelingAgent:
         return (
             "You are the modeling specialist for a 3D-printing workflow. You have no search, "
             "network, shell, filesystem, or printer tools. Produce complete OpenSCAD only "
-            "through submit_openscad_source. When a target part ID is supplied, change only "
-            "that semantic part and return the same part ID. Modify mode may import only "
-            "source.stl; create mode uses no imports. Build connected, watertight geometry "
-            "within constraints."
+            "through the supplied modeling tool. For multipart revisions, choose the minimal "
+            "affected part set, obey any allowed edit scope, keep each part separate, and submit "
+            "all changes atomically. Modify mode may import only source.stl; create mode uses no "
+            "imports. Build connected, watertight geometry within constraints."
         )

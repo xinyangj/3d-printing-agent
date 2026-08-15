@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS revision_requests (
     mode TEXT NOT NULL,
     feedback TEXT NOT NULL,
     part_id TEXT,
+    allowed_part_ids_json TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -214,6 +215,10 @@ class WorkflowRepository:
             revision_columns = {row[1] for row in await cursor.fetchall()}
             if "part_id" not in revision_columns:
                 await db.execute("ALTER TABLE revision_requests ADD COLUMN part_id TEXT")
+            if "allowed_part_ids_json" not in revision_columns:
+                await db.execute(
+                    "ALTER TABLE revision_requests ADD COLUMN allowed_part_ids_json TEXT"
+                )
             await db.commit()
 
     async def _connect(self) -> aiosqlite.Connection:
@@ -1048,14 +1053,20 @@ class WorkflowRepository:
             await db.execute("BEGIN IMMEDIATE")
             await db.execute(
                 """
-                INSERT INTO revision_requests (workflow_id, mode, feedback, part_id, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO revision_requests (
+                    workflow_id, mode, feedback, part_id, allowed_part_ids_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     revision.workflow_id,
                     revision.mode.value,
                     revision.feedback,
-                    revision.part_id,
+                    None,
+                    (
+                        json.dumps(revision.allowed_part_ids)
+                        if revision.allowed_part_ids is not None
+                        else None
+                    ),
                     revision.created_at.isoformat(),
                 ),
             )
@@ -1091,14 +1102,20 @@ class WorkflowRepository:
             assert_transition(current_state, WorkflowState.REVISION_REQUESTED)
             await db.execute(
                 """
-                INSERT INTO revision_requests (workflow_id, mode, feedback, part_id, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO revision_requests (
+                    workflow_id, mode, feedback, part_id, allowed_part_ids_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     revision.workflow_id,
                     revision.mode.value,
                     revision.feedback,
-                    revision.part_id,
+                    None,
+                    (
+                        json.dumps(revision.allowed_part_ids)
+                        if revision.allowed_part_ids is not None
+                        else None
+                    ),
                     revision.created_at.isoformat(),
                 ),
             )
@@ -1130,7 +1147,7 @@ class WorkflowRepository:
                 {
                     "mode": revision.mode.value,
                     "feedback": revision.feedback,
-                    "part_id": revision.part_id,
+                    "allowed_part_ids": revision.allowed_part_ids,
                 },
             )
             await self._insert_work_item(db, item)
@@ -1252,11 +1269,18 @@ class WorkflowRepository:
             row = await cursor.fetchone()
             if row is None:
                 raise NotFoundError("Workflow has no revision request")
+            allowed_part_ids = (
+                json.loads(row["allowed_part_ids_json"])
+                if row["allowed_part_ids_json"] is not None
+                else [row["part_id"]]
+                if row["part_id"] is not None
+                else None
+            )
             return RevisionRequest(
                 workflow_id=row["workflow_id"],
                 mode=RevisionMode(row["mode"]),
                 feedback=row["feedback"],
-                part_id=row["part_id"],
+                allowed_part_ids=allowed_part_ids,
                 created_at=row["created_at"],
             )
         finally:

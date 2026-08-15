@@ -16,6 +16,7 @@ from printing_agent.domain import (
     AnnotationOrigin,
     ArtifactFile,
     ArtifactProvenance,
+    ArtifactRevision,
     CandidateFile,
     InterfaceEvidence,
     MaterialDefinition,
@@ -416,6 +417,7 @@ def rebuild_part_project_artifact(
     provenance: ArtifactProvenance,
     classification: list[dict[str, object]],
     handoff_digest: str,
+    revision: ArtifactRevision,
 ) -> tuple[dict[str, object], list[ArtifactFile]]:
     _write_source_set_main(directory / "project", project)
     project_path = directory / "project" / "project.json"
@@ -481,6 +483,7 @@ def rebuild_part_project_artifact(
             for part_id, report in part_reports.items()
         },
         "provenance": provenance.model_dump(mode="json"),
+        "revision": revision.model_dump(mode="json"),
         "source_set_classification": classification,
         "files": [item.model_dump(mode="json") for item in files],
     }

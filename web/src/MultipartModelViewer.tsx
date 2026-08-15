@@ -19,13 +19,13 @@ type ViewerInstance = {
 export function MultipartPartsViewer({
   parts,
   instances,
-  selectedPartId,
-  onSelectPart,
+  scopedPartIds,
+  onTogglePart,
 }: {
   parts: ViewerPart[]
   instances: ViewerInstance[]
-  selectedPartId: string | null
-  onSelectPart: (partId: string) => void
+  scopedPartIds: string[]
+  onTogglePart: (partId: string) => void
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [mode, setMode] = useState<'unique' | 'quantities'>('unique')
@@ -58,6 +58,7 @@ export function MultipartPartsViewer({
 
     const loader = new STLLoader()
     const meshes: THREE.Mesh[] = []
+    const outlines: THREE.LineSegments[] = []
     let disposed = false
     let frame = 0
     const load = async () => {
@@ -98,7 +99,7 @@ export function MultipartPartsViewer({
         const mesh = new THREE.Mesh(
           geometry,
           new THREE.MeshStandardMaterial({
-            color: selectedPartId === part.id ? '#f2b45e' : part.color,
+            color: part.color,
             roughness: 0.42,
             metalness: 0.08,
             wireframe,
@@ -111,6 +112,15 @@ export function MultipartPartsViewer({
         } else {
           mesh.position.set(cursor - bounds.min.x, -bounds.min.y, -bounds.min.z)
           cursor += bounds.max.x - bounds.min.x + 8
+        }
+        if (scopedPartIds.includes(part.id)) {
+          const outline = new THREE.LineSegments(
+            new THREE.EdgesGeometry(geometry, 25),
+            new THREE.LineBasicMaterial({ color: '#f7f2df' }),
+          )
+          outline.renderOrder = 2
+          mesh.add(outline)
+          outlines.push(outline)
         }
         scene.add(mesh)
         meshes.push(mesh)
@@ -130,15 +140,32 @@ export function MultipartPartsViewer({
 
     const raycaster = new THREE.Raycaster()
     const pointer = new THREE.Vector2()
-    const selectMesh = (event: PointerEvent) => {
+    let pointerStart: { x: number; y: number } | null = null
+    const startSelection = (event: PointerEvent) => {
+      pointerStart = { x: event.clientX, y: event.clientY }
+    }
+    const finishSelection = (event: PointerEvent) => {
+      if (
+        !pointerStart ||
+        Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y) > 4
+      ) {
+        pointerStart = null
+        return
+      }
+      pointerStart = null
       const rect = renderer.domElement.getBoundingClientRect()
       pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
       pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
       raycaster.setFromCamera(pointer, camera)
       const hit = raycaster.intersectObjects(meshes, false)[0]
-      if (hit?.object.userData.partId) onSelectPart(hit.object.userData.partId)
+      if (hit?.object.userData.partId) onTogglePart(hit.object.userData.partId)
     }
-    renderer.domElement.addEventListener('pointerdown', selectMesh)
+    const cancelSelection = () => {
+      pointerStart = null
+    }
+    renderer.domElement.addEventListener('pointerdown', startSelection)
+    renderer.domElement.addEventListener('pointerup', finishSelection)
+    renderer.domElement.addEventListener('pointercancel', cancelSelection)
     const resize = new ResizeObserver(() => {
       renderer.setSize(container.clientWidth, container.clientHeight)
       camera.aspect = container.clientWidth / container.clientHeight
@@ -155,17 +182,27 @@ export function MultipartPartsViewer({
       disposed = true
       cancelAnimationFrame(frame)
       resize.disconnect()
-      renderer.domElement.removeEventListener('pointerdown', selectMesh)
+      renderer.domElement.removeEventListener('pointerdown', startSelection)
+      renderer.domElement.removeEventListener('pointerup', finishSelection)
+      renderer.domElement.removeEventListener('pointercancel', cancelSelection)
       controls.dispose()
       meshes.forEach((mesh) => {
         mesh.geometry.dispose()
         if (Array.isArray(mesh.material)) mesh.material.forEach((item) => item.dispose())
         else mesh.material.dispose()
       })
+      outlines.forEach((outline) => {
+        outline.geometry.dispose()
+        if (Array.isArray(outline.material)) {
+          outline.material.forEach((item) => item.dispose())
+        } else {
+          outline.material.dispose()
+        }
+      })
       renderer.dispose()
       container.removeChild(renderer.domElement)
     }
-  }, [instances, mode, onSelectPart, parts, selectedPartId, wireframe])
+  }, [instances, mode, onTogglePart, parts, scopedPartIds, wireframe])
 
   return (
     <div className="viewer-shell">

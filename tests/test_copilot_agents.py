@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from copilot.generated.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
@@ -17,6 +17,7 @@ from printing_agent.copilot_agents import (
     _role_permission_handler,
 )
 from printing_agent.domain import (
+    AnnotationOrigin,
     ArtifactProvenance,
     Dimensions,
     MeshReport,
@@ -24,6 +25,10 @@ from printing_agent.domain import (
     ModelDecision,
     ModelingHandoff,
     ModelPlan,
+    PartDefinition,
+    PartGeometryKind,
+    PartInstance,
+    PartProject,
     PrinterCapabilitySummary,
 )
 from printing_agent.repositories import WorkflowRepository
@@ -70,10 +75,12 @@ class CaptureRuntime:
     def __init__(self) -> None:
         self.prompt = ""
         self.resume = True
+        self.tools: list[Any] = []
 
     async def run(self, *args: object, **kwargs: object) -> str:
         self.prompt = cast(str, args[3])
         self.resume = cast(bool, kwargs["resume"])
+        self.tools = cast(list[Any], args[2])
         raise RuntimeError("captured")
 
 
@@ -133,6 +140,64 @@ async def test_revision_sessions_are_fresh_and_source_backed(
     assert source in modeling_runtime.prompt
     assert "Previous handoff" in modeling_runtime.prompt
     assert "New handoff" in modeling_runtime.prompt
+
+    multipart_artifact = artifact.model_copy(
+        update={
+            "project": PartProject(
+                parts=[
+                    PartDefinition(
+                        id="body",
+                        name="Bottle body",
+                        geometry_kind=PartGeometryKind.IMPORTED_MESH,
+                        module_name="body",
+                        annotation_origin=AnnotationOrigin.CATALOG_METADATA,
+                        confidence=1,
+                    ),
+                    PartDefinition(
+                        id="lid",
+                        name="Bottle lid",
+                        geometry_kind=PartGeometryKind.IMPORTED_MESH,
+                        module_name="lid",
+                        annotation_origin=AnnotationOrigin.CATALOG_METADATA,
+                        confidence=1,
+                    ),
+                ],
+                instances=[
+                    PartInstance(
+                        id="body_1",
+                        part_id="body",
+                        name="Bottle body",
+                        annotation_origin=AnnotationOrigin.CATALOG_METADATA,
+                        confidence=1,
+                    ),
+                    PartInstance(
+                        id="lid_1",
+                        part_id="lid",
+                        name="Bottle lid",
+                        annotation_origin=AnnotationOrigin.CATALOG_METADATA,
+                        confidence=1,
+                    ),
+                ],
+                assembly_status="not_provided",
+            ),
+            "part_meshes": {"body": artifact.mesh, "lid": artifact.mesh},
+        }
+    )
+    with pytest.raises(RuntimeError, match="captured"):
+        await modeling.revise(
+            revised,
+            multipart_artifact,
+            "Scale both parts",
+            source,
+            previous,
+            ["body", "lid"],
+        )
+
+    assert [tool.name for tool in modeling_runtime.tools] == [
+        "submit_multipart_revision"
+    ]
+    assert "Allowed edit scope: ['body', 'lid']" in modeling_runtime.prompt
+    assert "never merge separate part geometry" in modeling_runtime.prompt
 
     catalog = ThingiverseCatalog(settings)
     try:

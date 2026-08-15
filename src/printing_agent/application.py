@@ -92,7 +92,7 @@ class PrintingApplication:
                 return await self._refine_current(
                     workflow.id,
                     revision.feedback,
-                    revision.part_id,
+                    revision.allowed_part_ids,
                 )
             await self.repository.transition(
                 workflow.id,
@@ -431,7 +431,7 @@ class PrintingApplication:
         self,
         workflow_id: str,
         feedback: str,
-        part_id: str | None,
+        allowed_part_ids: list[str] | None,
     ) -> ModelArtifact:
         workflow = await self.repository.get_workflow(workflow_id)
         if workflow.active_artifact_version is None:
@@ -441,28 +441,36 @@ class PrintingApplication:
             workflow.active_artifact_version,
         )
         if artifact.project is not None and len(artifact.project.parts) > 1:
-            if part_id is None:
-                raise ValidationError("Select one part before refining a multipart artifact")
+            part_ids = {part.id for part in artifact.project.parts}
+            if allowed_part_ids is not None and not set(allowed_part_ids).issubset(part_ids):
+                unknown = sorted(set(allowed_part_ids) - part_ids)
+                raise ValidationError(f"Unknown edit-scope parts: {', '.join(unknown)}")
+            reference_part_id = (
+                allowed_part_ids[0] if allowed_part_ids else artifact.project.parts[0].id
+            )
             part = next(
-                (candidate for candidate in artifact.project.parts if candidate.id == part_id),
+                (
+                    candidate
+                    for candidate in artifact.project.parts
+                    if candidate.id == reference_part_id
+                ),
                 None,
             )
-            if part is None:
-                raise ValidationError(f"Part '{part_id}' is not present in the artifact")
+            assert part is not None
             adapter = cast(PrinterAdapter, self.printers.get(workflow.printer_name))
             printer = await adapter.capabilities()
             selected_source = SelectedSourceSummary(
-                filename=f"{part_id}.stl",
+                filename=f"{reference_part_id}.stl",
                 candidate_id=artifact.provenance.candidate_id or workflow_id,
-                file_id=part_id,
+                file_id=reference_part_id,
                 title=part.name,
                 creator=artifact.provenance.creator or "unknown",
                 license=artifact.provenance.license or "unknown",
                 attribution_url=artifact.provenance.source_url or "local-artifact",
                 source_digest=sha256_file(
-                    artifact.model_path.parent / f"{part_id}.stl"
+                    artifact.model_path.parent / f"{reference_part_id}.stl"
                 ),
-                mesh=artifact.part_meshes[part_id],
+                mesh=artifact.part_meshes[reference_part_id],
             )
             old_handoff = ModelingHandoff(
                 workflow_id=workflow_id,
@@ -524,7 +532,7 @@ class PrintingApplication:
             feedback,
             current_source,
             old_handoff,
-            part_id,
+            allowed_part_ids,
         )
 
     async def request_revision(
@@ -532,7 +540,7 @@ class PrintingApplication:
         workflow_id: str,
         mode: RevisionMode,
         feedback: str,
-        part_id: str | None = None,
+        allowed_part_ids: list[str] | None = None,
     ) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
         PrintingApplication._ensure_not_archived(workflow)
@@ -554,20 +562,23 @@ class PrintingApplication:
                     "This artifact has no editable OpenSCAD source; search for a new base instead"
                 )
             if artifact.project is not None and len(artifact.project.parts) > 1:
-                if part_id is None:
+                part_ids = {part.id for part in artifact.project.parts}
+                if allowed_part_ids is not None and not set(allowed_part_ids).issubset(
+                    part_ids
+                ):
+                    unknown = sorted(set(allowed_part_ids) - part_ids)
                     raise ValidationError(
-                        "Select one part before refining a multipart artifact"
+                        f"Unknown edit-scope parts: {', '.join(unknown)}"
                     )
-            if part_id is not None and (
-                artifact.project is None
-                or all(part.id != part_id for part in artifact.project.parts)
-            ):
-                raise ValidationError(f"Part '{part_id}' is not present in the active artifact")
+            elif allowed_part_ids is not None:
+                raise ValidationError(
+                    "Explicit part scopes are available only for multipart artifacts"
+                )
         revision = RevisionRequest(
             workflow_id=workflow_id,
             mode=mode,
             feedback=feedback,
-            part_id=part_id,
+            allowed_part_ids=allowed_part_ids,
         )
         await self.repository.request_revision(revision)
 

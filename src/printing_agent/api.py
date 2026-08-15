@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from printing_agent.bootstrap import Container, build_container
 from printing_agent.config import get_settings
@@ -35,7 +36,24 @@ class ApproveArtifactRequest(BaseModel):
 class RevisionRequestBody(BaseModel):
     mode: RevisionMode
     feedback: str = Field(min_length=1, max_length=10_000)
+    allowed_part_ids: list[str] | None = Field(default=None, min_length=1, max_length=100)
     part_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+    @model_validator(mode="after")
+    def normalize_legacy_part_id(self) -> RevisionRequestBody:
+        if self.part_id is not None:
+            if self.allowed_part_ids is not None:
+                raise ValueError("Use either allowed_part_ids or the legacy part_id, not both")
+            self.allowed_part_ids = [self.part_id]
+        if self.allowed_part_ids is not None:
+            if len(self.allowed_part_ids) != len(set(self.allowed_part_ids)):
+                raise ValueError("Allowed part IDs must be unique")
+            if any(
+                not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", item)
+                for item in self.allowed_part_ids
+            ):
+                raise ValueError("Allowed part IDs are invalid")
+        return self
 
 
 @asynccontextmanager
@@ -295,7 +313,7 @@ def create_app(container: Container | None = None) -> FastAPI:
             workflow_id,
             body.mode,
             body.feedback,
-            body.part_id,
+            body.allowed_part_ids,
         )
         return {"status": "revision_queued"}
 

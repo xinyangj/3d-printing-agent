@@ -1,11 +1,41 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
-from printing_agent.api import create_app
+from printing_agent.api import RevisionRequestBody, create_app
 from printing_agent.bootstrap import build_container
 from printing_agent.config import Settings
-from printing_agent.domain import WorkflowState
+from printing_agent.domain import RevisionMode, WorkflowState
+
+
+def test_revision_body_supports_optional_and_legacy_edit_scopes() -> None:
+    unrestricted = RevisionRequestBody(
+        mode=RevisionMode.REFINE_CURRENT,
+        feedback="Scale the bottle and lid",
+    )
+    restricted = RevisionRequestBody(
+        mode=RevisionMode.REFINE_CURRENT,
+        feedback="Scale these parts",
+        allowed_part_ids=["body", "lid"],
+    )
+    legacy = RevisionRequestBody(
+        mode=RevisionMode.REFINE_CURRENT,
+        feedback="Scale the lid",
+        part_id="lid",
+    )
+
+    assert unrestricted.allowed_part_ids is None
+    assert restricted.allowed_part_ids == ["body", "lid"]
+    assert legacy.allowed_part_ids == ["lid"]
+    with pytest.raises(ValidationError):
+        RevisionRequestBody(
+            mode=RevisionMode.REFINE_CURRENT,
+            feedback="Invalid mixed scope",
+            part_id="lid",
+            allowed_part_ids=["body"],
+        )
 
 
 async def test_health_and_printer_discovery(settings: Settings) -> None:

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
@@ -82,6 +82,12 @@ type Artifact = {
     size_bytes: number
     filename: string
   }
+  revision: {
+    feedback: string
+    affected_part_ids: string[]
+    allowed_part_ids: string[] | null
+    rationale: string
+  } | null
 }
 
 type PrintJob = {
@@ -354,197 +360,6 @@ function ModelViewer({
           camera.updateProjectionMatrix()
         }
 
-        function MultipartModelViewer({
-          artifact,
-          workflowId,
-          selectedPartId,
-          onSelectPart,
-        }: {
-          artifact: Artifact
-          workflowId: string
-          selectedPartId: string | null
-          onSelectPart: (partId: string) => void
-        }) {
-          const containerRef = useRef<HTMLDivElement>(null)
-          const [mode, setMode] = useState<'unique' | 'quantities'>('unique')
-          const [wireframe, setWireframe] = useState(false)
-          const [errors, setErrors] = useState<string[]>([])
-
-          useEffect(() => {
-            const container = containerRef.current
-            const project = artifact.project
-            if (!container || !project) return
-            const width = container.clientWidth
-            const height = container.clientHeight
-            const scene = new THREE.Scene()
-            scene.background = new THREE.Color('#111519')
-            const camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 5000)
-            camera.position.set(180, 150, 180)
-            const renderer = new THREE.WebGLRenderer({ antialias: true })
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-            renderer.setSize(width, height)
-            renderer.outputColorSpace = THREE.SRGBColorSpace
-            container.appendChild(renderer.domElement)
-            const controls = new OrbitControls(camera, renderer.domElement)
-            controls.enableDamping = true
-            const ambient = new THREE.HemisphereLight('#eaf7ff', '#25301d', 2.1)
-            scene.add(ambient)
-            const key = new THREE.DirectionalLight('#ffffff', 3.2)
-            key.position.set(120, 180, 100)
-            scene.add(key)
-            scene.add(new THREE.GridHelper(300, 24, '#4e645f', '#25302e'))
-
-            const loader = new STLLoader()
-            const meshes: THREE.Mesh[] = []
-            let disposed = false
-            let frame = 0
-            const load = async () => {
-              const failures: string[] = []
-              const geometries = new Map<string, THREE.BufferGeometry>()
-              await Promise.all(
-                project.parts.map(async (part) => {
-                  const download = artifact.downloads.find(
-                    (item) => item.role === 'part_stl' && item.part_id === part.id,
-                  )
-                  if (!download) {
-                    failures.push(`${part.name}: STL unavailable`)
-                    return
-                  }
-                  try {
-                    const geometry = await loader.loadAsync(
-                      `${API}/workflows/${workflowId}/artifacts/${artifact.version}/${download.path}`,
-                    )
-                    geometry.computeVertexNormals()
-                    geometries.set(part.id, geometry)
-                  } catch {
-                    failures.push(`${part.name}: failed to load`)
-                  }
-                }),
-              )
-              if (disposed) {
-                geometries.forEach((geometry) => geometry.dispose())
-                return
-              }
-              setErrors(failures)
-              const materialColors = new Map(
-                project.materials.map((material) => [material.id, material.color]),
-              )
-              let cursor = 0
-              const renderItems =
-                mode === 'quantities'
-                  ? project.instances
-                  : project.parts.map((part) => ({
-                      id: `${part.id}_unique`,
-                      part_id: part.id,
-                      name: part.name,
-                      transform: null,
-                    }))
-              renderItems.forEach((item) => {
-                const part = project.parts.find((candidate) => candidate.id === item.part_id)
-                const source = geometries.get(item.part_id)
-                if (!part || !source) return
-                const geometry = source.clone()
-                geometry.computeBoundingBox()
-                const bounds = geometry.boundingBox!
-                const material = new THREE.MeshStandardMaterial({
-                  color:
-                    selectedPartId === part.id
-                      ? '#f2b45e'
-                      : (materialColors.get(part.material_id ?? '') ?? '#79e2ca'),
-                  roughness: 0.42,
-                  metalness: 0.08,
-                  wireframe,
-                })
-                const mesh = new THREE.Mesh(geometry, material)
-                mesh.userData.partId = part.id
-                mesh.userData.instanceId = item.id
-                if (mode === 'quantities' && item.transform) {
-                  mesh.matrixAutoUpdate = false
-                  mesh.matrix.fromArray(item.transform).transpose()
-                } else {
-                  mesh.position.set(cursor - bounds.min.x, -bounds.min.y, -bounds.min.z)
-                  cursor += bounds.max.x - bounds.min.x + 8
-                }
-                scene.add(mesh)
-                meshes.push(mesh)
-              })
-              geometries.forEach((geometry) => geometry.dispose())
-              const visibleBounds = new THREE.Box3()
-              meshes.forEach((mesh) => visibleBounds.expandByObject(mesh))
-              if (!visibleBounds.isEmpty()) {
-                const size = visibleBounds.getSize(new THREE.Vector3())
-                const center = visibleBounds.getCenter(new THREE.Vector3())
-                const span = Math.max(size.x, size.y, size.z, 20)
-                camera.position.set(center.x + span * 1.5, center.y + span, center.z + span * 1.5)
-                controls.target.copy(center)
-              }
-            }
-            void load()
-
-            const raycaster = new THREE.Raycaster()
-            const pointer = new THREE.Vector2()
-            const selectMesh = (event: PointerEvent) => {
-              const rect = renderer.domElement.getBoundingClientRect()
-              pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
-              pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
-              raycaster.setFromCamera(pointer, camera)
-              const hit = raycaster.intersectObjects(meshes, false)[0]
-              if (hit?.object.userData.partId) onSelectPart(hit.object.userData.partId)
-            }
-            renderer.domElement.addEventListener('pointerdown', selectMesh)
-            const resize = new ResizeObserver(() => {
-              const nextWidth = container.clientWidth
-              const nextHeight = container.clientHeight
-              renderer.setSize(nextWidth, nextHeight)
-              camera.aspect = nextWidth / nextHeight
-              camera.updateProjectionMatrix()
-            })
-            resize.observe(container)
-            const animate = () => {
-              controls.update()
-              renderer.render(scene, camera)
-              frame = requestAnimationFrame(animate)
-            }
-            animate()
-            return () => {
-              disposed = true
-              cancelAnimationFrame(frame)
-              resize.disconnect()
-              renderer.domElement.removeEventListener('pointerdown', selectMesh)
-              controls.dispose()
-              meshes.forEach((mesh) => {
-                mesh.geometry.dispose()
-                if (Array.isArray(mesh.material)) mesh.material.forEach((item) => item.dispose())
-                else mesh.material.dispose()
-              })
-              renderer.dispose()
-              container.removeChild(renderer.domElement)
-            }
-          }, [artifact, mode, onSelectPart, selectedPartId, wireframe, workflowId])
-
-          return (
-            <div className="viewer-shell">
-              <div className="viewer-toolbar">
-                <button className={mode === 'unique' ? 'active' : ''} onClick={() => setMode('unique')}>
-                  Unique parts
-                </button>
-                <button
-                  className={mode === 'quantities' ? 'active' : ''}
-                  onClick={() => setMode('quantities')}
-                >
-                  Print quantities
-                </button>
-                <button className={wireframe ? 'active' : ''} onClick={() => setWireframe(!wireframe)}>
-                  Wireframe
-                </button>
-              </div>
-              <div className="model-viewer" ref={containerRef} aria-label="Separated multipart STL viewer" />
-              <div className="viewer-notice">Separated parts / print layout—not assembled</div>
-              {errors.length > 0 && <div className="viewer-errors">{errors.join(' · ')}</div>}
-            </div>
-          )
-        }
-        void MultipartModelViewer
         controls.update()
         scene.add(new THREE.Box3Helper(bounds, new THREE.Color('#f2b45e')))
       },
@@ -937,7 +752,7 @@ function WorkflowPanel({
   const queryClient = useQueryClient()
   const [feedback, setFeedback] = useState('')
   const [sourceOpen, setSourceOpen] = useState(false)
-  const [selectedPartId, setSelectedPartId] = useState<string | null>(null)
+  const [scopedPartIds, setScopedPartIds] = useState<string[]>([])
   const workflowQuery = useQuery({
     queryKey: ['workflow', workflowId],
     queryFn: () => api<WorkflowResponse>(`/workflows/${workflowId}`),
@@ -953,12 +768,18 @@ function WorkflowPanel({
   const artifact = data?.artifact
   const workflow = data?.workflow
   useEffect(() => {
-    const firstPart = artifact?.project?.parts[0]?.id ?? null
-    if (firstPart && !artifact?.project?.parts.some((part) => part.id === selectedPartId)) {
-      setSelectedPartId(firstPart)
-    }
-  }, [artifact, selectedPartId])
+    const partIds = new Set(artifact?.project?.parts.map((part) => part.id) ?? [])
+    setScopedPartIds((current) => current.filter((partId) => partIds.has(partId)))
+  }, [artifact?.version, artifact?.project])
+  const toggleScopedPart = useCallback((partId: string) => {
+    setScopedPartIds((current) =>
+      current.includes(partId)
+        ? current.filter((candidate) => candidate !== partId)
+        : [...current, partId],
+    )
+  }, [])
   const canInspect = Boolean(workflow && artifact && INSPECTABLE_STATE.has(workflow.state))
+  const isMultipart = Boolean(artifact?.project && artifact.project.parts.length > 1)
   const modelUrl = artifact
     ? artifactPreviewUrl(workflowId, artifact)
     : ''
@@ -994,11 +815,15 @@ function WorkflowPanel({
         body: JSON.stringify({
           mode,
           feedback,
-          part_id: mode === 'refine_current' ? selectedPartId : null,
+          allowed_part_ids:
+            mode === 'refine_current' && isMultipart && scopedPartIds.length > 0
+              ? scopedPartIds
+              : null,
         }),
       }),
     onSuccess: () => {
       setFeedback('')
+      setScopedPartIds([])
       void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
       void queryClient.invalidateQueries({ queryKey: ['workflows'] })
     },
@@ -1137,7 +962,7 @@ function WorkflowPanel({
       {canInspect && artifact && (
         <>
           <section className="inspection-grid">
-            {artifact.project && artifact.project.parts.length > 1 ? (
+            {isMultipart && artifact.project ? (
               <MultipartPartsViewer
                 parts={artifact.project.parts.map((part) => {
                   const download = artifact.downloads.find(
@@ -1160,8 +985,8 @@ function WorkflowPanel({
                   partId: instance.part_id,
                   transform: instance.transform,
                 }))}
-                selectedPartId={selectedPartId}
-                onSelectPart={setSelectedPartId}
+                scopedPartIds={scopedPartIds}
+                onTogglePart={toggleScopedPart}
               />
             ) : (
               <ModelViewer url={modelUrl} dimensions={artifact.mesh.dimensions} />
@@ -1206,6 +1031,29 @@ function WorkflowPanel({
               {artifact.project && (
                 <div className="panel-section">
                   <span className="section-label">Editable parts</span>
+                  {isMultipart && (
+                    <div className={`edit-scope ${scopedPartIds.length > 0 ? 'restricted' : ''}`}>
+                      <div>
+                        <strong>
+                          {scopedPartIds.length > 0
+                            ? `Editing limited to ${scopedPartIds.length} selected ${
+                                scopedPartIds.length === 1 ? 'part' : 'parts'
+                              }`
+                            : 'Agent decides affected parts'}
+                        </strong>
+                        <small>
+                          {scopedPartIds.length > 0
+                            ? 'The agent cannot edit parts outside this scope.'
+                            : 'Select parts only when you want to restrict the agent.'}
+                        </small>
+                      </div>
+                      {scopedPartIds.length > 0 && (
+                        <button className="text-button" onClick={() => setScopedPartIds([])}>
+                          Clear scope
+                        </button>
+                      )}
+                    </div>
+                  )}
                   <div className="part-list">
                     {artifact.project.parts.map((part) => {
                       const instanceCount = artifact.project!.instances.filter(
@@ -1216,10 +1064,19 @@ function WorkflowPanel({
                       )
                       return (
                         <button
-                          className={`part-row ${selectedPartId === part.id ? 'selected' : ''}`}
+                          className={`part-row ${isMultipart ? '' : 'read-only'} ${
+                            scopedPartIds.includes(part.id) ? 'selected' : ''
+                          }`}
                           key={part.id}
-                          onClick={() => setSelectedPartId(part.id)}
+                          onClick={() => toggleScopedPart(part.id)}
+                          aria-pressed={isMultipart ? scopedPartIds.includes(part.id) : undefined}
+                          disabled={!isMultipart}
                         >
+                          {isMultipart && (
+                            <span className="part-scope-check">
+                              {scopedPartIds.includes(part.id) ? '✓' : ''}
+                            </span>
+                          )}
                           <span
                             className="part-color"
                             style={{ background: material?.color ?? '#b7c4d4' }}
@@ -1232,6 +1089,9 @@ function WorkflowPanel({
                               {Math.round(part.confidence * 100)}% confidence
                             </small>
                             <small>{part.annotation_origin.replaceAll('_', ' ')}</small>
+                            {scopedPartIds.includes(part.id) && (
+                              <small className="scope-label">Included in edit scope</small>
+                            )}
                           </span>
                         </button>
                       )
@@ -1249,6 +1109,21 @@ function WorkflowPanel({
                       {item.rationale}
                     </p>
                   ))}
+                </div>
+              )}
+              {artifact.revision && artifact.project && (
+                <div className="panel-section revision-summary">
+                  <span className="section-label">Changed in artifact v{artifact.version}</span>
+                  <strong>
+                    {artifact.revision.affected_part_ids
+                      .map(
+                        (partId) =>
+                          artifact.project!.parts.find((part) => part.id === partId)?.name ??
+                          partId,
+                      )
+                      .join(', ')}
+                  </strong>
+                  <p>{artifact.revision.rationale}</p>
                 </div>
               )}
               {artifact.downloads.length > 0 && (
@@ -1324,12 +1199,17 @@ function WorkflowPanel({
                   placeholder="Describe what should change…"
                   rows={3}
                 />
-                {artifact.project && selectedPartId && (
+                {isMultipart && artifact.project && (
                   <p className="revision-target">
-                    Editing part:{' '}
-                    <strong>
-                      {artifact.project.parts.find((part) => part.id === selectedPartId)?.name}
-                    </strong>
+                    {scopedPartIds.length > 0
+                      ? `Edit scope: ${scopedPartIds
+                          .map(
+                            (partId) =>
+                              artifact.project!.parts.find((part) => part.id === partId)?.name ??
+                              partId,
+                          )
+                          .join(', ')}`
+                      : 'Edit scope: agent decides affected parts'}
                   </p>
                 )}
                 <div>

@@ -723,7 +723,7 @@ select:focus {
   cursor: pointer;
   display: grid;
   gap: 10px;
-  grid-template-columns: 14px 1fr;
+  grid-template-columns: 20px 14px 1fr;
   padding: 10px;
   text-align: left;
 }
@@ -731,6 +731,32 @@ select:focus {
 .part-row.selected {
   border-color: var(--teal-dark);
   box-shadow: 0 0 0 2px var(--teal-pale);
+}
+
+.part-row.read-only {
+  cursor: default;
+  grid-template-columns: 14px 1fr;
+}
+
+.part-row:disabled {
+  opacity: 1;
+}
+
+.part-scope-check {
+  align-items: center;
+  border: 1px solid var(--line-strong);
+  display: flex;
+  font-family: var(--mono);
+  font-size: 11px;
+  height: 16px;
+  justify-content: center;
+  width: 16px;
+}
+
+.part-row.selected .part-scope-check {
+  background: var(--teal-dark);
+  border-color: var(--teal-dark);
+  color: white;
 }
 
 .part-row span:last-child {
@@ -744,11 +770,53 @@ select:focus {
   text-transform: capitalize;
 }
 
+.part-row .scope-label {
+  color: var(--teal-dark);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
 .part-color {
   border: 1px solid var(--line-strong);
   border-radius: 50%;
   height: 12px;
   width: 12px;
+}
+
+.edit-scope {
+  align-items: center;
+  background: #f1f1eb;
+  border: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  margin-top: 10px;
+  padding: 11px;
+}
+
+.edit-scope.restricted {
+  background: var(--teal-pale);
+  border-color: var(--teal-dark);
+}
+
+.edit-scope > div {
+  display: grid;
+  gap: 3px;
+}
+
+.edit-scope strong,
+.revision-summary > strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.edit-scope small {
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.edit-scope .text-button {
+  flex: 0 0 auto;
+  font-size: 10px;
 }
 
 .part-warning,

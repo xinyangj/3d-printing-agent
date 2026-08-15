@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -424,6 +425,26 @@ class ArtifactFile(FrozenModel):
     part_id: str | None = None
 
 
+class ArtifactRevision(FrozenModel):
+    feedback: str = Field(min_length=1, max_length=10_000)
+    affected_part_ids: list[str] = Field(min_length=1, max_length=100)
+    allowed_part_ids: list[str] | None = Field(default=None, min_length=1, max_length=100)
+    rationale: str = Field(min_length=1, max_length=2_000)
+
+    @model_validator(mode="after")
+    def validate_part_ids(self) -> ArtifactRevision:
+        for values in (self.affected_part_ids, self.allowed_part_ids or []):
+            if len(values) != len(set(values)):
+                raise ValueError("Revision part IDs must be unique")
+            if any(not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", item) for item in values):
+                raise ValueError("Revision part IDs are invalid")
+        if self.allowed_part_ids is not None and not set(self.affected_part_ids).issubset(
+            self.allowed_part_ids
+        ):
+            raise ValueError("Affected parts must be within the allowed edit scope")
+        return self
+
+
 class ModelArtifact(FrozenModel):
     schema_version: Literal["1", "2"] = "1"
     workflow_id: str
@@ -442,6 +463,7 @@ class ModelArtifact(FrozenModel):
     part_meshes: dict[str, MeshReport] = Field(default_factory=dict)
     files: list[ArtifactFile] = Field(default_factory=list)
     provenance: ArtifactProvenance
+    revision: ArtifactRevision | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -483,8 +505,21 @@ class RevisionRequest(FrozenModel):
     workflow_id: str
     mode: RevisionMode
     feedback: str = Field(min_length=1, max_length=10_000)
-    part_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    allowed_part_ids: list[str] | None = Field(default=None, min_length=1, max_length=100)
     created_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_allowed_part_ids(self) -> RevisionRequest:
+        if self.allowed_part_ids is None:
+            return self
+        if len(self.allowed_part_ids) != len(set(self.allowed_part_ids)):
+            raise ValueError("Allowed part IDs must be unique")
+        if any(
+            not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", item)
+            for item in self.allowed_part_ids
+        ):
+            raise ValueError("Allowed part IDs are invalid")
+        return self
 
 
 class PrintJob(FrozenModel):

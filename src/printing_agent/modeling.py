@@ -14,6 +14,7 @@ from printing_agent.config import Settings
 from printing_agent.domain import (
     AnnotationOrigin,
     ArtifactProvenance,
+    ArtifactRevision,
     CandidateFile,
     Dimensions,
     MeshReport,
@@ -455,22 +456,39 @@ class ModelPipeline:
                 )
             raise
 
-    async def adopt_part_revision(
+    async def adopt_part_revisions(
         self,
         handoff: ModelingHandoff,
         artifact: ModelArtifact,
-        part_id: str,
-        source_code: str,
+        revisions: list[tuple[str, str, str]],
+        *,
+        feedback: str,
+        rationale: str,
+        allowed_part_ids: list[str] | None,
     ) -> ModelArtifact:
         if artifact.project is None or len(artifact.project.parts) < 2:
-            raise ValidationError("Part-scoped revision requires a multipart artifact")
+            raise ValidationError("Batch part revision requires a multipart artifact")
+        if artifact.project_path is None:
+            raise ValidationError("Multipart project metadata is unavailable")
         if artifact.project.assembly_status != "not_provided":
             raise ValidationError(
-                "Part-scoped mesh revisions currently require a separated print-layout project"
+                "Multipart mesh revisions currently require a separated print-layout project"
             )
-        part = next((item for item in artifact.project.parts if item.id == part_id), None)
-        if part is None:
-            raise ValidationError(f"Unknown target part '{part_id}'")
+        if not revisions:
+            raise ValidationError("At least one affected part is required")
+        revision_ids = [part_id for part_id, _, _ in revisions]
+        if len(revision_ids) != len(set(revision_ids)):
+            raise ValidationError("Affected part IDs must be unique")
+        parts_by_id = {part.id: part for part in artifact.project.parts}
+        unknown = sorted(set(revision_ids) - set(parts_by_id))
+        if unknown:
+            raise ValidationError(f"Unknown target parts: {', '.join(unknown)}")
+        if allowed_part_ids is not None:
+            outside_scope = sorted(set(revision_ids) - set(allowed_part_ids))
+            if outside_scope:
+                raise ValidationError(
+                    f"Parts outside the allowed edit scope: {', '.join(outside_scope)}"
+                )
         attempts = await self.repository.count_source_attempts(
             handoff.workflow_id, handoff.version
         )
@@ -479,11 +497,16 @@ class ModelPipeline:
         attempt = await self.repository.next_source_attempt(
             handoff.workflow_id, handoff.version
         )
-        module_name = part.module_name or f"part_{part_id}"
-        canonical_source = (
-            f"module {module_name}() {{\n{source_code}\n}}\n{module_name}();\n"
-        )
-        source_digest = hashlib.sha256(canonical_source.encode()).hexdigest()
+        canonical_sources: dict[str, str] = {}
+        for part_id, source_code, _ in revisions:
+            part = parts_by_id[part_id]
+            module_name = part.module_name or f"part_{part_id}"
+            canonical_sources[part_id] = (
+                f"module {module_name}() {{\n{source_code}\n}}\n{module_name}();\n"
+            )
+        source_digest = hashlib.sha256(
+            json.dumps(canonical_sources, sort_keys=True).encode()
+        ).hexdigest()
         await self.repository.save_source_attempt(
             handoff.workflow_id,
             handoff.version,
@@ -492,84 +515,101 @@ class ModelPipeline:
             source_digest,
         )
         try:
-            self.source_policy.validate(source_code, "source.stl")
             attempt_dir = self.artifacts.attempt_directory(
                 handoff.workflow_id, handoff.version, attempt
-            )
-            source_path = attempt_dir / "source.scad"
-            source_path.write_text(canonical_source, encoding="utf-8")
-            shutil.copy2(
-                artifact.model_path.parent / f"{part_id}.stl",
-                attempt_dir / "source.stl",
             )
             await self.repository.transition(
                 handoff.workflow_id,
                 WorkflowState.RENDERING,
-                event_kind="model.part_rendering",
-                payload={"part_id": part_id, "attempt": attempt},
+                event_kind="model.parts_rendering",
+                payload={"part_ids": revision_ids, "attempt": attempt},
             )
-            temporary_model = attempt_dir / "part.tmp.stl"
-            await self.renderer.render(source_path, temporary_model)
+            rendered_paths: dict[str, Path] = {}
+            source_directory = artifact.project_path.parent.parent
+            for part_id, source_code, _ in revisions:
+                self.source_policy.validate(source_code, "source.stl")
+                part_attempt = attempt_dir / "parts" / part_id
+                part_attempt.mkdir(parents=True, exist_ok=False)
+                source_path = part_attempt / "source.scad"
+                source_path.write_text(canonical_sources[part_id], encoding="utf-8")
+                shutil.copy2(
+                    source_directory / "outputs" / "parts" / f"{part_id}.stl",
+                    part_attempt / "source.stl",
+                )
+                temporary_model = part_attempt / "part.tmp.stl"
+                await self.renderer.render(source_path, temporary_model)
+                rendered_paths[part_id] = temporary_model
             await self.repository.transition(
                 handoff.workflow_id,
                 WorkflowState.VALIDATING,
-                event_kind="model.part_validating",
-                payload={"part_id": part_id, "attempt": attempt},
+                event_kind="model.parts_validating",
+                payload={"part_ids": revision_ids, "attempt": attempt},
             )
-            report = await self.mesh_inspector.inspect(temporary_model)
-            if not report.watertight or report.volume_mm3 <= 0:
-                raise ValidationError("Revised part must be watertight with positive volume")
+            revised_reports: dict[str, MeshReport] = {}
+            for part_id, rendered_path in rendered_paths.items():
+                report = await self.mesh_inspector.inspect(rendered_path)
+                if not report.watertight or report.volume_mm3 <= 0:
+                    raise ValidationError(
+                        f"Revised part '{part_id}' must be watertight with positive volume"
+                    )
+                revised_reports[part_id] = report
 
             version = await self.repository.next_artifact_version(handoff.workflow_id)
-            source_directory = artifact.project_path.parent.parent
             staging = attempt_dir / "artifact"
             shutil.copytree(source_directory, staging)
             imports_directory = staging / "project" / "imports"
-            derived_name = f"{part_id}-revision-source-v{artifact.version}.stl"
-            derived_path = imports_directory / derived_name
-            shutil.copy2(
-                source_directory / "outputs" / "parts" / f"{part_id}.stl",
-                derived_path,
-            )
-            revised_path = staging / "outputs" / "parts" / f"{part_id}.stl"
-            temporary_model.replace(revised_path)
-            canonical_part_source = canonical_source.replace(
-                "source.stl", f"../imports/{derived_name}"
-            )
-            (staging / "project" / "parts" / f"{part_id}.scad").write_text(
-                canonical_part_source, encoding="utf-8"
-            )
-
-            asset_id = f"revision-{part_id[:40]}-{version}"
-            revised_asset = SourceAsset(
-                id=asset_id,
-                filename=derived_name,
-                format="stl",
-                digest=sha256_file(derived_path),
-                path=f"project/imports/{derived_name}",
-                role="revision_input",
-                original_cad=False,
-                annotation_origin=AnnotationOrigin.AGENT_INFERENCE,
-            )
-            revised_part = part.model_copy(
-                update={
-                    "geometry_kind": PartGeometryKind.DERIVED_MESH,
-                    "source_asset_id": asset_id,
-                    "annotation_origin": AnnotationOrigin.AGENT_INFERENCE,
-                }
-            )
-            revised_parts = [
-                revised_part if item.id == part_id else item
-                for item in artifact.project.parts
-            ]
+            revised_parts_by_id = dict(parts_by_id)
+            revised_assets: list[SourceAsset] = []
+            for part_id, _, _ in revisions:
+                derived_name = f"{part_id}-revision-source-v{artifact.version}.stl"
+                derived_path = imports_directory / derived_name
+                shutil.copy2(
+                    source_directory / "outputs" / "parts" / f"{part_id}.stl",
+                    derived_path,
+                )
+                rendered_paths[part_id].replace(
+                    staging / "outputs" / "parts" / f"{part_id}.stl"
+                )
+                canonical_part_source = canonical_sources[part_id].replace(
+                    "source.stl", f"../imports/{derived_name}"
+                )
+                (staging / "project" / "parts" / f"{part_id}.scad").write_text(
+                    canonical_part_source, encoding="utf-8"
+                )
+                part_suffix = hashlib.sha256(part_id.encode()).hexdigest()[:8]
+                asset_id = f"revision-{part_id[:30]}-{part_suffix}-{version}"
+                revised_assets.append(
+                    SourceAsset(
+                        id=asset_id,
+                        filename=derived_name,
+                        format="stl",
+                        digest=sha256_file(derived_path),
+                        path=f"project/imports/{derived_name}",
+                        role="revision_input",
+                        original_cad=False,
+                        annotation_origin=AnnotationOrigin.AGENT_INFERENCE,
+                    )
+                )
+                revised_parts_by_id[part_id] = parts_by_id[part_id].model_copy(
+                    update={
+                        "geometry_kind": PartGeometryKind.DERIVED_MESH,
+                        "source_asset_id": asset_id,
+                        "annotation_origin": AnnotationOrigin.AGENT_INFERENCE,
+                    }
+                )
             project = artifact.project.model_copy(
                 update={
-                    "parts": revised_parts,
-                    "source_assets": [*artifact.project.source_assets, revised_asset],
+                    "parts": [
+                        revised_parts_by_id[part.id] for part in artifact.project.parts
+                    ],
+                    "source_assets": [
+                        *artifact.project.source_assets,
+                        *revised_assets,
+                    ],
                 }
             )
             part_reports = dict(artifact.part_meshes)
-            part_reports[part_id] = report
+            part_reports.update(revised_reports)
             meshes: dict[str, trimesh.Trimesh] = {}
             for project_part in project.parts:
                 loaded = trimesh.load_mesh(
@@ -587,6 +627,12 @@ class ModelPipeline:
             mesh = await self.mesh_inspector.inspect(layout_path)
             if not mesh.dimensions.fits(handoff.target_printer.build_volume):
                 raise ValidationError("Revised print layout exceeds the target build volume")
+            revision = ArtifactRevision(
+                feedback=feedback,
+                affected_part_ids=revision_ids,
+                allowed_part_ids=allowed_part_ids,
+                rationale=rationale,
+            )
             old_manifest = artifact.project_path.parent.parent / "manifest.json"
             old_data = json.loads(old_manifest.read_text(encoding="utf-8"))
             manifest, files = await asyncio.to_thread(
@@ -600,6 +646,7 @@ class ModelPipeline:
                 provenance=artifact.provenance,
                 classification=list(old_data.get("source_set_classification", [])),
                 handoff_digest=handoff.digest or "",
+                revision=revision,
             )
             adopted = self.artifacts.adopt_project(
                 handoff.workflow_id, version, staging
@@ -624,6 +671,7 @@ class ModelPipeline:
                 part_meshes=part_reports,
                 files=files,
                 provenance=artifact.provenance,
+                revision=revision,
             )
             await self.repository.save_artifact(revised_artifact)
             await self.repository.save_source_attempt(
@@ -636,10 +684,12 @@ class ModelPipeline:
             await self.repository.transition(
                 handoff.workflow_id,
                 WorkflowState.AWAITING_APPROVAL,
-                event_kind="artifact.part_revision_ready",
+                event_kind="artifact.multipart_revision_ready",
                 payload={
                     "artifact_version": version,
-                    "part_id": part_id,
+                    "affected_part_ids": revision_ids,
+                    "allowed_part_ids": allowed_part_ids,
+                    "rationale": rationale,
                     "manifest_digest": revised_artifact.manifest_digest,
                 },
             )
@@ -658,8 +708,11 @@ class ModelPipeline:
                 await self.repository.transition(
                     handoff.workflow_id,
                     WorkflowState.GENERATING,
-                    event_kind="model.part_repair_requested",
-                    payload={"part_id": part_id, "diagnostics": str(exc)[-2_000:]},
+                    event_kind="model.parts_repair_requested",
+                    payload={
+                        "part_ids": revision_ids,
+                        "diagnostics": str(exc)[-2_000:],
+                    },
                 )
             raise
 
