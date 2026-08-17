@@ -845,10 +845,12 @@ class CopilotModelingAgent:
                     result_type="rejected",
                     text_result_for_llm=f"Expected mode '{expected_mode}'.",
                 )
-            if params.part_id is not None:
+            if params.part_id not in {None, "base_model"}:
                 return ToolResult(
                     result_type="rejected",
-                    text_result_for_llm="Single-part submissions must omit part_id.",
+                    text_result_for_llm=(
+                        "Single-part submissions must omit part_id or use 'base_model'."
+                    ),
                 )
             workflow = await self.repository.get_workflow(state.handoff.workflow_id)
             active_handoff = await self.repository.get_handoff(
