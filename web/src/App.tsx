@@ -258,6 +258,7 @@ function useWorkflowEvents(workflowId: string | null) {
       'candidate.generation_fallback',
       'modeling.handoff_ready',
       'modeling.started',
+      'modeling.session_retry',
       'model.rendering',
       'model.validating',
       'model.repair_requested',

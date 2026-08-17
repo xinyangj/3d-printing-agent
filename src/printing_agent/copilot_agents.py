@@ -558,6 +558,11 @@ class CopilotDiscoveryAgent:
                             raise PolicyViolationError(
                                 "The source set must include at least one unique part"
                             )
+                        if decision.decision == ModelDecision.MODIFY:
+                            raise PolicyViolationError(
+                                "Multipart source sets must be selected as use_as_is; "
+                                "part-aware revisions happen after adoption"
+                            )
                     if (
                         decision.decision == ModelDecision.MODIFY
                         and inspection.candidate.allows_derivatives is False
@@ -622,28 +627,59 @@ class CopilotModelingAgent:
         self.runtime = _SessionRuntime(settings, repository)
 
     async def build(self, handoff: ModelingHandoff) -> ModelArtifact:
-        workflow = await self.repository.get_workflow(handoff.workflow_id)
-        state = _ModelingToolState(handoff=handoff)
-        await self.runtime.run(
-            workflow,
-            "modeling",
-            [self._source_tool(state)],
-            (
-                "Create the OpenSCAD source described by the immutable handoff. Call "
-                "submit_openscad_source and correct any validation failures.\n\n"
-                f"{handoff.model_dump_json(indent=2)}"
-            ),
-            self._system_message(),
-            resume=bool(workflow.modeling_session_id),
-        )
-        if state.artifact is None:
+        prior_detail: str | None = None
+        for session_attempt in range(1, self.settings.generation_attempt_budget + 1):
+            workflow = await self.repository.get_workflow(handoff.workflow_id)
+            state = _ModelingToolState(handoff=handoff)
+            retry_context = (
+                "\n\nA prior modeling session ended without an artifact. Correct this failure "
+                f"and call the tool in this session: {prior_detail}"
+                if prior_detail
+                else ""
+            )
+            await self.runtime.run(
+                workflow,
+                "modeling",
+                [self._source_tool(state)],
+                (
+                    "Create the OpenSCAD source described by the immutable handoff. Call "
+                    "submit_openscad_source and correct any validation failures.\n\n"
+                    f"{handoff.model_dump_json(indent=2)}"
+                    f"{retry_context}"
+                ),
+                self._system_message(),
+                resume=bool(workflow.modeling_session_id),
+            )
+            if state.artifact is not None:
+                return state.artifact
             if state.fatal_error is not None:
                 raise state.fatal_error
             if state.budget_exhausted is not None:
                 raise BudgetExhaustedError(state.budget_exhausted)
-            detail = state.failures[-1] if state.failures else "no source was adopted"
-            raise ExternalServiceError(f"Modeling ended without an artifact: {detail}")
-        return state.artifact
+            rejected_attempts = await self.repository.count_source_attempts(
+                handoff.workflow_id,
+                handoff.version,
+            )
+            if rejected_attempts >= self.settings.generation_attempt_budget:
+                raise BudgetExhaustedError(
+                    "OpenSCAD generation attempt budget was exhausted"
+                )
+            prior_detail = (
+                state.failures[-1] if state.failures else "no source was submitted"
+            )
+            if session_attempt < self.settings.generation_attempt_budget:
+                await self.repository.patch_workflow(
+                    handoff.workflow_id,
+                    modeling_session_id=None,
+                    event_kind="modeling.session_retry",
+                    payload={
+                        "session_attempt": session_attempt,
+                        "reason": prior_detail,
+                    },
+                )
+        raise ExternalServiceError(
+            f"Modeling ended without an artifact after session retries: {prior_detail}"
+        )
 
     async def revise(
         self,

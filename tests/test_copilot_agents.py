@@ -34,7 +34,9 @@ from printing_agent.domain import (
     PartInstance,
     PartProject,
     PrinterCapabilitySummary,
+    WorkflowState,
 )
+from printing_agent.errors import ExternalServiceError
 from printing_agent.repositories import WorkflowRepository
 
 
@@ -138,6 +140,55 @@ class CaptureRuntime:
         self.resume = cast(bool, kwargs["resume"])
         self.tools = cast(list[Any], args[2])
         raise RuntimeError("captured")
+
+
+class EmptyRuntime:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, *args: object, **kwargs: object) -> str:
+        del args, kwargs
+        self.calls += 1
+        return "session-ended"
+
+
+async def test_modeling_retries_sessions_that_submit_no_source(
+    settings: Settings,
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Create a car", "simulator")
+    pending = await repository.lease_next()
+    assert pending is not None
+    await repository.complete_work(pending.id)
+    plan = ModelPlan(search_query="car", geometry_summary="A toy car")
+    await repository.transition(workflow.id, WorkflowState.PLANNING)
+    await repository.save_plan(workflow.id, plan)
+    await repository.transition(workflow.id, WorkflowState.DISCOVERING)
+    await repository.transition(workflow.id, WorkflowState.SELECTING)
+    handoff = ModelingHandoff(
+        workflow_id=workflow.id,
+        version=1,
+        requirement=workflow.requirement,
+        model_plan=plan,
+        decision=ModelDecision.CREATE,
+        target_printer=PrinterCapabilitySummary(
+            name="simulator",
+            build_volume=Dimensions(width_mm=220, depth_mm=220, height_mm=250),
+            accepted_formats={"stl"},
+        ),
+        discovery_rationale="Generate after catalog fallback",
+    ).with_digest()
+    await repository.save_handoff(handoff)
+    await repository.transition(workflow.id, WorkflowState.HANDOFF_READY)
+    await repository.transition(workflow.id, WorkflowState.GENERATING)
+    modeling = CopilotModelingAgent(settings, repository, cast(object, None))
+    runtime = EmptyRuntime()
+    modeling.runtime = cast(object, runtime)  # type: ignore[assignment]
+
+    with pytest.raises(ExternalServiceError, match="after session retries"):
+        await modeling.build(handoff)
+
+    assert runtime.calls == settings.generation_attempt_budget
 
 
 async def test_revision_sessions_are_fresh_and_source_backed(
