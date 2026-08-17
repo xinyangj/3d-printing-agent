@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 import trimesh
+from lib3mf import Lib3MF
 
 from printing_agent.artifact_store import ArtifactStore, sha256_file
 from printing_agent.config import Settings
@@ -31,6 +32,7 @@ from printing_agent.errors import (
     BudgetExhaustedError,
     ExternalServiceError,
     PolicyViolationError,
+    SourceCacheError,
     ValidationError,
 )
 from printing_agent.multipart import (
@@ -250,14 +252,26 @@ class TrimeshSelectedSourceInspector:
         temporary_stl: Path | None = None
         try:
             if path.suffix.casefold() == ".3mf":
-                _, _, combined = await asyncio.to_thread(ThreeMFService().read, path)
+                try:
+                    _, _, combined = await asyncio.to_thread(ThreeMFService().read, path)
+                except Lib3MF.ELib3MFException as exc:
+                    raise ValidationError(f"Could not parse 3MF: {exc}") from exc
                 temporary_stl = path.with_suffix(".inspection.stl")
                 await asyncio.to_thread(combined.export, temporary_stl)
                 mesh = await self.mesh_inspector.inspect(temporary_stl)
             else:
                 mesh = await self.mesh_inspector.inspect(path)
-            accepted = mesh.finite and mesh.triangle_count > 0
-            reason = None
+            findings: list[str] = []
+            if not mesh.finite:
+                findings.append("mesh contains non-finite vertices")
+            if mesh.triangle_count <= 0:
+                findings.append("mesh contains no triangles")
+            if not mesh.watertight:
+                findings.append("mesh is not watertight")
+            if mesh.volume_mm3 <= 0:
+                findings.append("mesh has no validated positive volume")
+            accepted = not findings
+            reason = "; ".join(findings) if findings else None
         except ValidationError as exc:
             mesh = MeshReport(
                 dimensions=Dimensions(width_mm=1, depth_mm=1, height_mm=1),
@@ -342,9 +356,9 @@ class ModelPipeline:
                     / f"{handoff.selected_source.source_digest}.stl"
                 )
                 if not selected_path.is_file():
-                    raise PolicyViolationError("Selected source cache entry is missing")
+                    raise SourceCacheError("Selected source cache entry is missing")
                 if sha256_file(selected_path) != handoff.selected_source.source_digest:
-                    raise PolicyViolationError("Selected source digest changed")
+                    raise SourceCacheError("Selected source digest changed")
                 shutil.copy2(selected_path, attempt_dir / "source.stl")
 
             await self.repository.transition(
@@ -438,16 +452,23 @@ class ModelPipeline:
             )
             return artifact
         except Exception as exc:
+            candidate_failure = isinstance(
+                exc,
+                (PolicyViolationError, ValidationError),
+            )
             await self.repository.save_source_attempt(
                 handoff.workflow_id,
                 handoff.version,
                 attempt,
-                "rejected",
+                "rejected" if candidate_failure else "infrastructure_error",
                 source_digest,
                 str(exc)[-2_000:],
             )
             workflow = await self.repository.get_workflow(handoff.workflow_id)
-            if workflow.state in {WorkflowState.RENDERING, WorkflowState.VALIDATING}:
+            if candidate_failure and workflow.state in {
+                WorkflowState.RENDERING,
+                WorkflowState.VALIDATING,
+            }:
                 await self.repository.transition(
                     handoff.workflow_id,
                     WorkflowState.GENERATING,
@@ -896,39 +917,42 @@ class ModelPipeline:
             / "staging"
             / f"source-set-{version}"
         )
+        shutil.rmtree(workspace, ignore_errors=True)
         inspection_directory = workspace / "inspection"
         inspection_directory.mkdir(parents=True, exist_ok=False)
-        part_reports: dict[str, MeshReport] = {}
-        for part_id, part_mesh in part_meshes.items():
-            part_path = inspection_directory / f"{part_id}.stl"
-            await asyncio.to_thread(part_mesh.export, part_path)
-            report = await self.mesh_inspector.inspect(part_path)
-            if not report.watertight or report.volume_mm3 <= 0:
-                raise ValidationError(f"Source-set part '{part_id}' must be watertight")
-            part_reports[part_id] = report
-        layout_path = inspection_directory / "layout.stl"
-        await asyncio.to_thread(layout_mesh.export, layout_path)
-        mesh = await self.mesh_inspector.inspect(layout_path)
-        if not mesh.dimensions.fits(build_volume):
-            raise ValidationError("Source-set print layout exceeds the target build volume")
+        try:
+            part_reports: dict[str, MeshReport] = {}
+            for part_id, part_mesh in part_meshes.items():
+                part_path = inspection_directory / f"{part_id}.stl"
+                await asyncio.to_thread(part_mesh.export, part_path)
+                report = await self.mesh_inspector.inspect(part_path)
+                if not report.watertight or report.volume_mm3 <= 0:
+                    raise ValidationError(f"Source-set part '{part_id}' must be watertight")
+                part_reports[part_id] = report
+            layout_path = inspection_directory / "layout.stl"
+            await asyncio.to_thread(layout_mesh.export, layout_path)
+            mesh = await self.mesh_inspector.inspect(layout_path)
+            if not mesh.dimensions.fits(build_volume):
+                raise ValidationError("Source-set print layout exceeds the target build volume")
 
-        staging = workspace / "artifact"
-        manifest, files = await asyncio.to_thread(
-            write_source_set_artifact,
-            directory=staging,
-            workflow_id=workflow_id,
-            version=version,
-            project=project,
-            selected=selected,
-            part_meshes=part_meshes,
-            layout_mesh=layout_mesh,
-            mesh=mesh,
-            part_reports=part_reports,
-            provenance=provenance,
-            classification=classification,
-        )
-        adopted = self.artifacts.adopt_project(workflow_id, version, staging)
-        shutil.rmtree(workspace, ignore_errors=True)
+            staging = workspace / "artifact"
+            manifest, files = await asyncio.to_thread(
+                write_source_set_artifact,
+                directory=staging,
+                workflow_id=workflow_id,
+                version=version,
+                project=project,
+                selected=selected,
+                part_meshes=part_meshes,
+                layout_mesh=layout_mesh,
+                mesh=mesh,
+                part_reports=part_reports,
+                provenance=provenance,
+                classification=classification,
+            )
+            adopted = self.artifacts.adopt_project(workflow_id, version, staging)
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
         primary_part = project.parts[0].id
         source_path = adopted / "project" / "main.scad"
         artifact = ModelArtifact(

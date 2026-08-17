@@ -201,6 +201,16 @@ class SelectedSourceInspection(FrozenModel):
     inspected_at: datetime = Field(default_factory=utc_now)
 
 
+class CandidateAttempt(FrozenModel):
+    workflow_id: str
+    candidate_id: str = Field(min_length=1, max_length=100)
+    status: Literal["rejected", "adopted"]
+    stage: str = Field(min_length=1, max_length=100)
+    selected_file_ids: list[str] = Field(default_factory=list, max_length=100)
+    diagnostics: dict[str, str] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class SelectedCandidateFile(FrozenModel):
     file_id: str = Field(min_length=1, max_length=100)
     role: SelectedFileRole
@@ -569,6 +579,7 @@ _ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
         WorkflowState.CANCELLED,
     },
     WorkflowState.SELECTING: {
+        WorkflowState.DISCOVERING,
         WorkflowState.SOURCE_VALIDATION,
         WorkflowState.HANDOFF_READY,
         WorkflowState.VALIDATING,
@@ -589,6 +600,7 @@ _ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
     },
     WorkflowState.GENERATING: {
         WorkflowState.RENDERING,
+        WorkflowState.DISCOVERING,
         WorkflowState.PREPARATION_FAILED,
         WorkflowState.CANCELLED,
     },

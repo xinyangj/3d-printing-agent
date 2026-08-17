@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Protocol
 
 from printing_agent.domain import (
+    CandidateAttempt,
     CandidatePageInspection,
     Dimensions,
     DiscoveryDecision,
@@ -26,10 +27,10 @@ class DiscoveryAgent(Protocol):
         printer: PrinterCapabilitySummary,
     ) -> tuple[ModelPlan, DiscoveryDecision]: ...
 
-    async def resume_after_source_rejection(
+    async def resume_after_candidate_rejection(
         self,
         workflow_id: str,
-        inspection: SelectedSourceInspection,
+        attempt: CandidateAttempt,
     ) -> DiscoveryDecision: ...
 
 

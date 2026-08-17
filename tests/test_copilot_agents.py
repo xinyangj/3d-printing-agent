@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 from copilot.generated.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
 from copilot.generated.session_events import PermissionRequest
+from copilot.tools import ToolInvocation
 
 from printing_agent.catalogs import ThingiverseCatalog
 from printing_agent.config import Settings
@@ -19,9 +20,12 @@ from printing_agent.copilot_agents import (
 from printing_agent.domain import (
     AnnotationOrigin,
     ArtifactProvenance,
+    CandidateFile,
+    CandidatePageInspection,
     Dimensions,
     MeshReport,
     ModelArtifact,
+    ModelCandidate,
     ModelDecision,
     ModelingHandoff,
     ModelPlan,
@@ -69,6 +73,58 @@ async def test_role_permission_handler_uses_sdk_decision_types() -> None:
 
     assert isinstance(approved, PermissionDecisionApproveOnce)
     assert isinstance(rejected, PermissionDecisionReject)
+
+
+async def test_rejected_candidate_cannot_be_selected_again(
+    settings: Settings,
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Create a car", "simulator")
+    candidate = ModelCandidate(
+        id="rejected-car",
+        title="Rejected car",
+        source_url="https://example.test/car",
+        creator="maker",
+        license="CC BY",
+        files=[CandidateFile(id="car-file", name="car.stl", format="stl")],
+    )
+    await repository.save_page_inspection(
+        CandidatePageInspection(
+            workflow_id=workflow.id,
+            search_round_id="round",
+            candidate=candidate,
+        )
+    )
+    catalog = ThingiverseCatalog(settings)
+    try:
+        agent = CopilotDiscoveryAgent(settings, repository, catalog)
+        state = _DiscoveryToolState(
+            workflow=workflow,
+            plan=ModelPlan(search_query="car", geometry_summary="A toy car"),
+            rejected_candidate_ids={candidate.id},
+        )
+        tool = next(
+            item
+            for item in agent._build_tools(state, allow_plan=False)
+            if item.name == "select_model_candidate"
+        )
+        assert tool.handler is not None
+        result = await tool.handler(
+            ToolInvocation(
+                tool_name=tool.name,
+                arguments={
+                    "decision": ModelDecision.USE_AS_IS.value,
+                    "candidate_id": candidate.id,
+                    "file_id": "car-file",
+                    "rationale": "Try the same candidate again",
+                },
+            )
+        )
+    finally:
+        await catalog.close()
+
+    assert result.result_type == "rejected"
+    assert "excluded" in result.text_result_for_llm
 
 
 class CaptureRuntime:

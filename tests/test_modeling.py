@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import shutil
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -17,9 +19,12 @@ from printing_agent.domain import (
     AnnotationOrigin,
     ArtifactApproval,
     ArtifactProvenance,
+    CandidateAttempt,
     CandidateFile,
     Dimensions,
+    DiscoveryDecision,
     MaterialDefinition,
+    ModelCandidate,
     ModelDecision,
     ModelingHandoff,
     ModelPlan,
@@ -40,12 +45,19 @@ from printing_agent.domain import (
     WorkKind,
 )
 from printing_agent.errors import (
+    CandidateRejectedError,
     ConflictError,
+    ExternalServiceError,
     NotFoundError,
     PolicyViolationError,
     ValidationError,
 )
-from printing_agent.modeling import MeshInspector, ModelPipeline, OpenScadSourcePolicy
+from printing_agent.modeling import (
+    MeshInspector,
+    ModelPipeline,
+    OpenScadSourcePolicy,
+    TrimeshSelectedSourceInspector,
+)
 from printing_agent.multipart import ThreeMFService, _module_name
 from printing_agent.printers import SimulatedPrinterAdapter
 from printing_agent.repositories import WorkflowRepository
@@ -72,6 +84,28 @@ class FailingPartRenderer(PartRenderer):
         return await super().render(source_path, output_path)
 
 
+class UnavailableRenderer:
+    async def render(self, source_path: Path, output_path: Path) -> str:
+        del source_path, output_path
+        raise ExternalServiceError("OpenSCAD service is unavailable")
+
+
+class CopyCatalog:
+    def __init__(self, paths: dict[str, Path]) -> None:
+        self.paths = paths
+
+    async def download_file(
+        self,
+        candidate: ModelCandidate,
+        file_id: str,
+        destination: Path,
+    ) -> Path:
+        del candidate
+        await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(shutil.copy2, self.paths[file_id], destination)
+        return destination
+
+
 def test_source_policy_rejects_external_capabilities() -> None:
     policy = OpenScadSourcePolicy()
 
@@ -93,6 +127,237 @@ def test_openscad_module_names_are_valid_and_collision_resistant() -> None:
     assert hyphenated != underscored
     assert hyphenated[0].isalpha()
     assert all(character.isalnum() or character == "_" for character in hyphenated)
+
+
+async def test_source_inspection_rejects_non_watertight_mesh(
+    tmp_path: Path,
+) -> None:
+    valid_path = tmp_path / "valid.stl"
+    invalid_path = tmp_path / "invalid.stl"
+    invalid_3mf_path = tmp_path / "invalid.3mf"
+    trimesh.creation.box(extents=(10, 10, 10)).export(valid_path)
+    invalid = trimesh.creation.box(extents=(10, 10, 10))
+    invalid.update_faces(range(len(invalid.faces) - 1))
+    invalid.remove_unreferenced_vertices()
+    invalid.export(invalid_path)
+    invalid_3mf_path.write_bytes(b"not a 3mf archive")
+    inspector = TrimeshSelectedSourceInspector(MeshInspector())
+    volume = Dimensions(width_mm=220, depth_mm=220, height_mm=250)
+
+    valid = await inspector.inspect("workflow", "candidate", "valid", valid_path, volume)
+    rejected = await inspector.inspect(
+        "workflow", "candidate", "invalid", invalid_path, volume
+    )
+    rejected_3mf = await inspector.inspect(
+        "workflow", "candidate", "invalid-3mf", invalid_3mf_path, volume
+    )
+
+    assert valid.accepted is True
+    assert rejected.accepted is False
+    assert rejected.mesh.watertight is False
+    assert "not watertight" in (rejected.rejection_reason or "")
+    assert rejected_3mf.accepted is False
+    assert "Could not parse 3MF" in (rejected_3mf.rejection_reason or "")
+
+
+async def test_source_set_validation_is_atomic_before_cache_promotion(
+    settings: Settings,
+    repository: WorkflowRepository,
+    tmp_path: Path,
+) -> None:
+    workflow = await repository.create_workflow("Create a car", "simulator")
+    pending = await repository.lease_next()
+    assert pending is not None
+    await repository.complete_work(pending.id)
+    for state in (
+        WorkflowState.PLANNING,
+        WorkflowState.DISCOVERING,
+        WorkflowState.SELECTING,
+    ):
+        await repository.transition(workflow.id, state)
+    body_path = tmp_path / "body.stl"
+    wheel_path = tmp_path / "wheel.stl"
+    body = trimesh.creation.box(extents=(40, 20, 10))
+    body.update_faces(range(len(body.faces) - 1))
+    body.remove_unreferenced_vertices()
+    body.export(body_path)
+    trimesh.creation.cylinder(radius=5, height=4).export(wheel_path)
+    candidate = ModelCandidate(
+        id="car",
+        title="Car",
+        introduction="Body and wheels",
+        source_url="https://example.test/car",
+        creator="maker",
+        license="CC BY",
+        files=[
+            CandidateFile(id="body-file", name="body.stl", format="stl"),
+            CandidateFile(id="wheel-file", name="wheel.stl", format="stl"),
+        ],
+    )
+    selections = [
+        SelectedCandidateFile(
+            file_id="body-file",
+            role=SelectedFileRole.UNIQUE_PART,
+            part_id="body",
+            part_name="Body",
+            rationale="Required body",
+            confidence=1,
+        ),
+        SelectedCandidateFile(
+            file_id="wheel-file",
+            role=SelectedFileRole.UNIQUE_PART,
+            part_id="wheel",
+            part_name="Wheel",
+            quantity=4,
+            rationale="Required wheels",
+            confidence=1,
+        ),
+    ]
+    decision = DiscoveryDecision(
+        decision=ModelDecision.USE_AS_IS,
+        candidate_id=candidate.id,
+        selected_files=selections,
+        rationale="Use complete car set",
+    )
+    application = SimpleNamespace(
+        settings=settings,
+        repository=repository,
+        catalog=CopyCatalog({"body-file": body_path, "wheel-file": wheel_path}),
+        source_inspector=TrimeshSelectedSourceInspector(MeshInspector()),
+    )
+
+    with pytest.raises(CandidateRejectedError, match="required source-set"):
+        await PrintingApplication._adopt_source_set(  # type: ignore[arg-type]
+            application,
+            workflow.id,
+            candidate,
+            decision,
+            Dimensions(width_mm=220, depth_mm=220, height_mm=250),
+        )
+
+    assert not list((settings.candidate_cache_dir / "models").glob("*.stl"))
+    assert not (
+        settings.candidate_cache_dir / "models" / "incoming" / workflow.id
+    ).exists()
+
+
+async def test_candidate_rejections_advance_then_fall_back_to_creation(
+    settings: Settings,
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Create a car", "simulator")
+    pending = await repository.lease_next()
+    assert pending is not None
+    await repository.complete_work(pending.id)
+    await repository.transition(workflow.id, WorkflowState.PLANNING)
+    plan = ModelPlan(search_query="car", geometry_summary="A toy car")
+    await repository.save_plan(workflow.id, plan)
+    for state in (
+        WorkflowState.DISCOVERING,
+        WorkflowState.SELECTING,
+        WorkflowState.SOURCE_VALIDATION,
+    ):
+        await repository.transition(workflow.id, state)
+    abandoned_handoff = ModelingHandoff(
+        workflow_id=workflow.id,
+        version=1,
+        requirement=workflow.requirement,
+        model_plan=plan,
+        decision=ModelDecision.CREATE,
+        target_printer=PrinterCapabilitySummary(
+            name="simulator",
+            build_volume=Dimensions(width_mm=220, depth_mm=220, height_mm=250),
+            accepted_formats={"stl"},
+        ),
+        discovery_rationale="Fixture abandoned handoff",
+    ).with_digest()
+    await repository.save_handoff(abandoned_handoff)
+    await repository.patch_workflow(
+        workflow.id,
+        modeling_session_id="abandoned-session",
+    )
+
+    class RetryDiscovery:
+        def __init__(self) -> None:
+            self.attempts: list[CandidateAttempt] = []
+
+        async def resume_after_candidate_rejection(
+            self,
+            workflow_id: str,
+            attempt: CandidateAttempt,
+        ) -> DiscoveryDecision:
+            self.attempts.append(attempt)
+            next_id = f"candidate-{len(self.attempts) + 1}"
+            await repository.transition(
+                workflow_id,
+                WorkflowState.SELECTING,
+                event_kind="fixture.next_candidate",
+            )
+            return DiscoveryDecision(
+                decision=ModelDecision.USE_AS_IS,
+                candidate_id=next_id,
+                file_id=f"file-{next_id}",
+                rationale="Try the next ranked candidate",
+            )
+
+    discovery = RetryDiscovery()
+    application = SimpleNamespace(
+        settings=settings,
+        repository=repository,
+        discovery=discovery,
+        artifacts=ArtifactStore(settings.artifact_dir),
+    )
+
+    first = await PrintingApplication._retry_candidate_or_create(  # type: ignore[arg-type]
+        application,
+        workflow.id,
+        "candidate-1",
+        ["file-1"],
+        CandidateRejectedError(
+            "body is not watertight",
+            stage="modification",
+            diagnostics={"file-1": "mesh is not watertight"},
+        ),
+    )
+    assert first.candidate_id == "candidate-2"
+    after_first = await repository.get_workflow(workflow.id)
+    assert after_first.active_handoff_version is None
+    assert after_first.modeling_session_id is None
+    await repository.transition(workflow.id, WorkflowState.SOURCE_VALIDATION)
+    second = await PrintingApplication._retry_candidate_or_create(  # type: ignore[arg-type]
+        application,
+        workflow.id,
+        "candidate-2",
+        ["file-2"],
+        CandidateRejectedError(
+            "model is too large",
+            stage="artifact_validation",
+            diagnostics={"file-2": "layout exceeds build volume"},
+        ),
+    )
+    assert second.candidate_id == "candidate-3"
+    await repository.transition(workflow.id, WorkflowState.SOURCE_VALIDATION)
+    fallback = await PrintingApplication._retry_candidate_or_create(  # type: ignore[arg-type]
+        application,
+        workflow.id,
+        "candidate-3",
+        ["file-3"],
+        CandidateRejectedError(
+            "model is invalid",
+            stage="source_validation",
+            diagnostics={"file-3": "mesh is not watertight"},
+        ),
+    )
+
+    assert fallback.decision == ModelDecision.CREATE
+    assert len(discovery.attempts) == 2
+    assert await repository.list_rejected_candidate_ids(workflow.id) == {
+        "candidate-1",
+        "candidate-2",
+        "candidate-3",
+    }
+    assert await repository.count_rejected_candidates(workflow.id) == 3
+    assert (await repository.get_workflow(workflow.id)).state == WorkflowState.SELECTING
 
 
 def test_artifact_store_preserves_legacy_root_file_aliases(tmp_path: Path) -> None:
@@ -262,6 +527,50 @@ async def test_source_is_adopted_only_after_mesh_validation(
     )
     listed = await repository.list_workflows()
     assert {item.id for item in listed} == {workflow.id, copied.id}
+
+
+async def test_infrastructure_failure_does_not_consume_generation_budget(
+    settings: Settings,
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Create a cube", "simulator")
+    pending = await repository.lease_next()
+    assert pending is not None
+    await repository.complete_work(pending.id)
+    plan = ModelPlan(search_query="cube", geometry_summary="A cube")
+    await repository.transition(workflow.id, WorkflowState.PLANNING)
+    await repository.save_plan(workflow.id, plan)
+    await repository.transition(workflow.id, WorkflowState.DISCOVERING)
+    await repository.transition(workflow.id, WorkflowState.SELECTING)
+    handoff = ModelingHandoff(
+        workflow_id=workflow.id,
+        version=1,
+        requirement=workflow.requirement,
+        model_plan=plan,
+        decision=ModelDecision.CREATE,
+        target_printer=PrinterCapabilitySummary(
+            name="simulator",
+            build_volume=Dimensions(width_mm=220, depth_mm=220, height_mm=250),
+            accepted_formats={"stl"},
+        ),
+        discovery_rationale="Create a cube",
+    ).with_digest()
+    await repository.save_handoff(handoff)
+    await repository.transition(workflow.id, WorkflowState.HANDOFF_READY)
+    await repository.transition(workflow.id, WorkflowState.GENERATING)
+    pipeline = ModelPipeline(
+        settings,
+        repository,
+        ArtifactStore(settings.artifact_dir),
+        UnavailableRenderer(),  # type: ignore[arg-type]
+        MeshInspector(),
+    )
+
+    with pytest.raises(ExternalServiceError, match="unavailable"):
+        await pipeline.adopt_source(handoff, "cube(10);")
+
+    assert await repository.count_source_attempts(workflow.id, handoff.version) == 0
+    assert (await repository.get_workflow(workflow.id)).state == WorkflowState.RENDERING
 
 
 async def test_source_set_publishes_separate_parts_instances_and_package(

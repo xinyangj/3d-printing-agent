@@ -12,6 +12,7 @@ from printing_agent.copilot_agents import CopilotDiscoveryAgent, CopilotModeling
 from printing_agent.domain import (
     ArtifactApproval,
     ArtifactProvenance,
+    CandidateAttempt,
     DiscoveryDecision,
     ModelArtifact,
     ModelDecision,
@@ -28,7 +29,9 @@ from printing_agent.domain import (
 )
 from printing_agent.errors import (
     BudgetExhaustedError,
+    CandidateRejectedError,
     ConflictError,
+    PolicyViolationError,
     ValidationError,
 )
 from printing_agent.modeling import ModelPipeline, TrimeshSelectedSourceInspector
@@ -131,85 +134,117 @@ class PrintingApplication:
                     SelectedFileRole.COMBINED_MODEL,
                 }
             ]
-            if decision.selected_files and included_source_files:
-                if decision.decision != ModelDecision.USE_AS_IS:
-                    raise ValidationError(
-                        "Multipart source sets must be adopted before part-scoped revisions"
+            selected_file_ids = (
+                [item.file_id for item in included_source_files]
+                if included_source_files
+                else [str(decision.file_id)]
+                if decision.file_id is not None
+                else []
+            )
+            try:
+                if decision.selected_files and included_source_files:
+                    if decision.decision != ModelDecision.USE_AS_IS:
+                        raise CandidateRejectedError(
+                            "Multipart source sets cannot enter whole-model modification",
+                            stage="selection",
+                        )
+                    artifact = await self._adopt_source_set(
+                        workflow_id,
+                        candidate,
+                        decision,
+                        printer.build_volume,
                     )
-                return await self._adopt_source_set(
+                else:
+                    artifact = await self._adopt_single_candidate(
+                        workflow_id,
+                        candidate,
+                        decision,
+                        plan,
+                        printer,
+                    )
+                await self.repository.save_candidate_attempt(
+                    CandidateAttempt(
+                        workflow_id=workflow_id,
+                        candidate_id=candidate.id,
+                        status="adopted",
+                        stage="artifact_ready",
+                        selected_file_ids=selected_file_ids,
+                    )
+                )
+                return artifact
+            except CandidateRejectedError as exc:
+                decision = await self._retry_candidate_or_create(
                     workflow_id,
-                    candidate,
-                    decision,
-                    printer.build_volume,
+                    candidate.id,
+                    selected_file_ids,
+                    exc,
                 )
-            selected_file = next(
-                (item for item in candidate.files if item.id == str(decision.file_id)),
-                None,
+                continue
+
+    async def _adopt_single_candidate(
+        self,
+        workflow_id: str,
+        candidate,
+        decision: DiscoveryDecision,
+        plan,
+        printer,
+    ) -> ModelArtifact:
+        selected_file = next(
+            (item for item in candidate.files if item.id == str(decision.file_id)),
+            None,
+        )
+        if selected_file is None:
+            raise CandidateRejectedError(
+                "Selected source file is no longer available",
+                stage="selection",
             )
-            if selected_file is None:
-                raise ValidationError("Selected source file is no longer available")
-            source_format = selected_file.format.casefold().lstrip(".")
-            if source_format not in {"stl", "3mf"}:
-                raise ValidationError(
-                    f"Source format '{source_format}' is discoverable but not yet importable"
-                )
-            source_path = (
-                self.settings.candidate_cache_dir
-                / "models"
-                / "incoming"
-                / workflow_id
-                / f"{decision.file_id}.{source_format}"
+        source_format = selected_file.format.casefold().lstrip(".")
+        if source_format not in {"stl", "3mf"}:
+            raise CandidateRejectedError(
+                f"Source format '{source_format}' is not importable",
+                stage="selection",
+                diagnostics={selected_file.id: "unsupported source format"},
             )
+        incoming = (
+            self.settings.candidate_cache_dir / "models" / "incoming" / workflow_id
+        )
+        source_path = incoming / f"{selected_file.id}.{source_format}"
+        try:
             await self.repository.transition(
                 workflow_id,
                 WorkflowState.SOURCE_VALIDATION,
                 event_kind="source.download_started",
-                payload={
-                    "candidate_id": decision.candidate_id,
-                    "file_id": decision.file_id,
-                },
+                payload={"candidate_id": candidate.id, "file_id": selected_file.id},
             )
-            await self.catalog.download_file(candidate, str(decision.file_id), source_path)
+            await self.catalog.download_file(candidate, selected_file.id, source_path)
             inspection = await self.source_inspector.inspect(
                 workflow_id,
-                str(decision.candidate_id),
-                str(decision.file_id),
+                candidate.id,
+                selected_file.id,
                 source_path,
                 printer.build_volume,
             )
-            if inspection.accepted:
-                cache_path = (
-                    self.settings.candidate_cache_dir
-                    / "models"
-                    / f"{inspection.source_digest}.{source_format}"
-                )
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                if not cache_path.exists():
-                    source_path.replace(cache_path)
-                else:
-                    source_path.unlink(missing_ok=True)
-                inspection = inspection.model_copy(update={"cached_path": cache_path})
             await self.repository.save_source_inspection(inspection)
-
             if not inspection.accepted:
+                raise CandidateRejectedError(
+                    inspection.rejection_reason or "Selected source mesh is invalid",
+                    stage="source_validation",
+                    diagnostics={
+                        selected_file.id: inspection.rejection_reason
+                        or "invalid source mesh"
+                    },
+                )
+            cache_path = (
+                self.settings.candidate_cache_dir
+                / "models"
+                / f"{inspection.source_digest}.{source_format}"
+            )
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            if not cache_path.exists():
+                source_path.replace(cache_path)
+            else:
                 source_path.unlink(missing_ok=True)
-                rejected = await self.repository.count_rejected_sources(workflow_id)
-                if rejected >= self.settings.post_selection_failure_budget:
-                    raise BudgetExhaustedError(
-                        "Selected source validation failure budget was exhausted"
-                    )
-                await self.repository.transition(
-                    workflow_id,
-                    WorkflowState.DISCOVERING,
-                    event_kind="source.rejected",
-                    payload={"reason": inspection.rejection_reason},
-                )
-                decision = await self.discovery.resume_after_source_rejection(
-                    workflow_id,
-                    inspection,
-                )
-                continue
-
+            inspection = inspection.model_copy(update={"cached_path": cache_path})
             provenance = ArtifactProvenance(
                 kind="catalog",
                 candidate_id=candidate.id,
@@ -224,29 +259,37 @@ class PrintingApplication:
                     WorkflowState.VALIDATING,
                     event_kind="source.adopting_unchanged",
                 )
-                if source_format == "3mf":
-                    return await self.model_pipeline.adopt_existing_3mf(
+                try:
+                    if source_format == "3mf":
+                        return await self.model_pipeline.adopt_existing_3mf(
+                            workflow_id,
+                            cache_path,
+                            provenance,
+                            printer.build_volume,
+                        )
+                    return await self.model_pipeline.adopt_existing(
                         workflow_id,
-                        inspection.cached_path,
+                        cache_path,
                         provenance,
                         printer.build_volume,
                     )
-                return await self.model_pipeline.adopt_existing(
-                    workflow_id,
-                    inspection.cached_path,
-                    provenance,
-                    printer.build_volume,
-                )
+                except ValidationError as exc:
+                    raise CandidateRejectedError(
+                        exc.message,
+                        stage="artifact_validation",
+                        diagnostics={selected_file.id: exc.message},
+                    ) from exc
             if source_format != "stl":
-                raise ValidationError(
-                    "Structured 3MF sources must be adopted before part-scoped revision"
+                raise CandidateRejectedError(
+                    "Structured 3MF sources cannot enter whole-model modification",
+                    stage="selection",
+                    diagnostics={selected_file.id: "3MF modification is unsupported"},
                 )
-
             selected_source = SelectedSourceSummary(
                 filename=f"source.{source_format}",
                 format=source_format,
                 candidate_id=candidate.id,
-                file_id=str(decision.file_id),
+                file_id=selected_file.id,
                 title=candidate.title,
                 creator=candidate.creator,
                 license=candidate.license,
@@ -254,13 +297,108 @@ class PrintingApplication:
                 source_digest=inspection.source_digest,
                 mesh=inspection.mesh,
             )
-            return await self._create_with_modeling(
-                workflow_id,
-                plan,
-                decision,
-                printer,
-                selected_source=selected_source,
+            try:
+                return await self._create_with_modeling(
+                    workflow_id,
+                    plan,
+                    decision,
+                    printer,
+                    selected_source=selected_source,
+                )
+            except BudgetExhaustedError as exc:
+                raise CandidateRejectedError(
+                    exc.message,
+                    stage="modification",
+                    diagnostics={selected_file.id: exc.message},
+                ) from exc
+        except PolicyViolationError as exc:
+            raise CandidateRejectedError(
+                exc.message,
+                stage="download_policy",
+                diagnostics={selected_file.id: exc.message},
+            ) from exc
+        finally:
+            shutil.rmtree(incoming, ignore_errors=True)
+
+    async def _retry_candidate_or_create(
+        self,
+        workflow_id: str,
+        candidate_id: str,
+        selected_file_ids: list[str],
+        error: CandidateRejectedError,
+    ) -> DiscoveryDecision:
+        attempt = CandidateAttempt(
+            workflow_id=workflow_id,
+            candidate_id=candidate_id,
+            status="rejected",
+            stage=error.stage,
+            selected_file_ids=selected_file_ids,
+            diagnostics=error.diagnostics or {"candidate": error.message},
+        )
+        await self.repository.save_candidate_attempt(attempt)
+        rejected_count = await self.repository.count_rejected_candidates(workflow_id)
+        workflow = await self.repository.get_workflow(workflow_id)
+        if error.stage == "modification" and workflow.active_handoff_version is not None:
+            shutil.rmtree(
+                self.artifacts.workflow_root(workflow_id)
+                / "attempts"
+                / f"handoff-{workflow.active_handoff_version}",
+                ignore_errors=True,
             )
+            await self.repository.patch_workflow(
+                workflow_id,
+                active_handoff_version=None,
+                modeling_session_id=None,
+                event_kind="candidate.modification_abandoned",
+                payload={
+                    "candidate_id": candidate_id,
+                    "handoff_version": workflow.active_handoff_version,
+                },
+            )
+            workflow = await self.repository.get_workflow(workflow_id)
+        if workflow.state != WorkflowState.DISCOVERING:
+            await self.repository.transition(
+                workflow_id,
+                WorkflowState.DISCOVERING,
+                event_kind="candidate.rejected",
+                payload={
+                    "candidate_id": candidate_id,
+                    "stage": error.stage,
+                    "diagnostics": attempt.diagnostics,
+                    "rejected_count": rejected_count,
+                    "next_action": (
+                        "generate"
+                        if rejected_count
+                        >= self.settings.post_selection_failure_budget
+                        else "next_candidate"
+                    ),
+                },
+            )
+        if rejected_count >= self.settings.post_selection_failure_budget:
+            await self.repository.transition(
+                workflow_id,
+                WorkflowState.SELECTING,
+                event_kind="candidate.generation_fallback",
+                payload={
+                    "rejected_candidate_ids": sorted(
+                        await self.repository.list_rejected_candidate_ids(workflow_id)
+                    ),
+                    "budget": self.settings.post_selection_failure_budget,
+                },
+            )
+            decision = DiscoveryDecision(
+                decision=ModelDecision.CREATE,
+                rationale=(
+                    "Catalog candidates exhausted the technical validation budget; "
+                    "generate a new model from the persisted plan."
+                ),
+            )
+            await self.repository.save_discovery_decision(workflow_id, decision)
+            return decision
+        return await self.discovery.resume_after_candidate_rejection(
+            workflow_id,
+            attempt,
+        )
 
     async def _adopt_source_set(
         self,
@@ -277,6 +415,11 @@ class PrintingApplication:
                 SelectedFileRole.COMBINED_MODEL,
             }
         ]
+        if not selected:
+            raise CandidateRejectedError(
+                "Source set contains no included files",
+                stage="selection",
+            )
         candidate_files = {item.id: item for item in candidate.files}
         await self.repository.transition(
             workflow_id,
@@ -287,21 +430,27 @@ class PrintingApplication:
                 "file_ids": [item.file_id for item in selected],
             },
         )
-        prepared = []
         incoming = (
             self.settings.candidate_cache_dir
             / "models"
             / "incoming"
             / workflow_id
         )
+        shutil.rmtree(incoming, ignore_errors=True)
         try:
+            downloaded = []
+            diagnostics: dict[str, str] = {}
             for selection in selected:
-                candidate_file = candidate_files[selection.file_id]
+                candidate_file = candidate_files.get(selection.file_id)
+                if candidate_file is None:
+                    diagnostics[selection.file_id] = "selected file is unavailable"
+                    continue
                 source_format = candidate_file.format.casefold().lstrip(".")
                 if source_format != "stl":
-                    raise ValidationError(
-                        "Multi-file source sets currently require STL part files"
+                    diagnostics[candidate_file.id] = (
+                        "multi-file source sets currently require STL files"
                     )
+                    continue
                 source_path = incoming / f"{candidate_file.id}.{source_format}"
                 await self.catalog.download_file(candidate, candidate_file.id, source_path)
                 inspection = await self.source_inspector.inspect(
@@ -313,70 +462,78 @@ class PrintingApplication:
                 )
                 await self.repository.save_source_inspection(inspection)
                 if not inspection.accepted:
-                    raise ValidationError(
-                        inspection.rejection_reason
-                        or f"Source part '{candidate_file.name}' is invalid"
+                    diagnostics[candidate_file.id] = (
+                        inspection.rejection_reason or "invalid source part"
                     )
-                cache_path = (
-                    self.settings.candidate_cache_dir
-                    / "models"
-                    / f"{inspection.source_digest}.stl"
+                downloaded.append((selection, candidate_file, source_path, inspection))
+            if diagnostics:
+                raise CandidateRejectedError(
+                    "One or more required source-set files failed validation",
+                    stage="source_validation",
+                    diagnostics=diagnostics,
                 )
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                if not cache_path.exists():
-                    source_path.replace(cache_path)
-                else:
-                    source_path.unlink(missing_ok=True)
+
+            prepared = []
+            for selection, candidate_file, source_path, inspection in downloaded:
                 prepared.append(
                     (
                         selection,
                         candidate_file,
-                        cache_path,
+                        source_path,
                         inspection.mesh,
                     )
                 )
-        except Exception:
-            shutil.rmtree(incoming, ignore_errors=True)
-            raise
-        finally:
-            if incoming.exists() and not any(incoming.iterdir()):
-                incoming.rmdir()
 
-        source_set_digest = canonical_digest(
-            {
-                "files": [
-                    {
-                        "file_id": selection.file_id,
-                        "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
-                    }
-                    for selection, _, path, _ in prepared
-                ],
-                "shared_scale": decision.shared_scale,
-            }
-        )
-        provenance = ArtifactProvenance(
-            kind="catalog",
-            candidate_id=candidate.id,
-            source_url=candidate.source_url,
-            creator=candidate.creator,
-            license=candidate.license,
-            source_digest=source_set_digest,
-        )
-        await self.repository.transition(
-            workflow_id,
-            WorkflowState.VALIDATING,
-            event_kind="source_set.adopting",
-            payload={"part_count": len(prepared)},
-        )
-        return await self.model_pipeline.adopt_existing_set(
-            workflow_id,
-            prepared,
-            provenance,
-            build_volume,
-            shared_scale=decision.shared_scale,
-            description=f"{candidate.introduction}\n{candidate.instructions}",
-            classification=decision.selected_files,
-        )
+            source_set_digest = canonical_digest(
+                {
+                    "files": [
+                        {
+                            "file_id": selection.file_id,
+                            "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+                        }
+                        for selection, _, path, _ in prepared
+                    ],
+                    "shared_scale": decision.shared_scale,
+                }
+            )
+            provenance = ArtifactProvenance(
+                kind="catalog",
+                candidate_id=candidate.id,
+                source_url=candidate.source_url,
+                creator=candidate.creator,
+                license=candidate.license,
+                source_digest=source_set_digest,
+            )
+            await self.repository.transition(
+                workflow_id,
+                WorkflowState.VALIDATING,
+                event_kind="source_set.adopting",
+                payload={"part_count": len(prepared)},
+            )
+            try:
+                return await self.model_pipeline.adopt_existing_set(
+                    workflow_id,
+                    prepared,
+                    provenance,
+                    build_volume,
+                    shared_scale=decision.shared_scale,
+                    description=f"{candidate.introduction}\n{candidate.instructions}",
+                    classification=decision.selected_files,
+                )
+            except ValidationError as exc:
+                raise CandidateRejectedError(
+                    exc.message,
+                    stage="artifact_validation",
+                    diagnostics={"source_set": exc.message},
+                ) from exc
+        except PolicyViolationError as exc:
+            raise CandidateRejectedError(
+                exc.message,
+                stage="download_policy",
+                diagnostics={"candidate": exc.message},
+            ) from exc
+        finally:
+            shutil.rmtree(incoming, ignore_errors=True)
 
     async def _create_with_modeling(
         self,

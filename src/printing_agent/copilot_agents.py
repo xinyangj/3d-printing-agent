@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from printing_agent.catalogs import ThingiverseCatalog
 from printing_agent.config import Settings
 from printing_agent.domain import (
+    CandidateAttempt,
     DiscoveryDecision,
     ModelArtifact,
     ModelDecision,
@@ -25,13 +26,13 @@ from printing_agent.domain import (
     SearchRound,
     SelectedCandidateFile,
     SelectedFileRole,
-    SelectedSourceInspection,
     WorkflowState,
 )
 from printing_agent.errors import (
     BudgetExhaustedError,
     ExternalServiceError,
     PolicyViolationError,
+    ValidationError,
 )
 from printing_agent.modeling import ModelPipeline
 from printing_agent.repositories import WorkflowRepository
@@ -81,6 +82,7 @@ class _DiscoveryToolState:
     workflow: PrintWorkflow
     plan: ModelPlan | None = None
     decision: DiscoveryDecision | None = None
+    rejected_candidate_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -91,6 +93,8 @@ class _ModelingToolState:
     feedback: str | None = None
     artifact: ModelArtifact | None = None
     failures: list[str] = field(default_factory=list)
+    budget_exhausted: str | None = None
+    fatal_error: Exception | None = None
 
 
 def _role_permission_handler(allowed: set[str]):
@@ -206,7 +210,12 @@ class CopilotDiscoveryAgent:
         printer: PrinterCapabilitySummary,
     ) -> tuple[ModelPlan, DiscoveryDecision]:
         workflow = await self.repository.get_workflow(workflow_id)
-        state = _DiscoveryToolState(workflow=workflow)
+        state = _DiscoveryToolState(
+            workflow=workflow,
+            rejected_candidate_ids=await self.repository.list_rejected_candidate_ids(
+                workflow_id
+            ),
+        )
         tools = self._build_tools(state, allow_plan=True)
         await self.runtime.run(
             workflow,
@@ -222,22 +231,31 @@ class CopilotDiscoveryAgent:
             )
         return state.plan, state.decision
 
-    async def resume_after_source_rejection(
+    async def resume_after_candidate_rejection(
         self,
         workflow_id: str,
-        inspection: SelectedSourceInspection,
+        attempt: CandidateAttempt,
     ) -> DiscoveryDecision:
         workflow = await self.repository.get_workflow(workflow_id)
         plan = await self.repository.get_plan(workflow_id)
-        state = _DiscoveryToolState(workflow=workflow, plan=plan)
+        rejected_candidate_ids = await self.repository.list_rejected_candidate_ids(
+            workflow_id
+        )
+        state = _DiscoveryToolState(
+            workflow=workflow,
+            plan=plan,
+            rejected_candidate_ids=rejected_candidate_ids,
+        )
         tools = self._build_tools(state, allow_plan=False)
         prompt = (
-            "The provisionally selected source file failed server-side technical validation. "
-            "Continue discovery using your existing search context. Select a different inspected "
-            "candidate, refine the search, or choose creation.\n\n"
+            "The provisionally selected candidate failed server-side technical validation. "
+            "Select the highest-ranked remaining eligible candidate from already inspected "
+            "dossiers before searching further. Never select an excluded candidate. Choose "
+            "creation only when no eligible catalog candidate remains.\n\n"
             f"Original requirement: {workflow.requirement}\n"
             f"Persisted model plan: {plan.model_dump_json(indent=2)}\n"
-            f"Technical findings: {inspection.rejection_reason or 'invalid source mesh'}"
+            f"Rejected attempt: {attempt.model_dump_json(indent=2)}\n"
+            f"Excluded candidate IDs: {sorted(rejected_candidate_ids)}"
         )
         await self.runtime.run(
             workflow,
@@ -264,7 +282,15 @@ class CopilotDiscoveryAgent:
             else None
         )
         rejected_candidate_id = artifact.provenance.candidate_id if artifact else None
-        state = _DiscoveryToolState(workflow=workflow, plan=plan)
+        state = _DiscoveryToolState(
+            workflow=workflow,
+            plan=plan,
+            rejected_candidate_ids=await self.repository.list_rejected_candidate_ids(
+                workflow_id
+            ),
+        )
+        if rejected_candidate_id is not None:
+            state.rejected_candidate_ids.add(rejected_candidate_id)
         await self.repository.patch_workflow(
             workflow_id,
             discovery_session_id=None,
@@ -496,6 +522,10 @@ class CopilotDiscoveryAgent:
                         state.workflow.id,
                         str(decision.candidate_id),
                     )
+                    if str(decision.candidate_id) in state.rejected_candidate_ids:
+                        raise PolicyViolationError(
+                            "Selected candidate failed technical validation and is excluded"
+                        )
                     candidate_file_ids = {item.id for item in inspection.candidate.files}
                     selected_file_ids = {item.file_id for item in decision.selected_files}
                     if decision.file_id and decision.file_id not in candidate_file_ids:
@@ -607,6 +637,10 @@ class CopilotModelingAgent:
             resume=bool(workflow.modeling_session_id),
         )
         if state.artifact is None:
+            if state.fatal_error is not None:
+                raise state.fatal_error
+            if state.budget_exhausted is not None:
+                raise BudgetExhaustedError(state.budget_exhausted)
             detail = state.failures[-1] if state.failures else "no source was adopted"
             raise ExternalServiceError(f"Modeling ended without an artifact: {detail}")
         return state.artifact
@@ -654,6 +688,10 @@ class CopilotModelingAgent:
             resume=False,
         )
         if state.artifact is None:
+            if state.fatal_error is not None:
+                raise state.fatal_error
+            if state.budget_exhausted is not None:
+                raise BudgetExhaustedError(state.budget_exhausted)
             raise ExternalServiceError("Modeling revision ended without an adopted artifact")
         return state.artifact
 
@@ -730,10 +768,20 @@ class CopilotModelingAgent:
                 )
             except BudgetExhaustedError as exc:
                 state.failures.append(exc.message)
+                state.budget_exhausted = exc.message
+                return ToolResult(result_type="denied", text_result_for_llm=exc.message)
+            except ExternalServiceError as exc:
+                state.fatal_error = exc
                 return ToolResult(result_type="denied", text_result_for_llm=exc.message)
             except Exception as exc:
                 diagnostic = str(exc)[-2_000:]
                 state.failures.append(diagnostic)
+                if not isinstance(exc, (PolicyViolationError, ValidationError)):
+                    state.fatal_error = exc
+                    return ToolResult(
+                        result_type="denied",
+                        text_result_for_llm=diagnostic,
+                    )
                 return ToolResult(
                     result_type="failure",
                     text_result_for_llm=f"Multipart revision rejected: {diagnostic}",
@@ -792,10 +840,29 @@ class CopilotModelingAgent:
                 )
             except BudgetExhaustedError as exc:
                 state.failures.append(exc.message)
+                state.budget_exhausted = exc.message
+                return ToolResult(result_type="denied", text_result_for_llm=exc.message)
+            except ExternalServiceError as exc:
+                state.fatal_error = exc
                 return ToolResult(result_type="denied", text_result_for_llm=exc.message)
             except Exception as exc:
                 diagnostic = str(exc)[-2_000:]
                 state.failures.append(diagnostic)
+                if isinstance(exc, (PolicyViolationError, ValidationError)):
+                    attempts = await self.repository.count_source_attempts(
+                        state.handoff.workflow_id,
+                        state.handoff.version,
+                    )
+                    if attempts >= self.settings.generation_attempt_budget:
+                        state.budget_exhausted = (
+                            "OpenSCAD generation attempt budget was exhausted"
+                        )
+                else:
+                    state.fatal_error = exc
+                    return ToolResult(
+                        result_type="denied",
+                        text_result_for_llm=diagnostic,
+                    )
                 return ToolResult(
                     result_type="failure",
                     text_result_for_llm=f"Source rejected: {diagnostic}",

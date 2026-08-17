@@ -9,6 +9,7 @@ import aiosqlite
 
 from printing_agent.domain import (
     ArtifactApproval,
+    CandidateAttempt,
     CandidatePageInspection,
     DiscoveryDecision,
     ModelArtifact,
@@ -100,6 +101,16 @@ CREATE TABLE IF NOT EXISTS source_inspections (
     file_id TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS candidate_attempts (
+    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+    candidate_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workflow_id, candidate_id)
 );
 
 CREATE TABLE IF NOT EXISTS modeling_handoffs (
@@ -687,6 +698,61 @@ class WorkflowRepository:
         finally:
             await db.close()
 
+    async def save_candidate_attempt(self, attempt: CandidateAttempt) -> None:
+        db = await self._connect()
+        try:
+            await db.execute(
+                """
+                INSERT INTO candidate_attempts (
+                    workflow_id, candidate_id, status, stage, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workflow_id, candidate_id) DO UPDATE SET
+                    status = excluded.status,
+                    stage = excluded.stage,
+                    payload_json = excluded.payload_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    attempt.workflow_id,
+                    attempt.candidate_id,
+                    attempt.status,
+                    attempt.stage,
+                    attempt.model_dump_json(),
+                    attempt.created_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def list_rejected_candidate_ids(self, workflow_id: str) -> set[str]:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT candidate_id FROM candidate_attempts
+                WHERE workflow_id = ? AND status = 'rejected'
+                """,
+                (workflow_id,),
+            )
+            return {str(row["candidate_id"]) for row in await cursor.fetchall()}
+        finally:
+            await db.close()
+
+    async def count_rejected_candidates(self, workflow_id: str) -> int:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT COUNT(*) AS count FROM candidate_attempts
+                WHERE workflow_id = ? AND status = 'rejected'
+                """,
+                (workflow_id,),
+            )
+            return int((await cursor.fetchone())["count"])
+        finally:
+            await db.close()
+
     async def next_handoff_version(self, workflow_id: str) -> int:
         return await self._next_version("modeling_handoffs", workflow_id)
 
@@ -805,7 +871,7 @@ class WorkflowRepository:
             cursor = await db.execute(
                 """
                 SELECT COUNT(*) AS count FROM source_attempts
-                WHERE workflow_id = ? AND handoff_version = ?
+                WHERE workflow_id = ? AND handoff_version = ? AND status = 'rejected'
                 """,
                 (workflow_id, handoff_version),
             )
