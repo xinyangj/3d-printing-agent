@@ -1948,6 +1948,36 @@ class WorkflowRepository:
         finally:
             await db.close()
 
+    async def record_workflow_event(
+        self,
+        workflow_id: str,
+        kind: str,
+        payload: dict[str, Any],
+    ) -> None:
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT state FROM workflows WHERE id = ?",
+                (workflow_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError(f"Workflow '{workflow_id}' was not found")
+            await self._insert_event(
+                db,
+                workflow_id,
+                kind,
+                WorkflowState(row["state"]),
+                payload,
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
     async def enqueue(
         self,
         workflow_id: str,

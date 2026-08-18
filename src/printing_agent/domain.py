@@ -57,6 +57,7 @@ class WorkflowState(StrEnum):
 
 
 class ModelDecision(StrEnum):
+    REUSE = "reuse"
     MODIFY = "modify"
     USE_AS_IS = "use_as_is"
     CREATE = "create"
@@ -239,14 +240,43 @@ class DiscoveryDecision(FrozenModel):
     shared_scale: float = Field(default=1, gt=0, le=1000)
     rationale: str = Field(min_length=1, max_length=2000)
     required_changes: list[str] = Field(default_factory=list, max_length=20)
+    requires_source_preparation: bool = False
+    preparation_changes: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_decision(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        decision = normalized.get("decision")
+        if decision == ModelDecision.USE_AS_IS or decision == "use_as_is":
+            normalized["decision"] = ModelDecision.REUSE
+            normalized.setdefault("requires_source_preparation", False)
+        elif decision == ModelDecision.MODIFY or decision == "modify":
+            normalized["decision"] = ModelDecision.REUSE
+            normalized.setdefault("requires_source_preparation", True)
+            normalized.setdefault(
+                "preparation_changes",
+                list(normalized.get("required_changes") or []),
+            )
+        return normalized
 
     @model_validator(mode="after")
     def validate_source_choice(self) -> DiscoveryDecision:
         if self.decision == ModelDecision.CREATE:
             if self.candidate_id is not None or self.file_id is not None or self.selected_files:
                 raise ValueError("Creation decisions cannot select a candidate file")
+            if self.requires_source_preparation or self.preparation_changes:
+                raise ValueError("Creation decisions cannot request source preparation")
         elif not self.candidate_id or (not self.file_id and not self.selected_files):
             raise ValueError("A candidate and at least one file are required")
+        if self.requires_source_preparation and not self.preparation_changes:
+            raise ValueError("Source preparation requires concrete preparation changes")
+        if not self.requires_source_preparation and self.preparation_changes:
+            raise ValueError(
+                "Preparation changes require requires_source_preparation=true"
+            )
         selected_ids = [item.file_id for item in self.selected_files]
         if len(selected_ids) != len(set(selected_ids)):
             raise ValueError("Selected source-set file IDs must be unique")

@@ -263,6 +263,7 @@ function useWorkflowEvents(workflowId: string | null) {
     source.addEventListener('stream.complete', () => source.close())
     const knownEvents = [
       'preparation.started',
+      'role.tool_correction',
       'discovery.plan_ready',
       'discovery.searching',
       'discovery.search_complete',

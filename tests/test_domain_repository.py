@@ -8,6 +8,7 @@ import pytest
 from printing_agent.domain import (
     ArtifactApproval,
     Dimensions,
+    DiscoveryDecision,
     ModelCandidate,
     ModelDecision,
     ModelingHandoff,
@@ -404,3 +405,29 @@ def test_modeling_handoff_digest_is_stable_and_mode_is_validated() -> None:
 
     assert handoff.digest
     assert handoff.with_digest().digest == handoff.digest
+
+
+def test_legacy_discovery_decisions_normalize_to_reuse() -> None:
+    unchanged = DiscoveryDecision.model_validate(
+        {
+            "decision": "use_as_is",
+            "candidate_id": "candidate",
+            "file_id": "file",
+            "rationale": "Reuse unchanged",
+        }
+    )
+    modified = DiscoveryDecision.model_validate(
+        {
+            "decision": "modify",
+            "candidate_id": "candidate",
+            "file_id": "file",
+            "rationale": "Prepare source",
+            "required_changes": ["Add a mounting hole"],
+        }
+    )
+
+    assert unchanged.decision == ModelDecision.REUSE
+    assert unchanged.requires_source_preparation is False
+    assert modified.decision == ModelDecision.REUSE
+    assert modified.requires_source_preparation is True
+    assert modified.preparation_changes == ["Add a mounting hole"]

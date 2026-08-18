@@ -162,6 +162,69 @@ async def test_source_inspection_rejects_non_watertight_mesh(
     assert "Could not parse 3MF" in (rejected_3mf.rejection_reason or "")
 
 
+async def test_source_preparation_can_edit_one_file_and_preserve_another(
+    settings: Settings,
+    repository: WorkflowRepository,
+    tmp_path: Path,
+) -> None:
+    body_path = tmp_path / "body.stl"
+    wheel_path = tmp_path / "wheel.stl"
+    trimesh.creation.box(extents=(20, 10, 5)).export(body_path)
+    trimesh.creation.cylinder(radius=3, height=2).export(wheel_path)
+    inspector = MeshInspector()
+    body_selection = SelectedCandidateFile(
+        file_id="body-file",
+        role=SelectedFileRole.UNIQUE_PART,
+        part_id="body",
+        part_name="Body",
+        rationale="Car body",
+        confidence=1,
+    )
+    wheel_selection = SelectedCandidateFile(
+        file_id="wheel-file",
+        role=SelectedFileRole.UNIQUE_PART,
+        part_id="wheel",
+        part_name="Wheel",
+        quantity=4,
+        rationale="Car wheels",
+        confidence=1,
+    )
+    selected = [
+        (
+            body_selection,
+            CandidateFile(id="body-file", name="body.stl", format="stl"),
+            body_path,
+            await inspector.inspect(body_path),
+        ),
+        (
+            wheel_selection,
+            CandidateFile(id="wheel-file", name="wheel.stl", format="stl"),
+            wheel_path,
+            await inspector.inspect(wheel_path),
+        ),
+    ]
+    pipeline = ModelPipeline(
+        settings,
+        repository,
+        ArtifactStore(settings.artifact_dir),
+        PartRenderer(),  # type: ignore[arg-type]
+        inspector,
+    )
+    wheel_digest = sha256_file(wheel_path)
+
+    prepared, workspace = await pipeline.prepare_source_set_files(
+        str(uuid4()),
+        selected,
+        [("body", 'import("source.stl");', "Scale the body")],
+    )
+
+    prepared_by_id = {item[0].part_id: item for item in prepared}
+    assert prepared_by_id["body"][3].dimensions.width_mm == pytest.approx(60)
+    assert prepared_by_id["wheel"][2] == wheel_path
+    assert sha256_file(prepared_by_id["wheel"][2]) == wheel_digest
+    shutil.rmtree(workspace)
+
+
 async def test_source_set_validation_is_atomic_before_cache_promotion(
     settings: Settings,
     repository: WorkflowRepository,

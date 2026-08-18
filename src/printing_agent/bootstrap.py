@@ -47,7 +47,9 @@ async def build_container(settings: Settings | None = None) -> Container:
     )
     discovery = CopilotDiscoveryAgent(settings, repository, catalog)
     modeling = CopilotModelingAgent(settings, repository, model_pipeline)
-    revision_verifier = RevisionVerifier(CopilotRevisionVerifier(settings))
+    revision_verifier = RevisionVerifier(
+        CopilotRevisionVerifier(settings, repository)
+    )
     printers = PrinterRegistry()
     printers.register(SimulatedPrinterAdapter(settings.simulator_spool_dir))
     application = PrintingApplication(

@@ -24,6 +24,7 @@ from printing_agent.domain import (
     ModelingHandoff,
     PartGeometryKind,
     SelectedCandidateFile,
+    SelectedFileRole,
     SelectedSourceInspection,
     SourceAsset,
     WorkflowState,
@@ -376,6 +377,79 @@ class ModelPipeline:
         self.renderer = renderer
         self.mesh_inspector = mesh_inspector
         self.source_policy = source_policy or OpenScadSourcePolicy()
+
+    async def prepare_source_set_files(
+        self,
+        workflow_id: str,
+        selected: list[
+            tuple[SelectedCandidateFile, CandidateFile, Path, MeshReport]
+        ],
+        revisions: list[tuple[str, str, str]],
+    ) -> tuple[
+        list[tuple[SelectedCandidateFile, CandidateFile, Path, MeshReport]],
+        Path,
+    ]:
+        selected_by_part = {
+            selection.part_id: (selection, candidate_file, path, report)
+            for selection, candidate_file, path, report in selected
+            if selection.role == SelectedFileRole.UNIQUE_PART
+            and selection.part_id is not None
+        }
+        revision_ids = [part_id for part_id, _, _ in revisions]
+        if not revision_ids:
+            raise ValidationError("Source preparation must revise at least one included part")
+        if len(revision_ids) != len(set(revision_ids)):
+            raise ValidationError("Prepared part IDs must be unique")
+        unknown = sorted(set(revision_ids) - set(selected_by_part))
+        if unknown:
+            raise ValidationError(
+                f"Source preparation references unknown parts: {', '.join(unknown)}"
+            )
+        workspace = (
+            self.artifacts.workflow_root(workflow_id)
+            / "staging"
+            / "source-preparation"
+        )
+        shutil.rmtree(workspace, ignore_errors=True)
+        prepared_paths: dict[str, tuple[Path, MeshReport]] = {}
+        try:
+            for part_id, source_code, _ in revisions:
+                self.source_policy.validate(source_code, "source.stl")
+                _, _, original_path, _ = selected_by_part[part_id]
+                part_directory = workspace / part_id
+                part_directory.mkdir(parents=True, exist_ok=False)
+                shutil.copy2(original_path, part_directory / "source.stl")
+                source_path = part_directory / "source.scad"
+                source_path.write_text(
+                    (
+                        "module prepared_part() {\n"
+                        f"{source_code}\n"
+                        "}\n"
+                        "prepared_part();\n"
+                    ),
+                    encoding="utf-8",
+                )
+                output_path = part_directory / "prepared.stl"
+                await self.renderer.render(source_path, output_path)
+                report = await self.mesh_inspector.inspect(output_path)
+                if not report.watertight or report.volume_mm3 <= 0:
+                    raise ValidationError(
+                        f"Prepared part '{part_id}' must be watertight with positive volume"
+                    )
+                prepared_paths[part_id] = (output_path, report)
+            prepared = [
+                (
+                    selection,
+                    candidate_file,
+                    prepared_paths.get(selection.part_id, (path, report))[0],
+                    prepared_paths.get(selection.part_id, (path, report))[1],
+                )
+                for selection, candidate_file, path, report in selected
+            ]
+            return prepared, workspace
+        except Exception:
+            shutil.rmtree(workspace, ignore_errors=True)
+            raise
 
     async def adopt_source(
         self,

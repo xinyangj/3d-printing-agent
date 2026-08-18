@@ -16,6 +16,7 @@ from printing_agent.copilot_agents import (
     CopilotModelingAgent,
     _DiscoveryToolState,
     _role_permission_handler,
+    _SessionRuntime,
 )
 from printing_agent.domain import (
     AnnotationOrigin,
@@ -36,7 +37,7 @@ from printing_agent.domain import (
     PrinterCapabilitySummary,
     WorkflowState,
 )
-from printing_agent.errors import ExternalServiceError
+from printing_agent.errors import ToolCorrectionExhaustedError
 from printing_agent.repositories import WorkflowRepository
 
 
@@ -77,6 +78,41 @@ async def test_role_permission_handler_uses_sdk_decision_types() -> None:
     assert isinstance(rejected, PermissionDecisionReject)
 
 
+async def test_role_correction_controller_resumes_until_completion(
+    settings: Settings,
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Create a car", "simulator")
+    runtime = _SessionRuntime(settings, repository)
+    calls: list[bool] = []
+    complete = False
+
+    async def fake_run(*args: object, **kwargs: object) -> str:
+        nonlocal complete
+        del args
+        calls.append(bool(kwargs["resume"]))
+        if len(calls) == 2:
+            complete = True
+        return "session"
+
+    runtime.run = fake_run  # type: ignore[method-assign]
+    await runtime.run_with_corrections(
+        workflow,
+        "discovery",
+        [],
+        "select",
+        "system",
+        resume=False,
+        is_complete=lambda: complete,
+        rejection_reason=lambda: "decision must be reuse or create",
+    )
+
+    assert calls == [False, True]
+    events = await repository.list_events(workflow.id)
+    assert events[-1].kind == "role.tool_correction"
+    assert events[-1].payload["reason"] == "decision must be reuse or create"
+
+
 async def test_rejected_candidate_cannot_be_selected_again(
     settings: Settings,
     repository: WorkflowRepository,
@@ -115,7 +151,7 @@ async def test_rejected_candidate_cannot_be_selected_again(
             ToolInvocation(
                 tool_name=tool.name,
                 arguments={
-                    "decision": ModelDecision.USE_AS_IS.value,
+                    "decision": ModelDecision.REUSE.value,
                     "candidate_id": candidate.id,
                     "file_id": "car-file",
                     "rationale": "Try the same candidate again",
@@ -141,6 +177,9 @@ class CaptureRuntime:
         self.tools = cast(list[Any], args[2])
         raise RuntimeError("captured")
 
+    async def run_with_corrections(self, *args: object, **kwargs: object) -> str:
+        return await self.run(*args, **kwargs)
+
 
 class EmptyRuntime:
     def __init__(self) -> None:
@@ -150,6 +189,14 @@ class EmptyRuntime:
         del args, kwargs
         self.calls += 1
         return "session-ended"
+
+    async def run_with_corrections(self, *args: object, **kwargs: object) -> str:
+        is_complete = kwargs["is_complete"]
+        for _ in range(4):
+            await self.run(*args, **kwargs)
+            if is_complete():
+                return "session-ended"
+        raise ToolCorrectionExhaustedError("modeling exhausted correction attempts")
 
 
 async def test_modeling_retries_sessions_that_submit_no_source(
@@ -185,7 +232,7 @@ async def test_modeling_retries_sessions_that_submit_no_source(
     runtime = EmptyRuntime()
     modeling.runtime = cast(object, runtime)  # type: ignore[assignment]
 
-    with pytest.raises(ExternalServiceError, match="after session retries"):
+    with pytest.raises(ToolCorrectionExhaustedError, match="correction attempts"):
         await modeling.build(handoff)
 
     assert runtime.calls == settings.generation_attempt_budget

@@ -172,11 +172,6 @@ class PrintingApplication:
             )
             try:
                 if decision.selected_files and included_source_files:
-                    if decision.decision != ModelDecision.USE_AS_IS:
-                        raise CandidateRejectedError(
-                            "Multipart source sets cannot enter whole-model modification",
-                            stage="selection",
-                        )
                     artifact = await self._adopt_source_set(
                         workflow_id,
                         candidate,
@@ -340,7 +335,7 @@ class PrintingApplication:
                 license=candidate.license,
                 source_digest=inspection.source_digest,
             )
-            if decision.decision == ModelDecision.USE_AS_IS:
+            if not decision.requires_source_preparation:
                 await self.repository.transition(
                     workflow_id,
                     WorkflowState.VALIDATING,
@@ -443,6 +438,14 @@ class PrintingApplication:
                 },
             )
             workflow = await self.repository.get_workflow(workflow_id)
+        elif error.stage == "source_preparation":
+            await self.repository.patch_workflow(
+                workflow_id,
+                modeling_session_id=None,
+                event_kind="candidate.source_preparation_abandoned",
+                payload={"candidate_id": candidate_id},
+            )
+            workflow = await self.repository.get_workflow(workflow_id)
         if workflow.state != WorkflowState.DISCOVERING:
             await self.repository.transition(
                 workflow_id,
@@ -524,6 +527,7 @@ class PrintingApplication:
             / workflow_id
         )
         shutil.rmtree(incoming, ignore_errors=True)
+        preparation_workspace = None
         try:
             downloaded = []
             diagnostics: dict[str, str] = {}
@@ -570,6 +574,21 @@ class PrintingApplication:
                         inspection.mesh,
                     )
                 )
+            if decision.requires_source_preparation:
+                try:
+                    prepared, preparation_workspace = (
+                        await self.modeling.prepare_source_set(
+                            workflow_id,
+                            prepared,
+                            decision.preparation_changes,
+                        )
+                    )
+                except BudgetExhaustedError as exc:
+                    raise CandidateRejectedError(
+                        exc.message,
+                        stage="source_preparation",
+                        diagnostics={"source_set": exc.message},
+                    ) from exc
 
             source_set_digest = canonical_digest(
                 {
@@ -621,6 +640,8 @@ class PrintingApplication:
             ) from exc
         finally:
             shutil.rmtree(incoming, ignore_errors=True)
+            if preparation_workspace is not None:
+                shutil.rmtree(preparation_workspace, ignore_errors=True)
 
     async def _create_with_modeling(
         self,
@@ -639,10 +660,14 @@ class PrintingApplication:
             model_plan=plan,
             decision=(
                 ModelDecision.MODIFY
-                if decision.decision == ModelDecision.MODIFY
+                if selected_source is not None
                 else ModelDecision.CREATE
             ),
-            required_changes=decision.required_changes,
+            required_changes=(
+                decision.preparation_changes
+                if decision.requires_source_preparation
+                else decision.required_changes
+            ),
             selected_source=selected_source,
             target_printer=printer,
             discovery_rationale=decision.rationale,

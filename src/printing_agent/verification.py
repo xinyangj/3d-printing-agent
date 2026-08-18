@@ -23,9 +23,10 @@ from printing_agent.domain import (
     RevisionVerification,
     RevisionVerificationCheck,
 )
-from printing_agent.errors import ExternalServiceError
+from printing_agent.errors import ToolCorrectionExhaustedError
 from printing_agent.modeling import unwrap_base_model_source
 from printing_agent.multipart import ThreeMFService
+from printing_agent.repositories import WorkflowRepository
 
 _COLOR_CALL = re.compile(
     r"\bcolor\s*\(\s*(?P<value>\[[^\]]+\]|\"[^\"]+\")",
@@ -50,8 +51,13 @@ class _SemanticState:
 
 
 class CopilotRevisionVerifier:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        repository: WorkflowRepository,
+    ) -> None:
         self.settings = settings
+        self.repository = repository
 
     async def verify(self, evidence: dict[str, Any]) -> SemanticVerificationParams:
         state = _SemanticState()
@@ -127,22 +133,39 @@ class CopilotRevisionVerifier:
             )
             try:
                 prompt_evidence = self._bounded_prompt_evidence(evidence)
-                await session.send_and_wait(
-                    (
+                prompt = (
                         "Verify whether this provisional revision satisfies the exact feedback. "
                         "Mandatory deterministic failures cannot be overridden. Call the verdict "
                         "tool exactly once.\n\n"
                         f"{json.dumps(prompt_evidence, sort_keys=False, indent=2)}"
-                    ),
-                    timeout=300,
                 )
+                for attempt in range(1, 5):
+                    await session.send_and_wait(prompt, timeout=300)
+                    if state.result is not None:
+                        return state.result
+                    reason = (
+                        "Verification turn ended without an accepted "
+                        "submit_revision_verification call"
+                    )
+                    await self.repository.record_workflow_event(
+                        str(evidence["workflow_id"]),
+                        "role.tool_correction",
+                        {
+                            "role": "verification",
+                            "attempt": attempt,
+                            "reason": reason,
+                        },
+                    )
+                    prompt = (
+                        "Your previous verification turn did not submit an accepted verdict. "
+                        "Correct the verdict payload and call submit_revision_verification now. "
+                        f"Diagnostic: {reason}"
+                    )
             finally:
                 await session.disconnect()
-        if state.result is None:
-            raise ExternalServiceError(
-                "Revision verifier ended without submitting a verdict"
-            )
-        return state.result
+        raise ToolCorrectionExhaustedError(
+            "Verification exhausted 4 correction attempts without an accepted verdict"
+        )
 
     @staticmethod
     def _bounded_prompt_evidence(evidence: dict[str, Any]) -> dict[str, Any]:

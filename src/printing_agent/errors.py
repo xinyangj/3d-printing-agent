@@ -37,6 +37,10 @@ class BudgetExhaustedError(PrintingAgentError):
     code = "budget_exhausted"
 
 
+class ToolCorrectionExhaustedError(PrintingAgentError):
+    code = "tool_correction_exhausted"
+
+
 class ValidationError(PrintingAgentError):
     code = "validation_error"
 
