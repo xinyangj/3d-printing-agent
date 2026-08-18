@@ -843,7 +843,10 @@ class CopilotModelingAgent:
             params: SubmitOpenScadSourceParams,
         ) -> ToolResult:
             expected_mode = (
-                "modify" if state.handoff.decision == ModelDecision.MODIFY else "create"
+                "modify"
+                if state.base_artifact is not None
+                or state.handoff.decision == ModelDecision.MODIFY
+                else "create"
             )
             if params.mode != expected_mode:
                 return ToolResult(
