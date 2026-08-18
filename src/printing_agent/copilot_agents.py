@@ -842,16 +842,21 @@ class CopilotModelingAgent:
         async def submit_open_scad_source(
             params: SubmitOpenScadSourceParams,
         ) -> ToolResult:
-            expected_mode = (
-                "modify"
+            allowed_modes = (
+                {"create", "modify"}
+                if state.base_artifact is not None
+                and state.handoff.selected_source is None
+                else {"modify"}
                 if state.base_artifact is not None
                 or state.handoff.decision == ModelDecision.MODIFY
-                else "create"
+                else {"create"}
             )
-            if params.mode != expected_mode:
+            if params.mode not in allowed_modes:
                 return ToolResult(
                     result_type="rejected",
-                    text_result_for_llm=f"Expected mode '{expected_mode}'.",
+                    text_result_for_llm=(
+                        f"Expected mode: {', '.join(sorted(allowed_modes))}."
+                    ),
                 )
             if params.part_id not in {None, "base_model"}:
                 return ToolResult(
