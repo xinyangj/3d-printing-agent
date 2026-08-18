@@ -15,6 +15,8 @@ from printing_agent.domain import (
     PrinterCapabilitySummary,
     RevisionMode,
     RevisionRequest,
+    RevisionVerification,
+    RevisionVerificationCheck,
     SearchRound,
     WorkflowState,
     WorkKind,
@@ -171,6 +173,122 @@ async def test_workflow_archive_and_restore_preserve_state(
     ]
     with pytest.raises(ConflictError, match="not archived"):
         await repository.restore_workflow(workflow.id)
+
+
+async def test_failed_revision_rolls_back_active_artifact_and_handoff(
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Create a car", "simulator")
+    pending = await repository.lease_next()
+    assert pending is not None
+    await repository.complete_work(pending.id)
+    for state in (
+        WorkflowState.PLANNING,
+        WorkflowState.DISCOVERING,
+        WorkflowState.SELECTING,
+        WorkflowState.HANDOFF_READY,
+        WorkflowState.GENERATING,
+        WorkflowState.RENDERING,
+        WorkflowState.VALIDATING,
+    ):
+        await repository.transition(workflow.id, state)
+    await repository.patch_workflow(
+        workflow.id,
+        active_artifact_version=2,
+        active_handoff_version=2,
+        modeling_session_id="candidate-session",
+    )
+    verification = RevisionVerification(
+        workflow_id=workflow.id,
+        handoff_version=2,
+        base_artifact_version=1,
+        candidate_artifact_version=2,
+        feedback="Make the body red and wheels blue",
+        verdict="failed",
+        repairable=False,
+        checks=[
+            RevisionVerificationCheck(
+                id="material_representation",
+                passed=False,
+                repairable=False,
+                message="Colors are absent from packaged materials",
+            )
+        ],
+        rationale="The requested colors were not packaged.",
+    )
+
+    await repository.rollback_failed_revision(
+        verification,
+        restore_handoff_version=1,
+        restore_state=WorkflowState.APPROVED,
+        expected_handoff_version=2,
+        expected_active_artifact_version=2,
+    )
+
+    restored = await repository.get_workflow(workflow.id)
+    failure = await repository.get_active_revision_failure(workflow.id)
+    assert restored.state == WorkflowState.APPROVED
+    assert restored.active_artifact_version == 1
+    assert restored.active_handoff_version == 1
+    assert restored.modeling_session_id is None
+    assert failure == verification
+    assert (await repository.list_events(workflow.id))[-1].kind == (
+        "revision.verification_failed"
+    )
+
+
+async def test_revision_rollback_does_not_resurrect_cancelled_workflow(
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Create a car", "simulator")
+    pending = await repository.lease_next()
+    assert pending is not None
+    await repository.complete_work(pending.id)
+    for state in (
+        WorkflowState.PLANNING,
+        WorkflowState.DISCOVERING,
+        WorkflowState.SELECTING,
+        WorkflowState.HANDOFF_READY,
+        WorkflowState.GENERATING,
+        WorkflowState.RENDERING,
+        WorkflowState.VALIDATING,
+    ):
+        await repository.transition(workflow.id, state)
+    await repository.patch_workflow(
+        workflow.id,
+        active_artifact_version=1,
+        active_handoff_version=2,
+    )
+    await repository.transition(workflow.id, WorkflowState.CANCELLED)
+    verification = RevisionVerification(
+        workflow_id=workflow.id,
+        handoff_version=2,
+        base_artifact_version=1,
+        candidate_artifact_version=2,
+        feedback="Change the car",
+        verdict="failed",
+        repairable=False,
+        checks=[
+            RevisionVerificationCheck(
+                id="semantic_intent",
+                passed=False,
+                repairable=False,
+                message="Revision failed",
+            )
+        ],
+        rationale="Revision failed.",
+    )
+
+    with pytest.raises(ConflictError, match="Workflow changed"):
+        await repository.rollback_failed_revision(
+            verification,
+            restore_handoff_version=1,
+            restore_state=WorkflowState.AWAITING_APPROVAL,
+            expected_handoff_version=2,
+            expected_active_artifact_version=1,
+        )
+
+    assert (await repository.get_workflow(workflow.id)).state == WorkflowState.CANCELLED
 
 
 async def test_active_workflow_cannot_be_archived(repository: WorkflowRepository) -> None:

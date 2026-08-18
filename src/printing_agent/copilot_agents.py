@@ -95,6 +95,7 @@ class _ModelingToolState:
     failures: list[str] = field(default_factory=list)
     budget_exhausted: str | None = None
     fatal_error: Exception | None = None
+    defer_ready: bool = False
 
 
 def _role_permission_handler(allowed: set[str]):
@@ -689,6 +690,8 @@ class CopilotModelingAgent:
         current_source: str,
         previous_handoff: ModelingHandoff,
         allowed_part_ids: list[str] | None = None,
+        *,
+        recorded_feedback: str | None = None,
     ) -> ModelArtifact:
         workflow = await self.repository.get_workflow(handoff.workflow_id)
         multipart = artifact.project is not None and len(artifact.project.parts) > 1
@@ -696,7 +699,8 @@ class CopilotModelingAgent:
             handoff=handoff,
             allowed_part_ids=allowed_part_ids,
             base_artifact=artifact,
-            feedback=feedback,
+            feedback=recorded_feedback or feedback,
+            defer_ready=True,
         )
         await self.runtime.run(
             workflow,
@@ -795,6 +799,7 @@ class CopilotModelingAgent:
                     feedback=state.feedback or "Multipart revision",
                     rationale=params.rationale,
                     allowed_part_ids=state.allowed_part_ids,
+                    defer_ready=state.defer_ready,
                 )
                 return ToolResult(
                     text_result_for_llm=(
@@ -869,6 +874,7 @@ class CopilotModelingAgent:
                 state.artifact = await self.pipeline.adopt_source(
                     state.handoff,
                     params.source_code,
+                    defer_ready=state.defer_ready,
                 )
                 return ToolResult(
                     text_result_for_llm=(

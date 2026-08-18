@@ -15,6 +15,7 @@ from printing_agent.modeling import (
 )
 from printing_agent.printers import PrinterRegistry, SimulatedPrinterAdapter
 from printing_agent.repositories import WorkflowRepository
+from printing_agent.verification import CopilotRevisionVerifier, RevisionVerifier
 from printing_agent.worker import DurableWorker
 
 
@@ -46,6 +47,7 @@ async def build_container(settings: Settings | None = None) -> Container:
     )
     discovery = CopilotDiscoveryAgent(settings, repository, catalog)
     modeling = CopilotModelingAgent(settings, repository, model_pipeline)
+    revision_verifier = RevisionVerifier(CopilotRevisionVerifier(settings))
     printers = PrinterRegistry()
     printers.register(SimulatedPrinterAdapter(settings.simulator_spool_dir))
     application = PrintingApplication(
@@ -58,6 +60,7 @@ async def build_container(settings: Settings | None = None) -> Container:
         TrimeshSelectedSourceInspector(mesh_inspector),
         model_pipeline,
         printers,
+        revision_verifier,
     )
     worker = DurableWorker(repository, application)
     return Container(

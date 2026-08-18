@@ -38,6 +38,8 @@ from printing_agent.domain import (
     PrintSettings,
     RevisionMode,
     RevisionRequest,
+    RevisionVerification,
+    RevisionVerificationCheck,
     SelectedCandidateFile,
     SelectedFileRole,
     SelectedSourceSummary,
@@ -487,8 +489,74 @@ async def test_source_is_adopted_only_after_mesh_validation(
     assert revised.state == WorkflowState.REVISION_REQUESTED
     assert revision_work is not None and revision_work.kind == WorkKind.PREPARE
     await repository.complete_work(revision_work.id)
-    with pytest.raises(NotFoundError):
-        await repository.get_approval(copied.id)
+    assert (await repository.get_approval(copied.id)).artifact_version == 1
+
+    class FailedRevisionModeling:
+        async def revise(self, handoff, base_artifact, *args):
+            del args
+            await repository.save_source_attempt(
+                handoff.workflow_id,
+                handoff.version,
+                1,
+                "adopted",
+                "d" * 64,
+            )
+            await repository.transition(handoff.workflow_id, WorkflowState.RENDERING)
+            await repository.transition(handoff.workflow_id, WorkflowState.VALIDATING)
+            candidate = base_artifact.model_copy(
+                update={
+                    "version": 2,
+                    "manifest_digest": "d" * 64,
+                }
+            )
+            await repository.save_artifact(candidate, activate=False)
+            return candidate
+
+    class FailedRevisionVerifier:
+        async def verify(self, **kwargs):
+            assert (
+                await repository.get_workflow(kwargs["workflow_id"])
+            ).active_artifact_version == 1
+            return RevisionVerification(
+                workflow_id=kwargs["workflow_id"],
+                handoff_version=kwargs["handoff_version"],
+                base_artifact_version=kwargs["base"].version,
+                candidate_artifact_version=kwargs["candidate"].version,
+                feedback=kwargs["feedback"],
+                verdict="failed",
+                repairable=False,
+                checks=[
+                    RevisionVerificationCheck(
+                        id="semantic_intent",
+                        passed=False,
+                        repairable=False,
+                        message="Requested change is absent from packaged outputs",
+                    )
+                ],
+                rationale="The edit was not represented.",
+            )
+
+    rolled_back = await PrintingApplication._refine_current(  # type: ignore[arg-type]
+        SimpleNamespace(
+            repository=repository,
+            modeling=FailedRevisionModeling(),
+            revision_verifier=FailedRevisionVerifier(),
+            settings=settings,
+        ),
+        copied.id,
+        "Make the top rounder",
+        None,
+        1,
+        1,
+        WorkflowState.APPROVED,
+    )
+    restored_copy = await repository.get_workflow(copied.id)
+    assert rolled_back.version == 1
+    assert restored_copy.state == WorkflowState.APPROVED
+    assert restored_copy.active_artifact_version == 1
+    assert restored_copy.active_handoff_version == 1
+    assert (await repository.get_approval(copied.id)).artifact_version == 1
+    assert (await repository.get_active_revision_failure(copied.id)) is not None
 
     await repository.approve_artifact(
         ArtifactApproval(

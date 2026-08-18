@@ -97,10 +97,29 @@ type PrintJob = {
   message: string | null
 }
 
+type RevisionVerification = {
+  id: string
+  base_artifact_version: number
+  candidate_artifact_version: number
+  feedback: string
+  verdict: 'passed' | 'failed'
+  repairable: boolean
+  rationale: string
+  checks: Array<{
+    id: string
+    passed: boolean
+    message: string
+    evidence: Record<string, unknown>
+  }>
+  created_at: string
+}
+
 type WorkflowResponse = {
   workflow: Workflow
   artifact: Artifact | null
   job: PrintJob | null
+  revision_failure: RevisionVerification | null
+  revision_verification: RevisionVerification | null
 }
 
 type Printer = {
@@ -264,6 +283,9 @@ function useWorkflowEvents(workflowId: string | null) {
       'model.repair_requested',
       'artifact.ready',
       'revision.requested',
+      'revision.verification_repair_requested',
+      'revision.verification_passed',
+      'revision.verification_failed',
       'artifact.approved',
       'print.submitting',
       'print.queued',
@@ -628,7 +650,7 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
         <div className="empty-dashboard">No models match this lifecycle filter.</div>
       )}
       <section className="model-grid">
-        {items.map(({ workflow, artifact, job }) => {
+        {items.map(({ workflow, artifact, job, revision_failure }) => {
           const modelUrl = artifact
             ? artifactPreviewUrl(workflow.id, artifact)
             : null
@@ -653,6 +675,11 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
                       {formatState(workflow.state)}
                     </span>
                     {workflow.archived_at && <span className="archive-pill">Archived</span>}
+                    {revision_failure && (
+                      <span className="revision-failed-pill">
+                        Edit failed · v{revision_failure.base_artifact_version} restored
+                      </span>
+                    )}
                   </div>
                   <time>{new Date(workflow.updated_at).toLocaleString()}</time>
                 </div>
@@ -772,6 +799,8 @@ function WorkflowPanel({
   const data = workflowQuery.data
   const artifact = data?.artifact
   const workflow = data?.workflow
+  const revisionFailure = data?.revision_failure
+  const revisionVerification = data?.revision_verification
   useEffect(() => {
     const partIds = new Set(artifact?.project?.parts.map((part) => part.id) ?? [])
     setScopedPartIds((current) => current.filter((partId) => partIds.has(partId)))
@@ -931,6 +960,25 @@ function WorkflowPanel({
         </section>
       )}
 
+      {revisionFailure && (
+        <section className="revision-failure-notice">
+          <div>
+            <strong>
+              Latest edit was not applied · model v{revisionFailure.base_artifact_version}{' '}
+              restored
+            </strong>
+            <p>{revisionFailure.feedback}</p>
+          </div>
+          <ul>
+            {revisionFailure.checks
+              .filter((check) => !check.passed)
+              .map((check) => (
+                <li key={check.id}>{check.message}</li>
+              ))}
+          </ul>
+        </section>
+      )}
+
       {!canInspect && (
         <section className="progress-grid">
           <div className="progress-card">
@@ -1057,6 +1105,13 @@ function WorkflowPanel({
                           Clear scope
                         </button>
                       )}
+                      {revisionVerification?.verdict === 'passed' &&
+                        revisionVerification.candidate_artifact_version === artifact.version && (
+                          <div className="panel-section revision-summary">
+                            <span className="section-label">Verified revision</span>
+                            <strong>{revisionVerification.rationale}</strong>
+                          </div>
+                        )}
                     </div>
                   )}
                   <div className="part-list">

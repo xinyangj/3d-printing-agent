@@ -131,6 +131,12 @@ def create_app(container: Container | None = None) -> FastAPI:
             else None
         )
         job = await container.repository.get_latest_job(workflow.id)
+        revision_failure = await container.repository.get_active_revision_failure(
+            workflow.id
+        )
+        revision_verification = (
+            await container.repository.get_latest_revision_verification(workflow.id)
+        )
         artifact_payload = None
         if artifact is not None:
             artifact_payload = artifact.model_dump(
@@ -177,6 +183,16 @@ def create_app(container: Container | None = None) -> FastAPI:
             "workflow": workflow.model_dump(mode="json"),
             "artifact": artifact_payload,
             "job": job.model_dump(mode="json") if job else None,
+            "revision_failure": (
+                revision_failure.model_dump(mode="json")
+                if revision_failure is not None
+                else None
+            ),
+            "revision_verification": (
+                revision_verification.model_dump(mode="json")
+                if revision_verification is not None
+                else None
+            ),
         }
 
     @app.get("/api/v1/health")

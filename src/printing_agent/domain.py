@@ -455,6 +455,38 @@ class ArtifactRevision(FrozenModel):
         return self
 
 
+class RevisionVerificationCheck(FrozenModel):
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    passed: bool
+    mandatory: bool = True
+    repairable: bool = True
+    message: str = Field(min_length=1, max_length=2_000)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class RevisionVerification(FrozenModel):
+    id: str = Field(default_factory=new_id)
+    workflow_id: str
+    handoff_version: int = Field(ge=1)
+    base_artifact_version: int = Field(ge=1)
+    candidate_artifact_version: int = Field(ge=1)
+    feedback: str = Field(min_length=1, max_length=10_000)
+    verdict: Literal["passed", "failed"]
+    repairable: bool
+    checks: list[RevisionVerificationCheck] = Field(min_length=1, max_length=100)
+    rationale: str = Field(min_length=1, max_length=4_000)
+    created_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_verdict(self) -> RevisionVerification:
+        mandatory_failed = any(not check.passed and check.mandatory for check in self.checks)
+        if mandatory_failed and self.verdict != "failed":
+            raise ValueError("Mandatory failed checks require a failed verification verdict")
+        if self.verdict == "passed" and not all(check.passed for check in self.checks):
+            raise ValueError("Passing verification cannot contain failed checks")
+        return self
+
+
 class ModelArtifact(FrozenModel):
     schema_version: Literal["1", "2"] = "1"
     workflow_id: str
@@ -516,6 +548,9 @@ class RevisionRequest(FrozenModel):
     mode: RevisionMode
     feedback: str = Field(min_length=1, max_length=10_000)
     allowed_part_ids: list[str] | None = Field(default=None, min_length=1, max_length=100)
+    base_artifact_version: int | None = Field(default=None, ge=1)
+    base_handoff_version: int | None = Field(default=None, ge=1)
+    base_state: WorkflowState | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")

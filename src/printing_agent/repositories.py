@@ -19,6 +19,7 @@ from printing_agent.domain import (
     PrintWorkflow,
     RevisionMode,
     RevisionRequest,
+    RevisionVerification,
     SearchRound,
     SelectedSourceInspection,
     WorkflowEvent,
@@ -159,6 +160,27 @@ CREATE TABLE IF NOT EXISTS revision_requests (
     feedback TEXT NOT NULL,
     part_id TEXT,
     allowed_part_ids_json TEXT,
+    base_artifact_version INTEGER,
+    base_handoff_version INTEGER,
+    base_state TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS revision_verifications (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+    handoff_version INTEGER NOT NULL,
+    base_artifact_version INTEGER NOT NULL,
+    candidate_artifact_version INTEGER NOT NULL,
+    verdict TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS active_revision_failures (
+    workflow_id TEXT PRIMARY KEY REFERENCES workflows(id),
+    verification_id TEXT NOT NULL REFERENCES revision_verifications(id),
+    payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 
@@ -230,6 +252,16 @@ class WorkflowRepository:
                 await db.execute(
                     "ALTER TABLE revision_requests ADD COLUMN allowed_part_ids_json TEXT"
                 )
+            if "base_artifact_version" not in revision_columns:
+                await db.execute(
+                    "ALTER TABLE revision_requests ADD COLUMN base_artifact_version INTEGER"
+                )
+            if "base_handoff_version" not in revision_columns:
+                await db.execute(
+                    "ALTER TABLE revision_requests ADD COLUMN base_handoff_version INTEGER"
+                )
+            if "base_state" not in revision_columns:
+                await db.execute("ALTER TABLE revision_requests ADD COLUMN base_state TEXT")
             await db.commit()
 
     async def _connect(self) -> aiosqlite.Connection:
@@ -871,7 +903,8 @@ class WorkflowRepository:
             cursor = await db.execute(
                 """
                 SELECT COUNT(*) AS count FROM source_attempts
-                WHERE workflow_id = ? AND handoff_version = ? AND status = 'rejected'
+                WHERE workflow_id = ? AND handoff_version = ?
+                  AND status IN ('rejected', 'verification_rejected')
                 """,
                 (workflow_id, handoff_version),
             )
@@ -882,7 +915,12 @@ class WorkflowRepository:
     async def next_artifact_version(self, workflow_id: str) -> int:
         return await self._next_version("artifacts", workflow_id)
 
-    async def save_artifact(self, artifact: ModelArtifact) -> None:
+    async def save_artifact(
+        self,
+        artifact: ModelArtifact,
+        *,
+        activate: bool = True,
+    ) -> None:
         db = await self._connect()
         try:
             await db.execute("BEGIN IMMEDIATE")
@@ -908,19 +946,33 @@ class WorkflowRepository:
                     artifact.created_at.isoformat(),
                 ),
             )
-            cursor = await db.execute(
-                """
-                UPDATE workflows
-                SET active_artifact_version = ?, version = version + 1, updated_at = ?
-                WHERE id = ? AND version = ?
-                """,
-                (
-                    artifact.version,
-                    utc_now().isoformat(),
-                    artifact.workflow_id,
-                    workflow_version,
-                ),
-            )
+            if activate:
+                cursor = await db.execute(
+                    """
+                    UPDATE workflows
+                    SET active_artifact_version = ?, version = version + 1, updated_at = ?
+                    WHERE id = ? AND version = ?
+                    """,
+                    (
+                        artifact.version,
+                        utc_now().isoformat(),
+                        artifact.workflow_id,
+                        workflow_version,
+                    ),
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    UPDATE workflows
+                    SET version = version + 1, updated_at = ?
+                    WHERE id = ? AND version = ?
+                    """,
+                    (
+                        utc_now().isoformat(),
+                        artifact.workflow_id,
+                        workflow_version,
+                    ),
+                )
             if cursor.rowcount != 1:
                 raise ConflictError("Workflow was modified while saving the artifact")
             await db.commit()
@@ -933,6 +985,374 @@ class WorkflowRepository:
     async def get_artifact(self, workflow_id: str, version: int) -> ModelArtifact:
         payload = await self._get_composite_payload("artifacts", workflow_id, version)
         return ModelArtifact.model_validate_json(payload)
+
+    async def save_revision_verification(
+        self,
+        verification: RevisionVerification,
+        *,
+        active_failure: bool = False,
+    ) -> None:
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            await self._insert_revision_verification(db, verification)
+            if active_failure:
+                await self._set_active_revision_failure(db, verification)
+            elif verification.verdict == "passed":
+                await db.execute(
+                    "DELETE FROM active_revision_failures WHERE workflow_id = ?",
+                    (verification.workflow_id,),
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def get_active_revision_failure(
+        self,
+        workflow_id: str,
+    ) -> RevisionVerification | None:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT payload_json FROM active_revision_failures
+                WHERE workflow_id = ?
+                """,
+                (workflow_id,),
+            )
+            row = await cursor.fetchone()
+            return (
+                RevisionVerification.model_validate_json(row["payload_json"])
+                if row is not None
+                else None
+            )
+        finally:
+            await db.close()
+
+    async def get_latest_revision_verification(
+        self,
+        workflow_id: str,
+    ) -> RevisionVerification | None:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT payload_json FROM revision_verifications
+                WHERE workflow_id = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (workflow_id,),
+            )
+            row = await cursor.fetchone()
+            return (
+                RevisionVerification.model_validate_json(row["payload_json"])
+                if row is not None
+                else None
+            )
+        finally:
+            await db.close()
+
+    async def prepare_revision_verification_retry(
+        self,
+        verification: RevisionVerification,
+    ) -> None:
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT * FROM workflows WHERE id = ?",
+                (verification.workflow_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"Workflow '{verification.workflow_id}' was not found"
+                )
+            current = self._workflow_from_row(row)
+            assert_transition(current.state, WorkflowState.GENERATING)
+            if current.active_handoff_version != verification.handoff_version:
+                raise ConflictError("Active handoff changed before verification retry")
+            if current.active_artifact_version != verification.base_artifact_version:
+                raise ConflictError("Active artifact changed before verification retry")
+            await self._insert_revision_verification(db, verification)
+            now = utc_now()
+            cursor = await db.execute(
+                """
+                UPDATE workflows
+                SET state = ?, active_artifact_version = ?, modeling_session_id = NULL,
+                    version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    WorkflowState.GENERATING.value,
+                    verification.base_artifact_version,
+                    now.isoformat(),
+                    verification.workflow_id,
+                    current.version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed during verification retry")
+            await self._insert_event(
+                db,
+                verification.workflow_id,
+                "revision.verification_repair_requested",
+                WorkflowState.GENERATING,
+                {
+                    "verification_id": verification.id,
+                    "candidate_artifact_version": verification.candidate_artifact_version,
+                    "reasons": [
+                        check.message for check in verification.checks if not check.passed
+                    ],
+                },
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def complete_verified_revision(
+        self,
+        verification: RevisionVerification,
+    ) -> None:
+        if verification.verdict != "passed":
+            raise ValueError("Only passing verification can complete a revision")
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT * FROM workflows WHERE id = ?",
+                (verification.workflow_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"Workflow '{verification.workflow_id}' was not found"
+                )
+            current = self._workflow_from_row(row)
+            assert_transition(current.state, WorkflowState.AWAITING_APPROVAL)
+            if current.active_handoff_version != verification.handoff_version:
+                raise ConflictError(
+                    "Active handoff changed before verification completion"
+                )
+            if current.active_artifact_version != verification.base_artifact_version:
+                raise ConflictError(
+                    "Active artifact changed before verification completion"
+                )
+            await self._insert_revision_verification(db, verification)
+            await db.execute(
+                "DELETE FROM active_revision_failures WHERE workflow_id = ?",
+                (verification.workflow_id,),
+            )
+            await db.execute(
+                "DELETE FROM approvals WHERE workflow_id = ?",
+                (verification.workflow_id,),
+            )
+            now = utc_now()
+            cursor = await db.execute(
+                """
+                UPDATE workflows
+                SET state = ?, active_artifact_version = ?,
+                    version = version + 1, updated_at = ?,
+                    failure_code = NULL, failure_message = NULL
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    WorkflowState.AWAITING_APPROVAL.value,
+                    verification.candidate_artifact_version,
+                    now.isoformat(),
+                    verification.workflow_id,
+                    current.version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed during verification completion")
+            await self._insert_event(
+                db,
+                verification.workflow_id,
+                "revision.verification_passed",
+                WorkflowState.AWAITING_APPROVAL,
+                {
+                    "verification_id": verification.id,
+                    "artifact_version": verification.candidate_artifact_version,
+                },
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def rollback_failed_revision(
+        self,
+        verification: RevisionVerification,
+        *,
+        restore_handoff_version: int | None,
+        restore_state: WorkflowState,
+        expected_handoff_version: int | None,
+        expected_active_artifact_version: int,
+    ) -> None:
+        if verification.verdict != "failed":
+            raise ValueError("Only failed verification can roll back a revision")
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT * FROM workflows WHERE id = ?",
+                (verification.workflow_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"Workflow '{verification.workflow_id}' was not found"
+                )
+            current = self._workflow_from_row(row)
+            if current.state not in {
+                WorkflowState.REVISION_REQUESTED,
+                WorkflowState.HANDOFF_READY,
+                WorkflowState.GENERATING,
+                WorkflowState.RENDERING,
+                WorkflowState.VALIDATING,
+            }:
+                raise ConflictError(
+                    "Workflow changed before failed revision could be rolled back"
+                )
+            if current.active_handoff_version != expected_handoff_version:
+                raise ConflictError(
+                    "Active handoff changed before failed revision rollback"
+                )
+            if current.active_artifact_version != expected_active_artifact_version:
+                raise ConflictError(
+                    "Active artifact changed before failed revision rollback"
+                )
+            await self._insert_revision_verification(db, verification)
+            await self._set_active_revision_failure(db, verification)
+            now = utc_now()
+            cursor = await db.execute(
+                """
+                UPDATE workflows
+                SET state = ?, active_artifact_version = ?,
+                    active_handoff_version = ?, modeling_session_id = NULL,
+                    version = version + 1, updated_at = ?,
+                    failure_code = NULL, failure_message = NULL
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    restore_state.value,
+                    verification.base_artifact_version,
+                    restore_handoff_version,
+                    now.isoformat(),
+                    verification.workflow_id,
+                    current.version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed during revision rollback")
+            await self._insert_event(
+                db,
+                verification.workflow_id,
+                "revision.verification_failed",
+                restore_state,
+                {
+                    "verification_id": verification.id,
+                    "failed_artifact_version": verification.candidate_artifact_version,
+                    "restored_artifact_version": verification.base_artifact_version,
+                    "reasons": [
+                        check.message for check in verification.checks if not check.passed
+                    ],
+                },
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def mark_latest_source_attempt_verification_rejected(
+        self,
+        workflow_id: str,
+        handoff_version: int,
+        diagnostics: str,
+    ) -> None:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                UPDATE source_attempts
+                SET status = 'verification_rejected', diagnostics = ?
+                WHERE workflow_id = ? AND handoff_version = ?
+                  AND attempt = (
+                    SELECT MAX(attempt) FROM source_attempts
+                    WHERE workflow_id = ? AND handoff_version = ?
+                  )
+                """,
+                (
+                    diagnostics,
+                    workflow_id,
+                    handoff_version,
+                    workflow_id,
+                    handoff_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("No source attempt is available for verification")
+            await db.commit()
+        finally:
+            await db.close()
+
+    @staticmethod
+    async def _insert_revision_verification(
+        db: aiosqlite.Connection,
+        verification: RevisionVerification,
+    ) -> None:
+        await db.execute(
+            """
+            INSERT INTO revision_verifications (
+                id, workflow_id, handoff_version, base_artifact_version,
+                candidate_artifact_version, verdict, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                verification.id,
+                verification.workflow_id,
+                verification.handoff_version,
+                verification.base_artifact_version,
+                verification.candidate_artifact_version,
+                verification.verdict,
+                verification.model_dump_json(),
+                verification.created_at.isoformat(),
+            ),
+        )
+
+    @staticmethod
+    async def _set_active_revision_failure(
+        db: aiosqlite.Connection,
+        verification: RevisionVerification,
+    ) -> None:
+        await db.execute(
+            """
+            INSERT INTO active_revision_failures (
+                workflow_id, verification_id, payload_json, created_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(workflow_id) DO UPDATE SET
+                verification_id = excluded.verification_id,
+                payload_json = excluded.payload_json,
+                created_at = excluded.created_at
+            """,
+            (
+                verification.workflow_id,
+                verification.id,
+                verification.model_dump_json(),
+                verification.created_at.isoformat(),
+            ),
+        )
 
     async def approve_artifact(self, approval: ArtifactApproval) -> None:
         db = await self._connect()
@@ -1120,8 +1540,9 @@ class WorkflowRepository:
             await db.execute(
                 """
                 INSERT INTO revision_requests (
-                    workflow_id, mode, feedback, part_id, allowed_part_ids_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    workflow_id, mode, feedback, part_id, allowed_part_ids_json,
+                    base_artifact_version, base_handoff_version, base_state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     revision.workflow_id,
@@ -1133,10 +1554,21 @@ class WorkflowRepository:
                         if revision.allowed_part_ids is not None
                         else None
                     ),
+                    revision.base_artifact_version,
+                    revision.base_handoff_version,
+                    revision.base_state.value if revision.base_state is not None else None,
                     revision.created_at.isoformat(),
                 ),
             )
-            await db.execute("DELETE FROM approvals WHERE workflow_id = ?", (revision.workflow_id,))
+            await db.execute(
+                "DELETE FROM active_revision_failures WHERE workflow_id = ?",
+                (revision.workflow_id,),
+            )
+            if revision.mode == RevisionMode.SEARCH_NEW_BASE:
+                await db.execute(
+                    "DELETE FROM approvals WHERE workflow_id = ?",
+                    (revision.workflow_id,),
+                )
             await db.commit()
         except Exception:
             await db.rollback()
@@ -1150,7 +1582,11 @@ class WorkflowRepository:
         try:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
-                "SELECT state, version, archived_at FROM workflows WHERE id = ?",
+                """
+                SELECT state, version, archived_at, active_artifact_version,
+                       active_handoff_version
+                FROM workflows WHERE id = ?
+                """,
                 (revision.workflow_id,),
             )
             workflow = await cursor.fetchone()
@@ -1169,8 +1605,9 @@ class WorkflowRepository:
             await db.execute(
                 """
                 INSERT INTO revision_requests (
-                    workflow_id, mode, feedback, part_id, allowed_part_ids_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    workflow_id, mode, feedback, part_id, allowed_part_ids_json,
+                    base_artifact_version, base_handoff_version, base_state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     revision.workflow_id,
@@ -1182,13 +1619,21 @@ class WorkflowRepository:
                         if revision.allowed_part_ids is not None
                         else None
                     ),
+                    workflow["active_artifact_version"],
+                    workflow["active_handoff_version"],
+                    current_state.value,
                     revision.created_at.isoformat(),
                 ),
             )
             await db.execute(
-                "DELETE FROM approvals WHERE workflow_id = ?",
+                "DELETE FROM active_revision_failures WHERE workflow_id = ?",
                 (revision.workflow_id,),
             )
+            if revision.mode == RevisionMode.SEARCH_NEW_BASE:
+                await db.execute(
+                    "DELETE FROM approvals WHERE workflow_id = ?",
+                    (revision.workflow_id,),
+                )
             now = utc_now()
             cursor = await db.execute(
                 """
@@ -1214,6 +1659,9 @@ class WorkflowRepository:
                     "mode": revision.mode.value,
                     "feedback": revision.feedback,
                     "allowed_part_ids": revision.allowed_part_ids,
+                    "base_artifact_version": workflow["active_artifact_version"],
+                    "base_handoff_version": workflow["active_handoff_version"],
+                    "base_state": current_state.value,
                 },
             )
             await self._insert_work_item(db, item)
@@ -1347,6 +1795,13 @@ class WorkflowRepository:
                 mode=RevisionMode(row["mode"]),
                 feedback=row["feedback"],
                 allowed_part_ids=allowed_part_ids,
+                base_artifact_version=row["base_artifact_version"],
+                base_handoff_version=row["base_handoff_version"],
+                base_state=(
+                    WorkflowState(row["base_state"])
+                    if row["base_state"] is not None
+                    else None
+                ),
                 created_at=row["created_at"],
             )
         finally:

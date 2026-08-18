@@ -742,6 +742,50 @@ select:focus {
   opacity: 1;
 }
 
+.revision-failed-pill {
+  background: #f7ded8;
+  border: 1px solid #b94b3e;
+  color: #8d3027;
+  font-family: var(--mono);
+  font-size: 9px;
+  padding: 6px 8px;
+  text-transform: uppercase;
+}
+
+.revision-failure-notice {
+  align-items: start;
+  background: #fff1ed;
+  border: 1px solid #c85d4e;
+  color: #7f2e25;
+  display: grid;
+  gap: 20px;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(280px, 1.2fr);
+  margin-bottom: 18px;
+  padding: 20px 24px;
+}
+
+.revision-failure-notice strong {
+  color: #74261f;
+  font-family: var(--display);
+  font-size: 20px;
+}
+
+.revision-failure-notice p {
+  color: #8d463c;
+  font-size: 12px;
+  margin: 8px 0 0;
+}
+
+.revision-failure-notice ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.revision-failure-notice li {
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .part-scope-check {
   align-items: center;
   border: 1px solid var(--line-strong);

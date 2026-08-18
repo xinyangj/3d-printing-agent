@@ -53,6 +53,7 @@ _LITERAL_IMPORT = re.compile(
     r'\bimport\s*\(\s*(?:file\s*=\s*)?"(?P<path>[^"]+)"',
     re.IGNORECASE,
 )
+_BASE_MODEL_MODULE = re.compile(r"^\s*module\s+base_model\s*\(\s*\)\s*\{")
 
 
 def _without_comments(source: str) -> str:
@@ -95,6 +96,67 @@ def _without_comments(source: str) -> str:
     if in_string:
         raise PolicyViolationError("OpenSCAD contains an unterminated string")
     return "".join(output)
+
+
+def unwrap_base_model_source(source: str) -> str:
+    current = source.strip()
+    while True:
+        match = _BASE_MODEL_MODULE.match(current)
+        if match is None:
+            return current
+        open_brace = current.find("{", match.start(), match.end())
+        depth = 0
+        in_string = False
+        line_comment = False
+        block_comment = False
+        close_brace = None
+        index = open_brace
+        while index < len(current):
+            character = current[index]
+            following = current[index + 1] if index + 1 < len(current) else ""
+            if line_comment:
+                if character in "\r\n":
+                    line_comment = False
+                index += 1
+                continue
+            if block_comment:
+                if character == "*" and following == "/":
+                    block_comment = False
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if in_string:
+                if character == "\\" and following:
+                    index += 2
+                    continue
+                if character == '"':
+                    in_string = False
+                index += 1
+                continue
+            if character == "/" and following == "/":
+                line_comment = True
+                index += 2
+                continue
+            if character == "/" and following == "*":
+                block_comment = True
+                index += 2
+                continue
+            if character == '"':
+                in_string = True
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    close_brace = index
+                    break
+            index += 1
+        if close_brace is None:
+            return current
+        if current[close_brace + 1 :].strip() != "base_model();":
+            return current
+        current = current[open_brace + 1 : close_brace].strip()
 
 
 class OpenScadSourcePolicy:
@@ -319,6 +381,8 @@ class ModelPipeline:
         self,
         handoff: ModelingHandoff,
         source_code: str,
+        *,
+        defer_ready: bool = False,
     ) -> ModelArtifact:
         attempts = await self.repository.count_source_attempts(
             handoff.workflow_id,
@@ -433,7 +497,7 @@ class ModelPipeline:
                 files=files,
                 provenance=provenance,
             )
-            await self.repository.save_artifact(artifact)
+            await self.repository.save_artifact(artifact, activate=not defer_ready)
             await self.repository.save_source_attempt(
                 handoff.workflow_id,
                 handoff.version,
@@ -441,15 +505,16 @@ class ModelPipeline:
                 "adopted",
                 source_digest,
             )
-            await self.repository.transition(
-                handoff.workflow_id,
-                WorkflowState.AWAITING_APPROVAL,
-                event_kind="artifact.ready",
-                payload={
-                    "artifact_version": version,
-                    "manifest_digest": manifest_digest,
-                },
-            )
+            if not defer_ready:
+                await self.repository.transition(
+                    handoff.workflow_id,
+                    WorkflowState.AWAITING_APPROVAL,
+                    event_kind="artifact.ready",
+                    payload={
+                        "artifact_version": version,
+                        "manifest_digest": manifest_digest,
+                    },
+                )
             return artifact
         except Exception as exc:
             candidate_failure = isinstance(
@@ -486,6 +551,7 @@ class ModelPipeline:
         feedback: str,
         rationale: str,
         allowed_part_ids: list[str] | None,
+        defer_ready: bool = False,
     ) -> ModelArtifact:
         if artifact.project is None or len(artifact.project.parts) < 2:
             raise ValidationError("Batch part revision requires a multipart artifact")
@@ -694,7 +760,10 @@ class ModelPipeline:
                 provenance=artifact.provenance,
                 revision=revision,
             )
-            await self.repository.save_artifact(revised_artifact)
+            await self.repository.save_artifact(
+                revised_artifact,
+                activate=not defer_ready,
+            )
             await self.repository.save_source_attempt(
                 handoff.workflow_id,
                 handoff.version,
@@ -702,18 +771,19 @@ class ModelPipeline:
                 "adopted",
                 source_digest,
             )
-            await self.repository.transition(
-                handoff.workflow_id,
-                WorkflowState.AWAITING_APPROVAL,
-                event_kind="artifact.multipart_revision_ready",
-                payload={
-                    "artifact_version": version,
-                    "affected_part_ids": revision_ids,
-                    "allowed_part_ids": allowed_part_ids,
-                    "rationale": rationale,
-                    "manifest_digest": revised_artifact.manifest_digest,
-                },
-            )
+            if not defer_ready:
+                await self.repository.transition(
+                    handoff.workflow_id,
+                    WorkflowState.AWAITING_APPROVAL,
+                    event_kind="artifact.multipart_revision_ready",
+                    payload={
+                        "artifact_version": version,
+                        "affected_part_ids": revision_ids,
+                        "allowed_part_ids": allowed_part_ids,
+                        "rationale": rationale,
+                        "manifest_digest": revised_artifact.manifest_digest,
+                    },
+                )
             return revised_artifact
         except Exception as exc:
             await self.repository.save_source_attempt(

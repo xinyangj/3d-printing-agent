@@ -21,6 +21,8 @@ from printing_agent.domain import (
     PrintWorkflow,
     RevisionMode,
     RevisionRequest,
+    RevisionVerification,
+    RevisionVerificationCheck,
     SelectedFileRole,
     SelectedSourceSummary,
     WorkflowState,
@@ -31,13 +33,20 @@ from printing_agent.errors import (
     BudgetExhaustedError,
     CandidateRejectedError,
     ConflictError,
+    ExternalServiceError,
     PolicyViolationError,
+    PrintingAgentError,
     ValidationError,
 )
-from printing_agent.modeling import ModelPipeline, TrimeshSelectedSourceInspector
+from printing_agent.modeling import (
+    ModelPipeline,
+    TrimeshSelectedSourceInspector,
+    unwrap_base_model_source,
+)
 from printing_agent.ports import PrinterAdapter
 from printing_agent.printers import PrinterRegistry
 from printing_agent.repositories import WorkflowRepository
+from printing_agent.verification import RevisionVerifier
 
 
 class PrintingApplication:
@@ -52,6 +61,7 @@ class PrintingApplication:
         source_inspector: TrimeshSelectedSourceInspector,
         model_pipeline: ModelPipeline,
         printers: PrinterRegistry,
+        revision_verifier: RevisionVerifier,
     ) -> None:
         self.settings = settings
         self.repository = repository
@@ -62,6 +72,7 @@ class PrintingApplication:
         self.source_inspector = source_inspector
         self.model_pipeline = model_pipeline
         self.printers = printers
+        self.revision_verifier = revision_verifier
 
     async def create_workflow(self, requirement: str, printer_name: str):
         self.printers.get(printer_name)
@@ -92,11 +103,29 @@ class PrintingApplication:
         elif workflow.state == WorkflowState.REVISION_REQUESTED:
             revision = await self.repository.get_latest_revision(workflow.id)
             if revision.mode == RevisionMode.REFINE_CURRENT:
-                return await self._refine_current(
-                    workflow.id,
-                    revision.feedback,
-                    revision.allowed_part_ids,
-                )
+                try:
+                    return await self._refine_current(
+                        workflow.id,
+                        revision.feedback,
+                        revision.allowed_part_ids,
+                        revision.base_artifact_version,
+                        revision.base_handoff_version,
+                        revision.base_state,
+                    )
+                except PrintingAgentError as exc:
+                    return await self._rollback_revision_request_failure(
+                        workflow.id,
+                        revision,
+                        exc,
+                    )
+                except Exception as exc:
+                    return await self._rollback_revision_request_failure(
+                        workflow.id,
+                        revision,
+                        ExternalServiceError(
+                            f"Unexpected revision failure: {str(exc)[-1_950:]}"
+                        ),
+                    )
             await self.repository.transition(
                 workflow.id,
                 WorkflowState.DISCOVERING,
@@ -180,6 +209,64 @@ class PrintingApplication:
                     exc,
                 )
                 continue
+
+    async def _rollback_revision_request_failure(
+        self,
+        workflow_id: str,
+        revision: RevisionRequest,
+        error: PrintingAgentError,
+    ) -> ModelArtifact:
+        workflow = await self.repository.get_workflow(workflow_id)
+        base_artifact_version = (
+            revision.base_artifact_version or workflow.active_artifact_version
+        )
+        if base_artifact_version is None:
+            raise error
+        base_artifact = await self.repository.get_artifact(
+            workflow_id,
+            base_artifact_version,
+        )
+        expected_handoff_version = revision.base_handoff_version
+        if expected_handoff_version is None:
+            raise error
+        candidate_version = max(
+            base_artifact_version,
+            (await self.repository.next_artifact_version(workflow_id)) - 1,
+        )
+        verification = RevisionVerification(
+            workflow_id=workflow_id,
+            handoff_version=expected_handoff_version
+            or revision.base_handoff_version
+            or 1,
+            base_artifact_version=base_artifact_version,
+            candidate_artifact_version=candidate_version,
+            feedback=revision.feedback,
+            verdict="failed",
+            repairable=False,
+            checks=[
+                RevisionVerificationCheck(
+                    id="revision_execution",
+                    passed=False,
+                    repairable=False,
+                    message=error.message[:2_000],
+                    evidence={"error_code": error.code},
+                )
+            ],
+            rationale=f"The revision could not be completed: {error.message}"[:4_000],
+        )
+        restore_state = (
+            WorkflowState.APPROVED
+            if revision.base_state == WorkflowState.APPROVED
+            else WorkflowState.AWAITING_APPROVAL
+        )
+        await self.repository.rollback_failed_revision(
+            verification,
+            restore_handoff_version=revision.base_handoff_version,
+            restore_state=restore_state,
+            expected_handoff_version=expected_handoff_version,
+            expected_active_artifact_version=base_artifact_version,
+        )
+        return base_artifact
 
     async def _adopt_single_candidate(
         self,
@@ -589,13 +676,22 @@ class PrintingApplication:
         workflow_id: str,
         feedback: str,
         allowed_part_ids: list[str] | None,
+        requested_base_artifact_version: int | None,
+        requested_base_handoff_version: int | None,
+        requested_base_state: WorkflowState | None,
     ) -> ModelArtifact:
         workflow = await self.repository.get_workflow(workflow_id)
-        if workflow.active_artifact_version is None:
+        base_artifact_version = (
+            requested_base_artifact_version or workflow.active_artifact_version
+        )
+        base_handoff_version = (
+            requested_base_handoff_version or workflow.active_handoff_version
+        )
+        if base_artifact_version is None:
             raise ConflictError("Workflow has no active artifact")
         artifact = await self.repository.get_artifact(
             workflow_id,
-            workflow.active_artifact_version,
+            base_artifact_version,
         )
         if artifact.project is not None and len(artifact.project.parts) > 1:
             part_ids = {part.id for part in artifact.project.parts}
@@ -653,17 +749,19 @@ class PrintingApplication:
                     raise ValidationError(
                         f"Unknown edit-scope parts: {', '.join(unknown)}"
                     )
-            if workflow.active_handoff_version is None:
+            if base_handoff_version is None:
                 raise ConflictError("Current artifact was not produced by a modeling handoff")
             old_handoff = await self.repository.get_handoff(
                 workflow_id,
-                workflow.active_handoff_version,
+                base_handoff_version,
             )
             if artifact.source_path is None or not artifact.source_path.is_file():
                 raise ConflictError(
                     "This artifact has no editable OpenSCAD source; search for a new base instead"
                 )
-            current_source = artifact.source_path.read_text(encoding="utf-8")
+            current_source = unwrap_base_model_source(
+                artifact.source_path.read_text(encoding="utf-8")
+            )
         version = await self.repository.next_handoff_version(workflow_id)
         handoff = old_handoff.model_copy(
             update={
@@ -694,14 +792,125 @@ class PrintingApplication:
             WorkflowState.GENERATING,
             event_kind="revision.modeling_started",
         )
-        return await self.modeling.revise(
-            handoff,
-            artifact,
-            feedback,
-            current_source,
-            old_handoff,
-            allowed_part_ids,
+        repair_feedback = feedback
+        restore_state = (
+            WorkflowState.APPROVED
+            if requested_base_state == WorkflowState.APPROVED
+            else WorkflowState.AWAITING_APPROVAL
         )
+
+        async def rollback_execution_failure(
+            error: PrintingAgentError,
+            candidate_version: int,
+        ) -> ModelArtifact:
+            verification = RevisionVerification(
+                workflow_id=workflow_id,
+                handoff_version=handoff.version,
+                base_artifact_version=artifact.version,
+                candidate_artifact_version=candidate_version,
+                feedback=feedback,
+                verdict="failed",
+                repairable=False,
+                checks=[
+                    RevisionVerificationCheck(
+                        id="revision_execution",
+                        passed=False,
+                        repairable=False,
+                        message=error.message[:2_000],
+                        evidence={"error_code": error.code},
+                    )
+                ],
+                rationale=f"The revision could not be completed: {error.message}"[
+                    :4_000
+                ],
+            )
+            await self.repository.rollback_failed_revision(
+                verification,
+                restore_handoff_version=base_handoff_version,
+                restore_state=restore_state,
+                expected_handoff_version=handoff.version,
+                expected_active_artifact_version=artifact.version,
+            )
+            return artifact
+
+        while True:
+            try:
+                candidate = await self.modeling.revise(
+                    handoff,
+                    artifact,
+                    repair_feedback,
+                    current_source,
+                    old_handoff,
+                    allowed_part_ids,
+                    recorded_feedback=feedback,
+                )
+            except PrintingAgentError as exc:
+                return await rollback_execution_failure(exc, artifact.version)
+            except Exception as exc:
+                return await rollback_execution_failure(
+                    ExternalServiceError(
+                        f"Unexpected modeling revision failure: {str(exc)[-1_940:]}"
+                    ),
+                    artifact.version,
+                )
+            try:
+                verification = await self.revision_verifier.verify(
+                    workflow_id=workflow_id,
+                    handoff_version=handoff.version,
+                    feedback=feedback,
+                    base=artifact,
+                    candidate=candidate,
+                    allowed_part_ids=allowed_part_ids,
+                )
+            except PrintingAgentError as exc:
+                return await rollback_execution_failure(exc, candidate.version)
+            except Exception as exc:
+                return await rollback_execution_failure(
+                    ExternalServiceError(
+                        f"Unexpected revision verifier failure: {str(exc)[-1_940:]}"
+                    ),
+                    candidate.version,
+                )
+            if verification.verdict == "passed":
+                await self.repository.complete_verified_revision(verification)
+                return candidate
+            diagnostics = json.dumps(
+                verification.model_dump(mode="json"),
+                sort_keys=True,
+            )[-8_000:]
+            await self.repository.mark_latest_source_attempt_verification_rejected(
+                workflow_id,
+                handoff.version,
+                diagnostics,
+            )
+            attempts = await self.repository.count_source_attempts(
+                workflow_id,
+                handoff.version,
+            )
+            if (
+                verification.repairable
+                and attempts < self.settings.generation_attempt_budget
+            ):
+                await self.repository.prepare_revision_verification_retry(verification)
+                failed_reasons = [
+                    check.message for check in verification.checks if not check.passed
+                ]
+                verifier_guidance = (
+                    "Independent verifier findings to correct:\n- "
+                    + "\n- ".join(failed_reasons)
+                )
+                repair_feedback = (
+                    f"{feedback[:7_000]}\n\n{verifier_guidance}"
+                )[:10_000]
+                continue
+            await self.repository.rollback_failed_revision(
+                verification,
+                restore_handoff_version=base_handoff_version,
+                restore_state=restore_state,
+                expected_handoff_version=handoff.version,
+                expected_active_artifact_version=artifact.version,
+            )
+            return artifact
 
     async def request_revision(
         self,
