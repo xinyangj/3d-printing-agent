@@ -521,18 +521,15 @@ class RevisionVerifier:
 
     @staticmethod
     def _mesh_signature(mesh: trimesh.Trimesh) -> str:
-        vertices = np.round(np.asarray(mesh.vertices), 6)
-        vertex_order = np.lexsort((vertices[:, 2], vertices[:, 1], vertices[:, 0]))
-        triangles = np.round(np.asarray(mesh.triangles), 6)
+        triangles = np.round(np.asarray(mesh.triangles), 4)
         centroids = triangles.mean(axis=1)
         edge_lengths = np.sort(
             np.linalg.norm(triangles - np.roll(triangles, -1, axis=1), axis=2),
             axis=1,
         )
-        descriptors = np.column_stack((centroids, edge_lengths))
+        descriptors = np.round(np.column_stack((centroids, edge_lengths)), 4)
         triangle_order = np.lexsort(tuple(descriptors[:, index] for index in range(5, -1, -1)))
         digest = hashlib.sha256()
-        digest.update(vertices[vertex_order].tobytes())
         digest.update(descriptors[triangle_order].tobytes())
         return digest.hexdigest()
 
