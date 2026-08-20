@@ -10,6 +10,9 @@ http://127.0.0.1:8080 {
 		__AUTH_USERNAME__ __AUTH_PASSWORD_HASH__
 	}
 
+	@cloud_credentials path /api/v1/cloud-credentials*
+	respond @cloud_credentials 404
+
 	reverse_proxy 127.0.0.1:8000
 
 	log {

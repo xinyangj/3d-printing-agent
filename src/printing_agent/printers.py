@@ -20,6 +20,7 @@ from printing_agent.domain import (
     utc_now,
 )
 from printing_agent.errors import ConflictError, NotFoundError, ValidationError
+from printing_agent.fabrication import PrinterProfileRevision
 
 
 class PrinterRegistry:
@@ -31,6 +32,9 @@ class PrinterRegistry:
         if name in self._adapters:
             raise ConflictError(f"Printer adapter '{name}' is already registered")
         self._adapters[name] = adapter
+
+    def upsert(self, adapter: object) -> None:
+        self._adapters[adapter.name] = adapter
 
     def get(self, name: str) -> object:
         try:
@@ -229,3 +233,68 @@ class SimulatedPrinterAdapter:
             encoding="utf-8",
         )
         temporary.replace(job_dir / "job.json")
+
+
+class ProfilePrinterAdapter:
+    def __init__(self, profile: PrinterProfileRevision) -> None:
+        self.profile = profile
+        self.name = profile.profile_id
+
+    async def capabilities(self) -> PrinterCapabilitySummary:
+        spec = self.profile.spec
+        return PrinterCapabilitySummary(
+            name=self.name,
+            build_volume=spec.build_volume,
+            accepted_formats=spec.accepted_source_formats,
+            supported_materials=spec.supported_material_families,
+            supports_multipart_3mf=spec.supports_multipart_3mf,
+            supports_color=spec.supports_color,
+            supports_material_assignments=spec.supports_material_assignments,
+            slices_locally=spec.slicer.driver_id != "simulator_passthrough",
+        )
+
+    async def validate(
+        self,
+        artifact: ModelArtifact,
+        settings: PrintSettings,
+    ) -> None:
+        capabilities = await self.capabilities()
+        if not artifact.mesh.dimensions.fits(capabilities.build_volume):
+            raise ValidationError(
+                f"Artifact does not fit {self.profile.spec.display_name} build volume"
+            )
+        if (
+            settings.material
+            and settings.material.casefold()
+            not in {
+                item.casefold() for item in capabilities.supported_materials
+            }
+        ):
+            raise ValidationError(
+                f"{self.profile.spec.display_name} profile does not support "
+                f"{settings.material}"
+            )
+
+    async def submit(
+        self,
+        workflow_id: str,
+        artifact: ModelArtifact,
+        settings: PrintSettings,
+        idempotency_key: str,
+    ) -> PrintJob:
+        del workflow_id, artifact, settings, idempotency_key
+        raise ConflictError(
+            "This slicing profile creates artifacts only and cannot submit printer jobs"
+        )
+
+    async def status(self, external_id: str) -> PrintJob:
+        del external_id
+        raise NotFoundError(
+            "Slice-only profiles do not create external printer jobs"
+        )
+
+    async def cancel(self, external_id: str) -> PrintJob:
+        del external_id
+        raise ConflictError(
+            "Cancel the print inside the external printer application"
+        )

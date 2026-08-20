@@ -47,6 +47,13 @@ class WorkflowState(StrEnum):
     AWAITING_APPROVAL = "awaiting_approval"
     REVISION_REQUESTED = "revision_requested"
     APPROVED = "approved"
+    SLICE_SETUP = "slice_setup"
+    AWAITING_MATERIAL_REVIEW = "awaiting_material_review"
+    SLICE_REQUESTED = "slice_requested"
+    SLICING = "slicing"
+    SLICE_VALIDATING = "slice_validating"
+    AWAITING_SLICE_REVIEW = "awaiting_slice_review"
+    SLICE_FAILED = "slice_failed"
     SUBMITTING = "submitting"
     QUEUED = "queued"
     PRINTING = "printing"
@@ -73,6 +80,7 @@ class PrintJobStatus(StrEnum):
 
 class WorkKind(StrEnum):
     PREPARE = "prepare"
+    SLICE = "slice"
     SUBMIT = "submit"
     REFRESH_PRINT = "refresh_print"
 
@@ -696,8 +704,45 @@ _ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
     },
     WorkflowState.APPROVED: {
         WorkflowState.REVISION_REQUESTED,
+        WorkflowState.SLICE_SETUP,
         WorkflowState.SUBMITTING,
         WorkflowState.PRINT_FAILED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.SLICE_SETUP: {
+        WorkflowState.AWAITING_MATERIAL_REVIEW,
+        WorkflowState.SLICE_FAILED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.AWAITING_MATERIAL_REVIEW: {
+        WorkflowState.SLICE_SETUP,
+        WorkflowState.SLICE_REQUESTED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.SLICE_REQUESTED: {
+        WorkflowState.SLICING,
+        WorkflowState.SLICE_FAILED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.SLICING: {
+        WorkflowState.SLICE_VALIDATING,
+        WorkflowState.SLICE_FAILED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.SLICE_VALIDATING: {
+        WorkflowState.AWAITING_SLICE_REVIEW,
+        WorkflowState.SLICE_FAILED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.AWAITING_SLICE_REVIEW: {
+        WorkflowState.SLICE_SETUP,
+        WorkflowState.SLICE_REQUESTED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.SLICE_FAILED: {
+        WorkflowState.SLICE_SETUP,
+        WorkflowState.SLICE_REQUESTED,
+        WorkflowState.REVISION_REQUESTED,
         WorkflowState.CANCELLED,
     },
     WorkflowState.SUBMITTING: {

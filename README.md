@@ -105,23 +105,11 @@ Set-Location ..
 
 Open <http://127.0.0.1:8000>. FastAPI serves `web/dist` when present.
 
-### Private LAN access
+### Remote access
 
-To make the WebUI reachable from other devices on a trusted Windows Private network,
-set the bind address in `.env`:
-
-```dotenv
-PRINTING_AGENT_API_HOST=0.0.0.0
-PRINTING_AGENT_API_PORT=8000
-```
-
-Restart the API, add an inbound TCP/8000 Windows Firewall rule limited to the Private
-profile, then open `http://<this-computer's-ip>:8000` from another device. The Windows
-installer performs both configuration steps when run with `-EnableLanAccess`.
-
-> [!WARNING]
-> Port 8000 has no application-level authentication. Do not allow this rule on Public
-> profiles or expose it directly to the internet.
+Keep FastAPI bound to `127.0.0.1`. Do not expose port 8000 to LAN or the internet.
+Use the authenticated Caddy/Tailscale HTTPS deployment below for remote access.
+Cloud-token import and removal are intentionally unavailable through the reverse proxy.
 
 ## Windows deployment with Tailscale Funnel
 
@@ -146,6 +134,64 @@ Run PowerShell as the Windows user whose Copilot credentials should be used:
 Set-ExecutionPolicy -Scope Process Bypass
 .\deploy\windows\Install-Deployment.ps1
 ```
+
+## Bambu Lab H2D printer-ready artifact slicing
+
+This phase stops after creating a reviewed printer-ready artifact:
+
+```text
+verified model
+→ versioned H2D slicing profile
+→ read-only cloud H2D/AMS snapshot
+→ reviewed material/tray/tool assignment
+→ Bambu Studio CLI slicing
+→ validated, reviewed, downloadable .gcode.3mf
+```
+
+Prerequisites:
+
+1. Install the official Bambu Studio. The Windows installer script can install the
+   WinGet package `Bambulab.Bambustudio`.
+2. Configure these values in `.env` when auto-detection is insufficient:
+
+```dotenv
+PRINTING_AGENT_BAMBU_STUDIO_PATH=C:\Program Files\Bambu Studio\bambu-studio.exe
+PRINTING_AGENT_BAMBU_STUDIO_RESOURCE_DIR=C:\Program Files\Bambu Studio\resources\profiles
+```
+
+Use **Slicing profiles & cloud** in the WebUI to:
+
+- review or clone the versioned built-in H2D slicing profile;
+- configure nozzle, plate, and Bambu Studio profile mappings;
+- configure a Bambu Cloud token from the server's localhost UI only;
+- bind one cloud-observed H2D to a slicing profile;
+- map cloud filament IDs to pinned local Bambu Studio filament profiles;
+- forbid slots globally for automatic assignment.
+
+Job creation supports stricter per-job slot restrictions and slicing overrides.
+Forbidden slots are removed before the material-assignment agent receives candidates.
+
+> [!WARNING]
+> Bambu does not provide a supported public cloud inventory API. This optional,
+> experimental provider uses a pasted account access token to read bound devices and
+> AMS state. The token is accepted only over localhost and stored with Windows DPAPI.
+> The provider can publish only the non-mutating `get_version` and `pushall` status
+> requests. It cannot upload files, create cloud tasks, start/control a printer, or
+> send arbitrary G-code.
+
+FastAPI binds to `127.0.0.1`. Remote WebUI access goes through authenticated
+Caddy/Tailscale HTTPS. Caddy denies the cloud-token management path, so token setup
+must be performed directly at `http://127.0.0.1:8000`.
+
+Cloud inventory is refreshed before material assignment and again before slicing.
+Slicing blocks if the selected H2D is offline or its nozzle/AMS/material/quantity
+state is incomplete or changed. Remaining grams are approximate:
+`remain percentage × nominal tray weight`. The default safety margin is 15%.
+
+The final screen provides the Bambu plate thumbnail, verified mappings, usage,
+digests, manifest, and `.gcode.3mf` download. **No file is uploaded and no job is
+submitted to a printer.** Printer submission is intentionally frozen for a future
+design round.
 
 The installer:
 

@@ -47,3 +47,20 @@ if ($null -eq $tailscale) {
 } else {
     & $tailscale.Source funnel status
 }
+
+Write-Host ""
+Write-Host "Bambu tools"
+$bambuStudio = Get-Command "bambu-studio.exe" -ErrorAction SilentlyContinue
+$bambuPath = if ($null -ne $bambuStudio) {
+    $bambuStudio.Source
+} else {
+    @(
+        "$env:ProgramFiles\Bambu Studio\bambu-studio.exe",
+        "$env:LOCALAPPDATA\Programs\Bambu Studio\bambu-studio.exe"
+    ) | Where-Object { Test-Path $_ -PathType Leaf } | Select-Object -First 1
+}
+if ($bambuPath) {
+    Write-Host "  Bambu Studio: installed ($bambuPath)"
+} else {
+    Write-Host "  Bambu Studio: not detected"
+}

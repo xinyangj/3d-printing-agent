@@ -16,6 +16,8 @@ def settings(tmp_path: Path) -> Settings:
         artifact_dir=tmp_path / "artifacts",
         candidate_cache_dir=tmp_path / "cache",
         simulator_spool_dir=tmp_path / "spool",
+        slice_dir=tmp_path / "slices",
+        bambu_cloud_credential_path=tmp_path / "secrets" / "bambu-cloud.json",
         thingiverse_token="test-token",
     )
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -19,7 +20,15 @@ class Settings(BaseSettings):
     artifact_dir: Path = Path("var/artifacts")
     candidate_cache_dir: Path = Path("var/candidate-cache")
     simulator_spool_dir: Path = Path("var/simulator")
-    api_host: str = Field(default="127.0.0.1", min_length=1, max_length=255)
+    slice_dir: Path = Path("var/slices")
+    bambu_studio_path: str | None = None
+    bambu_studio_resource_dir: Path | None = None
+    bambu_cloud_credential_path: Path = Path(
+        "var/secrets/bambu-cloud-credentials.json"
+    )
+    bambu_cloud_snapshot_timeout_seconds: int = Field(default=20, ge=5, le=60)
+    bambu_cloud_snapshot_ttl_seconds: int = Field(default=60, ge=15, le=300)
+    api_host: Literal["127.0.0.1", "localhost", "::1"] = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
     thingiverse_token: str | None = None
     thingiverse_api_url: str = "https://api.thingiverse.com"
@@ -44,6 +53,8 @@ class Settings(BaseSettings):
             self.artifact_dir,
             self.candidate_cache_dir,
             self.simulator_spool_dir,
+            self.slice_dir,
+            self.bambu_cloud_credential_path.parent,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

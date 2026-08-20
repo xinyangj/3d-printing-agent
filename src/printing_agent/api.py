@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import re
 from collections.abc import AsyncIterator
@@ -14,17 +15,73 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 from printing_agent.bootstrap import Container, build_container
+from printing_agent.cloud_credentials import (
+    CloudRegion,
+    CredentialStoreError,
+)
+from printing_agent.cloud_inventory import CloudInventoryError, mask_identifier
 from printing_agent.config import get_settings
 from printing_agent.domain import RevisionMode, WorkflowState
-from printing_agent.errors import ConflictError, NotFoundError, PrintingAgentError
+from printing_agent.errors import (
+    ConflictError,
+    NotFoundError,
+    PrintingAgentError,
+    ValidationError,
+)
+from printing_agent.fabrication import (
+    JobOverrides,
+    MaterialDefinitionRevision,
+    MaterialDefinitionSpec,
+    ProfileOrigin,
+    SlicingProfileRevision,
+    SlicingProfileSpec,
+)
+from printing_agent.fabrication_profiles import (
+    resolve_profile_dependency_digests,
+)
+from printing_agent.printers import ProfilePrinterAdapter
 
 
 class CreateWorkflowRequest(BaseModel):
     requirement: str = Field(min_length=1, max_length=20_000)
     printer_name: str = Field(default="simulator", min_length=1, max_length=100)
+    overrides: JobOverrides = Field(default_factory=JobOverrides)
+
+
+class CreateSlicingCopyRequest(BaseModel):
+    profile_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    overrides: JobOverrides = Field(default_factory=JobOverrides)
+
+
+class ConfirmMaterialAssignmentRequest(BaseModel):
+    assignment_id: str
+    confirmed_by: str = Field(default="local-web", min_length=1, max_length=200)
+    spool_overrides: dict[str, str] = Field(default_factory=dict)
+
+
+class SaveCloudCredentialRequest(BaseModel):
+    access_token: SecretStr
+    region: CloudRegion
+    experimental_acknowledged: bool
+
+    @model_validator(mode="after")
+    def require_acknowledgement(self) -> SaveCloudCredentialRequest:
+        if not self.experimental_acknowledged:
+            raise ValueError("Experimental private cloud API risk must be acknowledged")
+        if not self.access_token.get_secret_value().strip():
+            raise ValueError("Bambu Cloud access token cannot be empty")
+        return self
+
+
+class RefreshCloudSnapshotRequest(BaseModel):
+    device_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class BindCloudDeviceRequest(BaseModel):
+    device_ref: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
 class ApproveArtifactRequest(BaseModel):
@@ -112,11 +169,50 @@ def create_app(container: Container | None = None) -> FastAPI:
     ) -> JSONResponse:
         return JSONResponse(
             status_code=422,
-            content={"error": {"code": "invalid_request", "details": error.errors()}},
+            content={
+                "error": {
+                    "code": "invalid_request",
+                    "details": [
+                        {
+                            "loc": item["loc"],
+                            "type": item["type"],
+                            "msg": item["msg"],
+                        }
+                        for item in error.errors()
+                    ],
+                }
+            },
         )
 
     def get_container(request: Request) -> Container:
         return request.app.state.container
+
+    def require_local_credential_request(request: Request) -> None:
+        forwarded_headers = {
+            "forwarded",
+            "x-forwarded-for",
+            "x-real-ip",
+        }
+        if (
+            request.client is None
+            or request.client.host not in {"127.0.0.1", "::1", "testclient"}
+            or any(request.headers.get(name) for name in forwarded_headers)
+        ):
+            raise NotFoundError("Endpoint was not found")
+
+    def _masked_slicing_snapshot(snapshot) -> dict[str, object]:
+        payload = snapshot.model_dump(mode="json")
+        serial = payload["profile"].get("cloud_device_serial")
+        if isinstance(serial, str) and serial:
+            payload["profile"]["cloud_device_serial"] = mask_identifier(serial)
+        return payload
+
+    def _masked_profile(profile) -> dict[str, object]:
+        payload = profile.model_dump(mode="json")
+        serial = payload["spec"].get("cloud_device_serial")
+        if isinstance(serial, str) and serial:
+            payload["spec"]["cloud_device_serial"] = mask_identifier(serial)
+        return payload
 
     async def serialize_workflow(
         container: Container,
@@ -137,6 +233,45 @@ def create_app(container: Container | None = None) -> FastAPI:
         revision_verification = (
             await container.repository.get_latest_revision_verification(workflow.id)
         )
+        try:
+            printer_snapshot = (
+                await container.repository.get_workflow_printer_snapshot(workflow.id)
+            )
+        except NotFoundError:
+            printer_snapshot = None
+        try:
+            material_assignment = (
+                await container.repository.get_latest_material_assignment(workflow.id)
+            )
+        except NotFoundError:
+            material_assignment = None
+        try:
+            slice_job = await container.repository.get_latest_slice_job(workflow.id)
+        except NotFoundError:
+            slice_job = None
+        sliced_artifact = None
+        try:
+            cloud_snapshot = (
+        await container.repository.get_latest_cloud_device_snapshot(
+            workflow.id
+        )
+            )
+        except NotFoundError:
+            cloud_snapshot = None
+        if (
+            material_assignment is not None
+            and cloud_snapshot is not None
+            and material_assignment.cloud_snapshot_digest
+            != cloud_snapshot.digest
+        ):
+            material_assignment = None
+        if slice_job is not None and slice_job.status.value == "ready":
+            try:
+                sliced_artifact = await container.repository.get_sliced_artifact(
+                    slice_job.id
+                )
+            except NotFoundError:
+                sliced_artifact = None
         artifact_payload = None
         if artifact is not None:
             artifact_payload = artifact.model_dump(
@@ -193,6 +328,39 @@ def create_app(container: Container | None = None) -> FastAPI:
                 if revision_verification is not None
                 else None
             ),
+            "printer_snapshot": (
+                _masked_slicing_snapshot(printer_snapshot)
+                if printer_snapshot is not None
+                else None
+            ),
+            "material_assignment": (
+                material_assignment.model_dump(mode="json")
+                if material_assignment is not None
+                else None
+            ),
+            "slice_job": (
+                slice_job.model_dump(mode="json")
+                if slice_job is not None
+                else None
+            ),
+            "sliced_artifact": (
+                {
+                    **sliced_artifact.model_dump(
+                        mode="json",
+                        exclude={"path", "thumbnail_path"},
+                    ),
+                    "thumbnail_available": (
+                        sliced_artifact.thumbnail_path is not None
+                    ),
+                }
+                if sliced_artifact is not None
+                else None
+            ),
+            "cloud_snapshot": (
+                cloud_snapshot.masked_dump()
+                if cloud_snapshot is not None
+                else None
+            ),
         }
 
     @app.get("/api/v1/health")
@@ -207,6 +375,7 @@ def create_app(container: Container | None = None) -> FastAPI:
         workflow = await get_container(request).application.create_workflow(
             body.requirement,
             body.printer_name,
+            body.overrides,
         )
         return workflow.model_dump(mode="json")
 
@@ -347,6 +516,23 @@ def create_app(container: Container | None = None) -> FastAPI:
         workflow = await container.application.copy_workflow(workflow_id)
         return await serialize_workflow(container, workflow)
 
+    @app.post(
+        "/api/v1/workflows/{workflow_id}/slicing-copies",
+        status_code=201,
+    )
+    async def create_slicing_copy(
+        workflow_id: str,
+        body: CreateSlicingCopyRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        container = get_container(request)
+        workflow = await container.application.copy_workflow(
+            workflow_id,
+            target_printer_name=body.profile_id,
+            overrides=body.overrides,
+        )
+        return await serialize_workflow(container, workflow)
+
     @app.post("/api/v1/workflows/{workflow_id}/archive")
     async def archive_workflow(
         workflow_id: str,
@@ -374,6 +560,377 @@ def create_app(container: Container | None = None) -> FastAPI:
     async def list_printers(request: Request) -> list[dict[str, object]]:
         capabilities = await get_container(request).printers.capabilities()
         return [item.model_dump(mode="json") for item in capabilities]
+
+    @app.get("/api/v1/slicing-profiles")
+    async def list_slicing_profiles(request: Request) -> list[dict[str, object]]:
+        profiles = await get_container(request).repository.list_printer_profiles()
+        return [_masked_profile(item) for item in profiles]
+
+    @app.get("/api/v1/slicing/readiness")
+    async def slicing_readiness(
+        request: Request,
+        profile_id: str | None = None,
+        profile_revision: int | None = None,
+    ) -> list[dict[str, object]]:
+        if profile_revision is not None and profile_id is None:
+            raise ValidationError(
+                "profile_revision requires a matching profile_id"
+            )
+        return await get_container(request).application.fabrication_readiness(
+            profile_id,
+            profile_revision,
+        )
+
+    @app.get("/api/v1/cloud-credential-status")
+    async def cloud_credential_status(
+        request: Request,
+    ) -> dict[str, object]:
+        status = await asyncio.to_thread(
+            get_container(request).cloud_credentials.status
+        )
+        return status.model_dump(mode="json")
+
+    @app.post("/api/v1/cloud-credentials", status_code=201)
+    async def save_cloud_credential(
+        body: SaveCloudCredentialRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        require_local_credential_request(request)
+        container = get_container(request)
+        token = body.access_token.get_secret_value().strip()
+        try:
+            devices = await container.inventory.validate_token(
+                token,
+                body.region,
+            )
+            status = await asyncio.to_thread(
+                container.cloud_credentials.store,
+                token,
+                body.region,
+            )
+        except (CredentialStoreError, CloudInventoryError) as exc:
+            raise ValidationError(str(exc)) from exc
+        return {
+            "credential": status.model_dump(mode="json"),
+            "devices": [item.masked_dump() for item in devices],
+        }
+
+    @app.delete("/api/v1/cloud-credentials")
+    async def clear_cloud_credential(
+        request: Request,
+    ) -> dict[str, object]:
+        require_local_credential_request(request)
+        try:
+            status = await asyncio.to_thread(
+                get_container(request).cloud_credentials.clear
+            )
+        except CredentialStoreError as exc:
+            raise ValidationError(str(exc)) from exc
+        return status.model_dump(mode="json")
+
+    @app.get("/api/v1/cloud-devices")
+    async def list_cloud_devices(
+        request: Request,
+    ) -> list[dict[str, object]]:
+        devices = await get_container(request).application.list_cloud_devices()
+        return [item.masked_dump() for item in devices]
+
+    @app.post(
+        "/api/v1/workflows/{workflow_id}/cloud-snapshot",
+        status_code=201,
+    )
+    async def refresh_cloud_snapshot(
+        workflow_id: str,
+        body: RefreshCloudSnapshotRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        snapshot = await get_container(
+            request
+        ).application.refresh_cloud_snapshot(
+            workflow_id,
+            body.device_id,
+        )
+        return snapshot.masked_dump()
+
+    @app.post("/api/v1/slicing-profiles/{profile_id}", status_code=201)
+    async def save_slicing_profile(
+        profile_id: str,
+        body: SlicingProfileSpec,
+        request: Request,
+    ) -> dict[str, object]:
+        container = get_container(request)
+        body = body.model_copy(
+            update={
+                "slicer": body.slicer.model_copy(
+                    update={
+                        "executable_path": container.settings.bambu_studio_path,
+                        "resource_root": (
+                            str(container.settings.bambu_studio_resource_dir)
+                            if container.settings.bambu_studio_resource_dir
+                            else None
+                        ),
+                    }
+                )
+            }
+        )
+        raw_expected_revision = request.headers.get("if-match")
+        expected_revision: int | None = None
+        if raw_expected_revision is not None:
+            normalized = raw_expected_revision.strip().strip('"')
+            if not normalized.isdigit():
+                raise ConflictError("If-Match must contain a printer profile revision")
+            expected_revision = int(normalized)
+        try:
+            current = await container.repository.get_printer_profile(profile_id)
+            revision = current.revision + 1
+            body = body.model_copy(
+                update={
+                    "cloud_region": current.spec.cloud_region,
+                    "cloud_device_name": current.spec.cloud_device_name,
+                    "cloud_device_serial": current.spec.cloud_device_serial,
+                }
+            )
+        except NotFoundError:
+            revision = 1
+        profile = SlicingProfileRevision(
+            profile_id=profile_id,
+            revision=revision,
+            origin=ProfileOrigin.CUSTOM,
+            spec=body,
+        ).with_digest()
+        await container.repository.save_printer_profile(
+            profile,
+            expected_revision=expected_revision,
+        )
+        container.printers.upsert(ProfilePrinterAdapter(profile))
+        return _masked_profile(profile)
+
+    @app.post("/api/v1/slicing-profiles/{profile_id}/archive")
+    async def archive_slicing_profile(
+        profile_id: str,
+        request: Request,
+    ) -> dict[str, str]:
+        await get_container(request).repository.archive_printer_profile(profile_id)
+        return {"status": "archived"}
+
+    @app.post(
+        "/api/v1/slicing-profiles/{profile_id}/cloud-device",
+        status_code=201,
+    )
+    async def bind_cloud_device(
+        profile_id: str,
+        body: BindCloudDeviceRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        container = get_container(request)
+        devices = await container.application.list_cloud_devices()
+        selected = next(
+            (
+                item
+                for item in devices
+                if hashlib.sha256(item.device_id.encode()).hexdigest()
+                == body.device_ref
+            ),
+            None,
+        )
+        if selected is None:
+            raise NotFoundError("Cloud device reference was not found")
+        current = await container.repository.get_printer_profile(profile_id)
+        credential_status = await asyncio.to_thread(
+            container.cloud_credentials.status
+        )
+        if credential_status.region is None:
+            raise ConflictError("Cloud credential region is unavailable")
+        profile = current.model_copy(
+            update={
+                "revision": current.revision + 1,
+                "origin": ProfileOrigin.CUSTOM,
+                "spec": current.spec.model_copy(
+                    update={
+                        "cloud_region": credential_status.region,
+                        "cloud_device_name": selected.name,
+                        "cloud_device_serial": selected.device_id,
+                    }
+                ),
+                "digest": None,
+            }
+        ).with_digest()
+        await container.repository.save_printer_profile(
+            profile,
+            expected_revision=current.revision,
+        )
+        container.printers.upsert(ProfilePrinterAdapter(profile))
+        return _masked_profile(profile)
+
+    @app.get("/api/v1/materials")
+    async def list_materials(request: Request) -> list[dict[str, object]]:
+        values = await get_container(request).repository.list_material_definitions()
+        return [item.model_dump(mode="json") for item in values]
+
+    @app.post("/api/v1/materials/{material_id}", status_code=201)
+    async def save_material(
+        material_id: str,
+        body: MaterialDefinitionSpec,
+        request: Request,
+    ) -> dict[str, object]:
+        repository = get_container(request).repository
+        digests: dict[str, str] | None = None
+        for profile in await repository.list_printer_profiles():
+            root = profile.spec.slicer.resource_root
+            if root is None:
+                continue
+            try:
+                digests = await asyncio.to_thread(
+                    resolve_profile_dependency_digests,
+                    root,
+                    body.slicer_filament_profile_id,
+                    "filament",
+                )
+            except PrintingAgentError:
+                continue
+            if digests:
+                break
+        if not digests:
+            raise ValidationError(
+                "Filament profile could not be pinned from an installed slicer "
+                "resource directory"
+            )
+        body = body.model_copy(
+            update={
+                "slicer_profile_dependency_digests": digests,
+                "slicer_profile_digest": next(iter(digests.values())),
+            }
+        )
+        try:
+            current = await repository.get_material_definition(material_id)
+            revision = current.revision + 1
+        except NotFoundError:
+            revision = 1
+        material = MaterialDefinitionRevision(
+            material_id=material_id,
+            revision=revision,
+            spec=body,
+        ).with_digest()
+        await repository.save_material_definition(material)
+        return material.model_dump(mode="json")
+
+    @app.post(
+        "/api/v1/workflows/{workflow_id}/material-assignment",
+        status_code=201,
+    )
+    async def propose_material_assignment(
+        workflow_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        value = await get_container(
+            request
+        ).application.propose_material_assignment(workflow_id)
+        return value.model_dump(mode="json")
+
+    @app.post(
+        "/api/v1/workflows/{workflow_id}/material-assignment/confirm"
+    )
+    async def confirm_material_assignment(
+        workflow_id: str,
+        body: ConfirmMaterialAssignmentRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        value = await get_container(
+            request
+        ).application.confirm_material_assignment(
+            workflow_id,
+            body.assignment_id,
+            body.confirmed_by,
+            body.spool_overrides,
+        )
+        return value.model_dump(mode="json")
+
+    @app.post("/api/v1/workflows/{workflow_id}/slice", status_code=202)
+    async def request_slice(
+        workflow_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        value = await get_container(request).application.request_slice(workflow_id)
+        return value.model_dump(mode="json")
+
+    @app.get("/api/v1/workflows/{workflow_id}/slices/{slice_job_id}/download")
+    async def download_slice(
+        workflow_id: str,
+        slice_job_id: str,
+        request: Request,
+    ) -> FileResponse:
+        artifact = await get_container(request).repository.get_sliced_artifact(
+            slice_job_id
+        )
+        if artifact.workflow_id != workflow_id:
+            raise NotFoundError("Sliced artifact was not found")
+        path = await asyncio.to_thread(lambda: Path(artifact.path).resolve())
+        root = await asyncio.to_thread(
+            get_container(request).settings.slice_dir.resolve
+        )
+        if root not in path.parents or not await asyncio.to_thread(path.is_file):
+            raise ConflictError("Sliced artifact path is unavailable")
+        return FileResponse(
+            path,
+            media_type="model/3mf",
+            filename=path.name,
+        )
+
+    @app.get("/api/v1/workflows/{workflow_id}/slices/{slice_job_id}/manifest")
+    async def download_slice_manifest(
+        workflow_id: str,
+        slice_job_id: str,
+        request: Request,
+    ) -> FileResponse:
+        artifact = await get_container(request).repository.get_sliced_artifact(
+            slice_job_id
+        )
+        if artifact.workflow_id != workflow_id:
+            raise NotFoundError("Sliced artifact was not found")
+        manifest = await asyncio.to_thread(
+            lambda: Path(artifact.path).resolve().parent
+            / "slice-manifest.json"
+        )
+        root = await asyncio.to_thread(
+            get_container(request).settings.slice_dir.resolve
+        )
+        if root not in manifest.parents or not await asyncio.to_thread(
+            manifest.is_file
+        ):
+            raise ConflictError("Slice manifest is unavailable")
+        return FileResponse(
+            manifest,
+            media_type="application/json",
+            filename=f"slice-{slice_job_id[:8]}-manifest.json",
+        )
+
+    @app.get("/api/v1/workflows/{workflow_id}/slices/{slice_job_id}/thumbnail")
+    async def download_slice_thumbnail(
+        workflow_id: str,
+        slice_job_id: str,
+        request: Request,
+    ) -> FileResponse:
+        artifact = await get_container(request).repository.get_sliced_artifact(
+            slice_job_id
+        )
+        if artifact.workflow_id != workflow_id or not artifact.thumbnail_path:
+            raise NotFoundError("Sliced plate thumbnail was not found")
+        thumbnail = await asyncio.to_thread(
+            lambda: Path(artifact.thumbnail_path).resolve()
+        )
+        root = await asyncio.to_thread(
+            get_container(request).settings.slice_dir.resolve
+        )
+        if root not in thumbnail.parents or not await asyncio.to_thread(
+            thumbnail.is_file
+        ):
+            raise ConflictError("Sliced plate thumbnail is unavailable")
+        media_type = (
+            "image/png"
+            if thumbnail.suffix.casefold() == ".png"
+            else "image/jpeg"
+        )
+        return FileResponse(thumbnail, media_type=media_type)
 
     web_dist = Path(__file__).resolve().parents[2] / "web" / "dist"
     if web_dist.is_dir():

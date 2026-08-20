@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$AuthUsername = "printing-agent",
-    [switch]$EnableLanAccess,
+    [switch]$SkipBambuTools,
     [switch]$SkipPackageInstall,
     [switch]$SkipScheduledTasks,
     [switch]$SkipFunnel
@@ -14,11 +14,18 @@ function Install-WinGetPackage {
         [Parameter(Mandatory = $true)]
         [string]$Id,
         [Parameter(Mandatory = $true)]
-        [string]$CommandName
+        [string]$CommandName,
+        [string[]]$Fallbacks = @()
     )
 
     if ($null -ne (Get-Command $CommandName -ErrorAction SilentlyContinue)) {
         return
+    }
+    foreach ($candidate in $Fallbacks) {
+        $expanded = [Environment]::ExpandEnvironmentVariables($candidate)
+        if (Test-Path $expanded -PathType Leaf) {
+            return
+        }
     }
 
     $winget = Get-ExecutablePath -Name "winget.exe"
@@ -73,6 +80,15 @@ if (-not $SkipPackageInstall) {
     Install-WinGetPackage -Id "OpenSCAD.OpenSCAD" -CommandName "openscad.exe"
     Install-WinGetPackage -Id "Tailscale.Tailscale" -CommandName "tailscale.exe"
     Install-WinGetPackage -Id "CaddyServer.Caddy" -CommandName "caddy.exe"
+    if (-not $SkipBambuTools) {
+        Install-WinGetPackage `
+            -Id "Bambulab.Bambustudio" `
+            -CommandName "bambu-studio.exe" `
+            -Fallbacks @(
+                "%ProgramFiles%\Bambu Studio\bambu-studio.exe",
+                "%LOCALAPPDATA%\Programs\Bambu Studio\bambu-studio.exe"
+            )
+    }
 }
 
 Update-ProcessPath
@@ -85,6 +101,13 @@ $caddy = Get-ExecutablePath -Name "caddy.exe" -Fallbacks @(
     "%LOCALAPPDATA%\Microsoft\WinGet\Links\caddy.exe",
     "%ProgramFiles%\Caddy\caddy.exe"
 )
+$bambuStudio = $null
+if (-not $SkipBambuTools) {
+    $bambuStudio = Get-ExecutablePath -Name "bambu-studio.exe" -Fallbacks @(
+        "%ProgramFiles%\Bambu Studio\bambu-studio.exe",
+        "%LOCALAPPDATA%\Programs\Bambu Studio\bambu-studio.exe"
+    )
+}
 
 if (-not (Test-Path ".venv\Scripts\python.exe" -PathType Leaf)) {
     Invoke-Checked -Executable $pythonLauncher -Arguments @(
@@ -115,24 +138,23 @@ $envLines = Set-EnvironmentEntry `
     -Lines $envLines `
     -Name "PRINTING_AGENT_OPENSCAD_PATH" `
     -Value $openscad
-if ($EnableLanAccess) {
+if ($null -ne $bambuStudio) {
     $envLines = Set-EnvironmentEntry `
         -Lines $envLines `
-        -Name "PRINTING_AGENT_API_HOST" `
-        -Value "0.0.0.0"
-    $existingRule = Get-NetFirewallRule `
-        -DisplayName $script:LanFirewallRuleName `
-        -ErrorAction SilentlyContinue
-    if ($null -eq $existingRule) {
-        New-NetFirewallRule `
-            -DisplayName $script:LanFirewallRuleName `
-            -Direction Inbound `
-            -Action Allow `
-            -Protocol TCP `
-            -LocalPort 8000 `
-            -Profile Private | Out-Null
+        -Name "PRINTING_AGENT_BAMBU_STUDIO_PATH" `
+        -Value $bambuStudio
+    $resourceRoot = Join-Path (Split-Path $bambuStudio) "resources\profiles"
+    if (Test-Path $resourceRoot -PathType Container) {
+        $envLines = Set-EnvironmentEntry `
+            -Lines $envLines `
+            -Name "PRINTING_AGENT_BAMBU_STUDIO_RESOURCE_DIR" `
+            -Value $resourceRoot
     }
 }
+$envLines = Set-EnvironmentEntry `
+    -Lines $envLines `
+    -Name "PRINTING_AGENT_API_HOST" `
+    -Value "127.0.0.1"
 $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllLines($envPath, $envLines, $utf8WithoutBom)
 Protect-DeploymentFile -Path $envPath
@@ -174,6 +196,4 @@ Write-Host ""
 Write-Host "Deployment installation completed."
 Write-Host "Set PRINTING_AGENT_THINGIVERSE_TOKEN in .env before creating live workflows."
 Write-Host "Run Get-DeploymentStatus.ps1 to inspect the services and Funnel."
-if ($EnableLanAccess) {
-    Write-Host "LAN access is enabled on TCP port 8000 for Private network profiles."
-}
+Write-Host "Bambu Studio slicing is local. This deployment does not submit printer jobs."

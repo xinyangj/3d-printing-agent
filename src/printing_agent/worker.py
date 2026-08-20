@@ -30,6 +30,8 @@ class DurableWorker:
             try:
                 if item.kind == WorkKind.PREPARE:
                     await self.application.prepare(item.workflow_id)
+                elif item.kind == WorkKind.SLICE:
+                    await self.application.slice_workflow(item.workflow_id)
                 elif item.kind == WorkKind.SUBMIT:
                     await self.application.submit_print(item.workflow_id)
                 elif item.kind == WorkKind.REFRESH_PRINT:
@@ -72,6 +74,8 @@ class DurableWorker:
                 if kind in {WorkKind.SUBMIT, WorkKind.REFRESH_PRINT}
                 else WorkflowState.PREPARATION_FAILED
             )
+            if kind == WorkKind.SLICE:
+                return
             await self.repository.transition(
                 workflow_id,
                 target,

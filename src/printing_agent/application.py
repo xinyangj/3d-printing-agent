@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import math
+import re
 import shutil
 from typing import cast
 
 from printing_agent.artifact_store import ArtifactStore, sha256_file
 from printing_agent.catalogs import ThingiverseCatalog
+from printing_agent.cloud_inventory import (
+    CloudDeviceSnapshot,
+    CloudInventoryError,
+    InventoryProvider,
+)
 from printing_agent.config import Settings
 from printing_agent.copilot_agents import CopilotDiscoveryAgent, CopilotModelingAgent
 from printing_agent.domain import (
@@ -34,17 +42,44 @@ from printing_agent.errors import (
     CandidateRejectedError,
     ConflictError,
     ExternalServiceError,
+    NotFoundError,
     PolicyViolationError,
     PrintingAgentError,
     ValidationError,
 )
+from printing_agent.fabrication import (
+    JobOverrides,
+    MaterialAssignment,
+    MaterialDefinitionRevision,
+    PhysicalSpool,
+    PrinterProfileRevision,
+    SliceJob,
+    SliceJobStatus,
+    SpoolReservation,
+    SpoolStatus,
+    WorkflowPrinterSnapshot,
+    resolve_slot_policy,
+)
+from printing_agent.fabrication import (
+    utc_now as fabrication_utc_now,
+)
+from printing_agent.fabrication_drivers import (
+    SliceRequest,
+    SlicerRegistry,
+)
+from printing_agent.fabrication_profiles import (
+    built_in_simulator_profile,
+    resolve_slicer_profile_file_digests,
+)
+from printing_agent.material_assignment import MaterialAssignmentService
 from printing_agent.modeling import (
     ModelPipeline,
     TrimeshSelectedSourceInspector,
     unwrap_base_model_source,
 )
+from printing_agent.multipart import single_part_project, write_project_artifact
 from printing_agent.ports import PrinterAdapter
-from printing_agent.printers import PrinterRegistry
+from printing_agent.printers import PrinterRegistry, ProfilePrinterAdapter
 from printing_agent.repositories import WorkflowRepository
 from printing_agent.verification import RevisionVerifier
 
@@ -62,6 +97,9 @@ class PrintingApplication:
         model_pipeline: ModelPipeline,
         printers: PrinterRegistry,
         revision_verifier: RevisionVerifier,
+        slicers: SlicerRegistry,
+        inventory: InventoryProvider,
+        material_assignment: MaterialAssignmentService,
     ) -> None:
         self.settings = settings
         self.repository = repository
@@ -73,20 +111,377 @@ class PrintingApplication:
         self.model_pipeline = model_pipeline
         self.printers = printers
         self.revision_verifier = revision_verifier
+        self.slicers = slicers
+        self.inventory = inventory
+        self.material_assignment = material_assignment
+        self._cancel_locks: dict[str, asyncio.Lock] = {}
 
-    async def create_workflow(self, requirement: str, printer_name: str):
+    async def create_workflow(
+        self,
+        requirement: str,
+        printer_name: str,
+        overrides: JobOverrides | None = None,
+    ):
+        workflow = PrintWorkflow(
+            requirement=requirement,
+            printer_name=printer_name,
+        )
+        _, snapshot = await self._build_printer_snapshot(
+            workflow.id,
+            printer_name,
+            overrides or JobOverrides(),
+        )
+        return await self.repository.create_workflow_with_snapshot(
+            workflow,
+            snapshot,
+        )
+
+    async def _build_printer_snapshot(
+        self,
+        workflow_id: str,
+        printer_name: str,
+        resolved_overrides: JobOverrides,
+    ) -> tuple[PrinterProfileRevision, WorkflowPrinterSnapshot]:
+        profile = await self.repository.get_printer_profile(printer_name)
         self.printers.get(printer_name)
-        return await self.repository.create_workflow(requirement, printer_name)
+        if profile.spec.slicer.driver_id == "bambu_studio_cli" and (
+            resolved_overrides.timelapse is not None
+            or resolved_overrides.calibration is not None
+        ):
+            raise ValidationError(
+                "Timelapse and calibration are not supported by the slice-only workflow"
+            )
+        slot_ids = {slot.id for slot in profile.spec.material_slots}
+        toolhead_ids = {toolhead.id for toolhead in profile.spec.toolheads}
+        plate_ids = {plate.id for plate in profile.spec.plates}
+        referenced_slots = set(resolved_overrides.forbidden_slot_ids)
+        referenced_slots.update(resolved_overrides.allowed_slot_ids or set())
+        referenced_slots.update(
+            slot
+            for values in resolved_overrides.part_allowed_slot_ids.values()
+            for slot in values
+        )
+        referenced_slots.update(
+            slot
+            for values in resolved_overrides.part_forbidden_slot_ids.values()
+            for slot in values
+        )
+        if not referenced_slots.issubset(slot_ids):
+            raise ValidationError("Job overrides reference unknown material slots")
+        if (
+            resolved_overrides.toolhead_id is not None
+            and resolved_overrides.toolhead_id not in toolhead_ids
+        ):
+            raise ValidationError("Job overrides reference an unknown toolhead")
+        if (
+            resolved_overrides.plate_id is not None
+            and resolved_overrides.plate_id not in plate_ids
+        ):
+            raise ValidationError("Job overrides reference an unknown plate")
+        snapshot = WorkflowPrinterSnapshot(
+            workflow_id=workflow_id,
+            profile_id=profile.profile_id,
+            profile_revision=profile.revision,
+            profile_digest=profile.digest or "0" * 64,
+            profile=profile.spec,
+            overrides=resolved_overrides,
+            slicer_profile_file_digests=await asyncio.to_thread(
+                resolve_slicer_profile_file_digests,
+                profile,
+            ),
+            resolved_slot_policy=resolve_slot_policy(
+                profile.spec,
+                resolved_overrides,
+            ),
+        ).with_digest()
+        return profile, snapshot
+
+    async def fabrication_readiness(
+        self,
+        profile_id: str | None = None,
+        profile_revision: int | None = None,
+    ) -> list[dict[str, object]]:
+        values: list[dict[str, object]] = []
+        if profile_id is not None:
+            profiles = [
+                await self.repository.get_printer_profile(
+                    profile_id,
+                    profile_revision,
+                )
+            ]
+        else:
+            profiles = await self.repository.list_printer_profiles()
+        for profile in profiles:
+            slicing_capable = (
+                profile.spec.slicer.driver_id != "simulator_passthrough"
+            )
+            slicer_ready = not slicing_capable
+            slicer_message = (
+                "This profile does not require local slicing."
+                if not slicing_capable
+                else "Slicer readiness has not been checked."
+            )
+            if slicing_capable:
+                try:
+                    await self.slicers.get(
+                        profile.spec.slicer.driver_id
+                    ).validate_profile(profile)
+                    await asyncio.to_thread(
+                        resolve_slicer_profile_file_digests,
+                        profile,
+                    )
+                except PrintingAgentError as exc:
+                    slicer_ready = False
+                    slicer_message = self._readiness_message(profile, exc)
+                else:
+                    slicer_ready = True
+                    slicer_message = (
+                        "Bambu Studio and the configured profile resources "
+                        "are available."
+                    )
+
+            values.append(
+                {
+                    "profile_id": profile.profile_id,
+                    "profile_revision": profile.revision,
+                    "display_name": profile.spec.display_name,
+                    "slicing_capable": slicing_capable,
+                    "ready_for_fabrication": (
+                        slicing_capable
+                        and slicer_ready
+                        and profile.spec.cloud_device_serial is not None
+                    ),
+                    "slicer": {
+                        "ready": slicer_ready,
+                        "message": slicer_message,
+                    },
+                    "cloud_binding": {
+                        "configured": (
+                            profile.spec.cloud_device_serial is not None
+                        ),
+                        "device_name": profile.spec.cloud_device_name,
+                    },
+                }
+            )
+        return values
+
+    async def list_cloud_devices(self):
+        try:
+            return await self.inventory.list_devices()
+        except CloudInventoryError as exc:
+            raise ExternalServiceError(str(exc)) from exc
+
+    async def refresh_cloud_snapshot(
+        self,
+        workflow_id: str,
+        device_id: str | None = None,
+    ) -> CloudDeviceSnapshot:
+        workflow = await self.repository.get_workflow(workflow_id)
+        PrintingApplication._ensure_not_archived(workflow)
+        if workflow.state not in {
+            WorkflowState.APPROVED,
+            WorkflowState.SLICE_SETUP,
+            WorkflowState.AWAITING_MATERIAL_REVIEW,
+            WorkflowState.SLICE_FAILED,
+            WorkflowState.AWAITING_SLICE_REVIEW,
+        }:
+            raise ConflictError(
+                "Cloud inventory can be refreshed only during slicing setup or review"
+            )
+        profile_snapshot = (
+            await self.repository.get_workflow_printer_snapshot(workflow_id)
+        )
+        profile = await self.repository.get_printer_profile(
+            profile_snapshot.profile_id,
+            profile_snapshot.profile_revision,
+        )
+        selected_device = device_id or profile.spec.cloud_device_serial
+        if not selected_device:
+            raise ValidationError(
+                "The slicing profile is not bound to a Bambu Cloud H2D device"
+            )
+        try:
+            snapshot = await self.inventory.snapshot(selected_device)
+        except CloudInventoryError as exc:
+            raise ExternalServiceError(str(exc)) from exc
+        self._validate_cloud_snapshot(profile, snapshot)
+        try:
+            previous_snapshot = (
+                await self.repository.get_latest_cloud_device_snapshot(
+                    workflow_id
+                )
+            )
+        except NotFoundError:
+            previous_snapshot = None
+        await self.repository.save_cloud_device_snapshot(
+            workflow_id,
+            profile.profile_id,
+            snapshot,
+        )
+        inventory_changed = (
+            previous_snapshot is not None
+            and previous_snapshot.digest != snapshot.digest
+        )
+        if workflow.state == WorkflowState.APPROVED or (
+            workflow.state != WorkflowState.SLICE_SETUP
+            and inventory_changed
+        ):
+            await self.repository.transition(
+                workflow_id,
+                WorkflowState.SLICE_SETUP,
+                event_kind="cloud.snapshot_refreshed",
+                payload={
+                    "cloud_snapshot_id": snapshot.id,
+                    "cloud_snapshot_digest": snapshot.digest,
+                    "inventory_changed": inventory_changed,
+                },
+            )
+        else:
+            await self.repository.record_workflow_event(
+                workflow_id,
+                "cloud.snapshot_refreshed",
+                {
+                    "cloud_snapshot_id": snapshot.id,
+                    "cloud_snapshot_digest": snapshot.digest,
+                },
+            )
+        return snapshot
+
+    @staticmethod
+    def _validate_cloud_snapshot(
+        profile: PrinterProfileRevision,
+        snapshot: CloudDeviceSnapshot,
+    ) -> None:
+        if profile.spec.cloud_region != snapshot.region:
+            raise ConflictError(
+                "Cloud device region differs from the slicing profile"
+            )
+        if (
+            profile.spec.cloud_device_serial
+            and profile.spec.cloud_device_serial != snapshot.device.device_id
+        ):
+            raise ConflictError(
+                "Cloud snapshot device differs from the slicing profile binding"
+            )
+        if not snapshot.device.online:
+            raise ConflictError("The bound H2D is offline")
+        if "h2d" not in snapshot.device.model.casefold().replace(" ", ""):
+            raise ConflictError("The bound cloud device is not an H2D")
+        expected = {
+            item.id: item for item in profile.spec.toolheads
+        }
+        observed = {
+            item.position: item for item in snapshot.installed_nozzles
+        }
+        if set(observed) != {"left", "right"}:
+            raise ConflictError("Cloud snapshot does not prove both H2D nozzles")
+        for toolhead_id in ("left", "right"):
+            configured = expected.get(toolhead_id)
+            actual = observed[toolhead_id]
+            if configured is None or not math.isclose(
+                configured.nozzle_diameter_mm,
+                actual.diameter_mm,
+                rel_tol=0,
+                abs_tol=1e-6,
+            ):
+                raise ConflictError(
+                    f"Observed {toolhead_id} nozzle differs from the slicing profile"
+                )
+            configured_material = PrintingApplication._nozzle_material_category(
+                configured.nozzle_material
+            )
+            observed_material = PrintingApplication._nozzle_material_category(
+                actual.nozzle_type
+            )
+            if configured_material != observed_material:
+                raise ConflictError(
+                    f"Observed {toolhead_id} nozzle material differs from "
+                    "the slicing profile"
+                )
+            if configured.hardened and observed_material != "hardened_steel":
+                raise ConflictError(
+                    f"Observed {toolhead_id} nozzle is not proven hardened"
+                )
+        expected_slots = {
+            item.id for item in profile.spec.material_slots
+        }
+        observed_slots = {
+            tray.slot_id
+            for unit in snapshot.ams_units
+            for tray in unit.trays
+        } | {tray.slot_id for tray in snapshot.external_trays}
+        missing_slots = sorted(expected_slots - observed_slots)
+        if missing_slots:
+            raise ConflictError(
+                "Cloud snapshot is missing slicing-profile slots: "
+                + ", ".join(missing_slots)
+            )
+
+    @staticmethod
+    def _nozzle_material_category(value: str) -> str:
+        normalized = value.casefold().replace("-", "_").replace(" ", "_")
+        code = re.fullmatch(r"h[shx](00|01|05)", normalized)
+        if code:
+            return {
+                "00": "stainless_steel",
+                "01": "hardened_steel",
+                "05": "tungsten_carbide",
+            }[code.group(1)]
+        if "hardened" in normalized:
+            return "hardened_steel"
+        if "tungsten" in normalized or "carbide" in normalized:
+            return "tungsten_carbide"
+        if "stainless" in normalized:
+            return "stainless_steel"
+        return normalized
+
+    @staticmethod
+    def _readiness_message(
+        profile: PrinterProfileRevision,
+        error: PrintingAgentError,
+    ) -> str:
+        message = str(error)
+        for value in (
+            profile.spec.slicer.executable_path,
+            profile.spec.slicer.resource_root,
+        ):
+            if value:
+                message = message.replace(value, "[configured path]")
+        return message[-500:]
 
     @staticmethod
     def _ensure_not_archived(workflow: PrintWorkflow) -> None:
         if workflow.archived_at is not None:
             raise ConflictError("Restore the archived workflow before changing it")
 
+    async def _workflow_profile_adapter(
+        self,
+        workflow: PrintWorkflow,
+    ) -> PrinterAdapter:
+        try:
+            snapshot = await self.repository.get_workflow_printer_snapshot(
+                workflow.id
+            )
+        except NotFoundError:
+            return cast(PrinterAdapter, self.printers.get(workflow.printer_name))
+        revision = await self.repository.get_printer_profile(
+            snapshot.profile_id,
+            snapshot.profile_revision,
+        )
+        if revision.digest != snapshot.profile_digest:
+            raise ConflictError("Workflow printer profile snapshot digest is invalid")
+        pinned = revision.model_copy(
+            update={
+                "spec": snapshot.profile,
+                "digest": snapshot.profile_digest,
+            }
+        )
+        return cast(PrinterAdapter, ProfilePrinterAdapter(pinned))
+
     async def prepare(self, workflow_id: str) -> ModelArtifact:
         workflow = await self.repository.get_workflow(workflow_id)
         PrintingApplication._ensure_not_archived(workflow)
-        adapter = cast(PrinterAdapter, self.printers.get(workflow.printer_name))
+        adapter = await self._workflow_profile_adapter(workflow)
         printer = await adapter.capabilities()
 
         if workflow.state == WorkflowState.RECEIVED:
@@ -735,7 +1130,7 @@ class PrintingApplication:
                 None,
             )
             assert part is not None
-            adapter = cast(PrinterAdapter, self.printers.get(workflow.printer_name))
+            adapter = await self._workflow_profile_adapter(workflow)
             printer = await adapter.capabilities()
             selected_source = SelectedSourceSummary(
                 filename=f"{reference_part_id}.stl",
@@ -1008,7 +1403,7 @@ class PrintingApplication:
         artifact = await self.repository.get_artifact(workflow_id, artifact_version)
         if artifact.manifest_digest != manifest_digest:
             raise ValidationError("Approval digest does not match the inspected artifact")
-        adapter = cast(PrinterAdapter, self.printers.get(workflow.printer_name))
+        adapter = await self._workflow_profile_adapter(workflow)
         plan = await self.repository.get_plan(workflow_id)
         await adapter.validate(artifact, plan.print_settings)
         await self.repository.approve_artifact(
@@ -1020,9 +1415,381 @@ class PrintingApplication:
             )
         )
 
+    async def propose_material_assignment(
+        self,
+        workflow_id: str,
+    ) -> MaterialAssignment:
+        workflow = await self.repository.get_workflow(workflow_id)
+        PrintingApplication._ensure_not_archived(workflow)
+        if workflow.state != WorkflowState.SLICE_SETUP:
+            raise ConflictError(
+                "Refresh a complete cloud device snapshot before assigning materials"
+            )
+        if workflow.active_artifact_version is None:
+            raise ConflictError("Workflow has no active artifact")
+        artifact = await self.repository.get_artifact(
+            workflow_id,
+            workflow.active_artifact_version,
+        )
+        snapshot = await self.repository.get_workflow_printer_snapshot(workflow_id)
+        profile = await self.repository.get_printer_profile(
+            snapshot.profile_id,
+            snapshot.profile_revision,
+        )
+        cloud_snapshot = (
+            await self.repository.get_latest_cloud_device_snapshot(workflow_id)
+        )
+        if fabrication_utc_now() >= cloud_snapshot.expires_at:
+            raise ConflictError(
+                "Cloud inventory snapshot expired; refresh it before assigning materials"
+            )
+        spools, materials = await self._observed_cloud_spools(
+            profile,
+            cloud_snapshot,
+        )
+        plan = await self.repository.get_plan(workflow_id)
+        assignment = await self.material_assignment.propose(
+            workflow_id=workflow_id,
+            artifact=artifact,
+            profile=profile,
+            printer_snapshot_digest=snapshot.digest or "0" * 64,
+            cloud_snapshot_id=cloud_snapshot.id,
+            cloud_snapshot_digest=cloud_snapshot.digest,
+            policy=snapshot.resolved_slot_policy,
+            overrides=snapshot.overrides,
+            spools=spools,
+            materials=materials,
+            maximum_color_distance=snapshot.overrides.maximum_color_distance,
+            default_material_family=plan.print_settings.material,
+        )
+        assignment = assignment.model_copy(
+            update={"requires_confirmation": True, "digest": None}
+        ).with_digest()
+        await self.repository.save_material_assignment(assignment)
+        await self.repository.transition(
+            workflow_id,
+            WorkflowState.AWAITING_MATERIAL_REVIEW,
+            event_kind="material.assignment_ready",
+            payload={
+                "assignment_id": assignment.id,
+                "cloud_snapshot_digest": cloud_snapshot.digest,
+            },
+        )
+        return assignment
+
+    async def _observed_cloud_spools(
+        self,
+        profile: PrinterProfileRevision,
+        cloud_snapshot: CloudDeviceSnapshot,
+    ) -> tuple[
+        list[PhysicalSpool],
+        dict[tuple[str, int], MaterialDefinitionRevision],
+    ]:
+        definitions = await self.repository.list_material_definitions()
+        by_cloud_id: dict[str, list] = {}
+        for definition in definitions:
+            for cloud_id in definition.spec.cloud_filament_ids:
+                by_cloud_id.setdefault(cloud_id, []).append(definition)
+        slot_ids = {slot.id for slot in profile.spec.material_slots}
+        trays = [
+            tray
+            for unit in cloud_snapshot.ams_units
+            for tray in unit.trays
+            if tray.material is not None
+        ]
+        trays.extend(
+            tray
+            for tray in cloud_snapshot.external_trays
+            if tray.material is not None
+        )
+        spools: list[PhysicalSpool] = []
+        materials: dict[tuple[str, int], MaterialDefinitionRevision] = {}
+        for tray in trays:
+            if tray.slot_id not in slot_ids:
+                raise ConflictError(
+                    f"Observed cloud slot '{tray.slot_id}' is not defined "
+                    "by the slicing profile"
+                )
+            if (
+                tray.nominal_tray_weight_g is None
+                or tray.estimated_remaining_g is None
+                or tray.estimated_remaining_g <= 0
+            ):
+                continue
+            if not tray.material_profile_id:
+                raise ConflictError(
+                    f"Observed slot '{tray.slot_id}' has no Bambu filament identifier"
+                )
+            matches = by_cloud_id.get(tray.material_profile_id, [])
+            if len(matches) != 1:
+                raise ConflictError(
+                    f"Observed filament '{tray.material_profile_id}' in "
+                    f"slot '{tray.slot_id}' has no unique local material mapping"
+                )
+            material = matches[0]
+            spool_id = (
+                "cloud-"
+                + hashlib.sha256(
+                    (
+                        f"{cloud_snapshot.device.device_id}:{tray.slot_id}"
+                    ).encode()
+                ).hexdigest()[:24]
+            )
+            spool = PhysicalSpool(
+                id=spool_id,
+                material_id=material.material_id,
+                material_revision=material.revision,
+                material_digest=material.digest or "0" * 64,
+                initial_weight_g=tray.nominal_tray_weight_g,
+                remaining_weight_g=tray.estimated_remaining_g,
+                status=SpoolStatus.LOADED,
+                location=f"cloud snapshot {cloud_snapshot.id}",
+                printer_profile_id=profile.profile_id,
+                slot_id=tray.slot_id,
+                measured_color=(
+                    tray.color
+                    if tray.color and tray.color.startswith("#")
+                    else None
+                ),
+                cloud_snapshot_digest=cloud_snapshot.digest,
+            )
+            await self.repository.save_spool(spool)
+            spools.append(spool)
+            materials[(material.material_id, material.revision)] = material
+        if not spools:
+            raise ConflictError("Cloud snapshot contains no usable loaded material")
+        return spools, materials
+
+    async def confirm_material_assignment(
+        self,
+        workflow_id: str,
+        assignment_id: str,
+        confirmed_by: str,
+        spool_overrides: dict[str, str] | None = None,
+    ) -> MaterialAssignment:
+        workflow = await self.repository.get_workflow(workflow_id)
+        if workflow.state != WorkflowState.AWAITING_MATERIAL_REVIEW:
+            raise ConflictError("Workflow is not awaiting material review")
+        assignment = await self.repository.get_latest_material_assignment(workflow_id)
+        if assignment.id != assignment_id:
+            raise ConflictError("Material assignment is stale")
+        if spool_overrides:
+            assignment = self.material_assignment.apply_user_overrides(
+                assignment,
+                spool_overrides,
+            )
+        confirmed = assignment.model_copy(
+            update={
+                "confirmed_by": confirmed_by,
+                "confirmed_at": fabrication_utc_now(),
+                "digest": None,
+            }
+        ).with_digest()
+        await self.repository.save_material_assignment(confirmed)
+        return confirmed
+
+    async def request_slice(self, workflow_id: str) -> SliceJob:
+        workflow = await self.repository.get_workflow(workflow_id)
+        PrintingApplication._ensure_not_archived(workflow)
+        if workflow.state not in {
+            WorkflowState.AWAITING_MATERIAL_REVIEW,
+            WorkflowState.SLICE_FAILED,
+            WorkflowState.AWAITING_SLICE_REVIEW,
+        }:
+            raise ConflictError("Workflow is not ready for slicing or reslicing")
+        if workflow.active_artifact_version is None:
+            raise ConflictError("Workflow has no active artifact")
+        artifact = await self.repository.get_artifact(
+            workflow_id,
+            workflow.active_artifact_version,
+        )
+        snapshot = await self.repository.get_workflow_printer_snapshot(workflow_id)
+        profile = await self.repository.get_printer_profile(
+            snapshot.profile_id,
+            snapshot.profile_revision,
+        )
+        assignment = await self.repository.get_latest_material_assignment(workflow_id)
+        if assignment.confirmed_at is None:
+            raise ConflictError("Material assignment requires user confirmation")
+        if (
+            assignment.artifact_version != artifact.version
+            or assignment.artifact_manifest_digest != artifact.manifest_digest
+            or assignment.printer_snapshot_digest != snapshot.digest
+        ):
+            raise ConflictError("Material assignment no longer matches the workflow")
+        selected_device = profile.spec.cloud_device_serial
+        if not selected_device:
+            raise ConflictError("Slicing profile has no bound cloud H2D device")
+        try:
+            fresh_cloud_snapshot = await self.inventory.snapshot(selected_device)
+        except CloudInventoryError as exc:
+            raise ExternalServiceError(str(exc)) from exc
+        self._validate_cloud_snapshot(profile, fresh_cloud_snapshot)
+        await self.repository.save_cloud_device_snapshot(
+            workflow_id,
+            profile.profile_id,
+            fresh_cloud_snapshot,
+        )
+        if fresh_cloud_snapshot.digest != assignment.cloud_snapshot_digest:
+            if workflow.state != WorkflowState.SLICE_SETUP:
+                await self.repository.transition(
+                    workflow_id,
+                    WorkflowState.SLICE_SETUP,
+                    event_kind="cloud.inventory_changed",
+                    payload={
+                        "previous_digest": assignment.cloud_snapshot_digest,
+                        "current_digest": fresh_cloud_snapshot.digest,
+                    },
+                )
+            raise ConflictError(
+                "Cloud printer or AMS inventory changed; review materials again"
+            )
+        idempotency_key = hashlib.sha256(
+            (
+                f"{workflow_id}:{artifact.manifest_digest}:{snapshot.digest}:"
+                f"{assignment.digest}:{workflow.version}"
+            ).encode()
+        ).hexdigest()
+        job = SliceJob(
+            workflow_id=workflow_id,
+            artifact_version=artifact.version,
+            artifact_manifest_digest=artifact.manifest_digest,
+            printer_snapshot_digest=snapshot.digest or "0" * 64,
+            cloud_snapshot_digest=fresh_cloud_snapshot.digest,
+            material_assignment_digest=assignment.digest or "0" * 64,
+            slicer_driver_id=snapshot.profile.slicer.driver_id,
+            material_safety_margin_percent=(
+                snapshot.overrides.material_safety_margin_percent
+            ),
+            idempotency_key=idempotency_key,
+        )
+        requested_weights = {
+            request.part_id: request.estimated_weight_g
+            for request in assignment.requests
+        }
+        if any(weight is None or weight <= 0 for weight in requested_weights.values()):
+            raise ConflictError(
+                "Every material assignment requires a positive pre-slice weight estimate"
+            )
+        reservation_weights: dict[str, float] = {}
+        for part_assignment in assignment.assignments:
+            reservation_weights[part_assignment.spool_id] = (
+                reservation_weights.get(part_assignment.spool_id, 0)
+                + float(requested_weights[part_assignment.part_id])
+                * (
+                    1
+                    + snapshot.overrides.material_safety_margin_percent
+                    / 100
+                )
+            )
+        reservations = []
+        for spool_id, weight in reservation_weights.items():
+            spool = await self.repository.get_spool(spool_id)
+            if spool.cloud_snapshot_digest != fresh_cloud_snapshot.digest:
+                raise ConflictError(
+                    f"Observed spool '{spool_id}' is stale; refresh materials"
+                )
+            reservations.append(
+                SpoolReservation(
+                    workflow_id=workflow_id,
+                    slice_job_id=job.id,
+                    spool_id=spool_id,
+                    reserved_weight_g=weight,
+                    remaining_weight_snapshot_g=spool.remaining_weight_g,
+                )
+            )
+        await self.repository.enqueue_slice(job, reservations)
+        return job
+
+    async def slice_workflow(self, workflow_id: str) -> None:
+        job = await self.repository.get_latest_slice_job(workflow_id)
+        workspace = None
+        try:
+            job = job.model_copy(
+                update={
+                    "status": SliceJobStatus.SLICING,
+                    "updated_at": fabrication_utc_now(),
+                    "message": "Bambu Studio slicing started",
+                }
+            )
+            await self.repository.save_slice_job(job)
+            await self.repository.transition(
+                workflow_id,
+                WorkflowState.SLICING,
+                event_kind="slice.started",
+                payload={"slice_job_id": job.id},
+            )
+            artifact = await self.repository.get_artifact(
+                workflow_id,
+                job.artifact_version,
+            )
+            snapshot = await self.repository.get_workflow_printer_snapshot(workflow_id)
+            assignment = await self.repository.get_latest_material_assignment(workflow_id)
+            if assignment.digest != job.material_assignment_digest:
+                raise ConflictError("Slice job material assignment is stale")
+            driver = self.slicers.get(job.slicer_driver_id)
+            workspace = self.settings.slice_dir / workflow_id / job.id
+            sliced = await driver.slice(
+                SliceRequest(
+                    job=job,
+                    artifact=artifact,
+                    printer=snapshot,
+                    material_assignment=assignment,
+                    workspace=workspace,
+                )
+            )
+            await self.repository.reconcile_spool_reservations(
+                job.id,
+                sliced.filament_usage_g,
+                job.material_safety_margin_percent,
+            )
+            job = job.model_copy(
+                update={
+                    "status": SliceJobStatus.VALIDATING,
+                    "updated_at": fabrication_utc_now(),
+                    "message": "Validating sliced G-code 3MF",
+                }
+            )
+            await self.repository.save_slice_job(job)
+            await self.repository.transition(
+                workflow_id,
+                WorkflowState.SLICE_VALIDATING,
+                event_kind="slice.validating",
+                payload={"slice_job_id": job.id},
+            )
+            ready_job = job.model_copy(
+                update={
+                    "status": SliceJobStatus.READY,
+                    "updated_at": fabrication_utc_now(),
+                    "message": "Sliced job is ready for review",
+                }
+            )
+            await self.repository.finalize_slice(ready_job, sliced)
+        except Exception as exc:
+            try:
+                await self.repository.fail_slice(job, str(exc)[-2_000:])
+            finally:
+                if workspace is not None:
+                    await asyncio.to_thread(
+                        shutil.rmtree,
+                        workspace,
+                        True,
+                    )
+
     async def request_print(self, workflow_id: str) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
         PrintingApplication._ensure_not_archived(workflow)
+        try:
+            snapshot = await self.repository.get_workflow_printer_snapshot(workflow_id)
+        except NotFoundError:
+            snapshot = None
+        if (
+            snapshot is not None
+            and snapshot.profile.slicer.driver_id != "simulator_passthrough"
+        ):
+            raise ConflictError(
+                "This printer requires material assignment and slicing before submission"
+            )
         await self.repository.enqueue_print_submission(workflow_id)
 
     async def archive_workflow(self, workflow_id: str) -> PrintWorkflow:
@@ -1063,7 +1830,13 @@ class PrintingApplication:
         )
         await self.repository.finalize_print_submission(job)
 
-    async def copy_workflow(self, workflow_id: str) -> PrintWorkflow:
+    async def copy_workflow(
+        self,
+        workflow_id: str,
+        *,
+        target_printer_name: str | None = None,
+        overrides: JobOverrides | None = None,
+    ) -> PrintWorkflow:
         source_workflow = await self.repository.get_workflow(workflow_id)
         PrintingApplication._ensure_not_archived(source_workflow)
         if source_workflow.active_artifact_version is None:
@@ -1081,9 +1854,11 @@ class PrintingApplication:
             else None
         )
         plan = await self.repository.get_plan(workflow_id)
+        fabrication_copy = target_printer_name is not None
+        printer_name = target_printer_name or source_workflow.printer_name
         copied_workflow = PrintWorkflow(
             requirement=source_workflow.requirement,
-            printer_name=source_workflow.printer_name,
+            printer_name=printer_name,
             state=WorkflowState.AWAITING_APPROVAL,
             active_handoff_version=1 if source_handoff is not None else None,
             active_artifact_version=1,
@@ -1100,6 +1875,63 @@ class PrintingApplication:
             else None
         )
         try:
+            if fabrication_copy:
+                target_profile, copied_snapshot = await self._build_printer_snapshot(
+                    copied_workflow.id,
+                    printer_name,
+                    overrides or JobOverrides(),
+                )
+                if (
+                    target_profile.spec.slicer.driver_id
+                    == "simulator_passthrough"
+                ):
+                    raise ValidationError(
+                        "Fabrication copies require a slicing-capable printer profile"
+                    )
+                await self.slicers.get(
+                    target_profile.spec.slicer.driver_id
+                ).validate_profile(target_profile)
+            else:
+                target_profile = None
+                try:
+                    source_snapshot = (
+                        await self.repository.get_workflow_printer_snapshot(
+                            workflow_id
+                        )
+                    )
+                except NotFoundError:
+                    if source_workflow.printer_name != "simulator":
+                        raise
+                    profile = built_in_simulator_profile()
+                    try:
+                        await self.repository.get_printer_profile(
+                            profile.profile_id,
+                            profile.revision,
+                        )
+                    except NotFoundError:
+                        await self.repository.save_printer_profile(profile)
+                    source_snapshot = WorkflowPrinterSnapshot(
+                        workflow_id=workflow_id,
+                        profile_id=profile.profile_id,
+                        profile_revision=profile.revision,
+                        profile_digest=profile.digest or "0" * 64,
+                        profile=profile.spec,
+                        slicer_profile_file_digests=await asyncio.to_thread(
+                            resolve_slicer_profile_file_digests,
+                            profile,
+                        ),
+                        resolved_slot_policy=resolve_slot_policy(
+                            profile.spec,
+                            JobOverrides(),
+                        ),
+                    ).with_digest()
+                copied_snapshot = source_snapshot.model_copy(
+                    update={
+                        "workflow_id": copied_workflow.id,
+                        "digest": None,
+                    }
+                ).with_digest()
+
             copied_from = {
                 "workflow_id": workflow_id,
                 "artifact_version": source_artifact.version,
@@ -1136,6 +1968,7 @@ class PrintingApplication:
                     encoding="utf-8",
                 )
                 adopted = self.artifacts.adopt_project(copied_workflow.id, 1, staging)
+                shutil.rmtree(staging)
                 source_relative = (
                     source_artifact.source_path.relative_to(source_directory)
                     if source_artifact.source_path is not None
@@ -1164,6 +1997,87 @@ class PrintingApplication:
                         ),
                         "manifest_digest": manifest_digest,
                     }
+                )
+            elif fabrication_copy:
+                staging = (
+                    self.artifacts.workflow_root(copied_workflow.id)
+                    / "staging"
+                    / "artifact-1"
+                )
+                source_path = (
+                    source_artifact.source_path or source_artifact.model_path
+                )
+                imported = (
+                    source_artifact.source_path is None
+                    or source_path.suffix.casefold() != ".scad"
+                )
+                project = single_part_project(
+                    source_digest=(
+                        source_artifact.source_digest
+                        or source_artifact.model_digest
+                    ),
+                    imported=imported,
+                    source_filename=source_path.name,
+                )
+                manifest, files = await asyncio.to_thread(
+                    write_project_artifact,
+                    directory=staging,
+                    workflow_id=copied_workflow.id,
+                    version=1,
+                    project=project,
+                    source_path=source_path,
+                    model_path=source_artifact.model_path,
+                    mesh=source_artifact.mesh,
+                    provenance=source_artifact.provenance,
+                    handoff_digest=(
+                        copied_handoff.digest
+                        if copied_handoff is not None
+                        else None
+                    ),
+                    diagnostics=None,
+                    imported=imported,
+                )
+                manifest["copied_from"] = copied_from
+                manifest.pop("manifest_digest", None)
+                manifest_digest = canonical_digest(manifest)
+                manifest["manifest_digest"] = manifest_digest
+                (staging / "manifest.json").write_text(
+                    json.dumps(manifest, sort_keys=True, indent=2),
+                    encoding="utf-8",
+                )
+                adopted = self.artifacts.adopt_project(
+                    copied_workflow.id,
+                    1,
+                    staging,
+                )
+                shutil.rmtree(staging)
+                copied_artifact = ModelArtifact(
+                    schema_version="2",
+                    workflow_id=copied_workflow.id,
+                    version=1,
+                    source_path=adopted / "project" / "main.scad",
+                    model_path=(
+                        adopted
+                        / "outputs"
+                        / "parts"
+                        / "base_model.stl"
+                    ),
+                    project_path=adopted / "project" / "project.json",
+                    three_mf_path=adopted / "outputs" / "model.3mf",
+                    source_digest=(
+                        source_artifact.source_digest
+                        or source_artifact.model_digest
+                    ),
+                    model_digest=str(manifest["model_digest"]),
+                    project_digest=str(manifest["project_digest"]),
+                    three_mf_digest=str(manifest["three_mf_digest"]),
+                    manifest_digest=manifest_digest,
+                    mesh=source_artifact.mesh,
+                    project=project,
+                    part_meshes={"base_model": source_artifact.mesh},
+                    files=files,
+                    provenance=source_artifact.provenance,
+                    revision=source_artifact.revision,
                 )
             else:
                 manifest = {
@@ -1195,13 +2109,55 @@ class PrintingApplication:
                         "manifest_digest": manifest_digest,
                     }
                 )
+
+            carried_approval = None
+            if fabrication_copy and source_artifact.schema_version == "2":
+                try:
+                    source_approval = await self.repository.get_approval(
+                        workflow_id
+                    )
+                except NotFoundError:
+                    source_approval = None
+                if (
+                    source_approval is not None
+                    and source_approval.artifact_version
+                    == source_artifact.version
+                    and source_approval.manifest_digest
+                    == source_artifact.manifest_digest
+                    and copied_artifact.three_mf_path is not None
+                    and self._same_printable_content(
+                        source_artifact,
+                        copied_artifact,
+                    )
+                ):
+                    assert target_profile is not None
+                    await ProfilePrinterAdapter(target_profile).validate(
+                        copied_artifact,
+                        plan.print_settings,
+                    )
+                    carried_approval = ArtifactApproval(
+                        workflow_id=copied_workflow.id,
+                        artifact_version=copied_artifact.version,
+                        manifest_digest=copied_artifact.manifest_digest,
+                        approved_by=(
+                            "carried-from:"
+                            f"{workflow_id}:{source_approval.approved_by}"
+                        ),
+                    )
+                    copied_workflow = copied_workflow.model_copy(
+                        update={"state": WorkflowState.APPROVED}
+                    )
+
             await self.repository.create_copy(
                 copied_workflow,
                 plan,
                 copied_handoff,
                 copied_artifact,
+                copied_snapshot,
+                carried_approval,
                 source_workflow_id=workflow_id,
                 source_artifact_version=source_artifact.version,
+                fabrication=fabrication_copy,
             )
             return copied_workflow
         except Exception:
@@ -1210,6 +2166,43 @@ class PrintingApplication:
                 ignore_errors=True,
             )
             raise
+
+    @staticmethod
+    def _same_printable_content(
+        source: ModelArtifact,
+        copied: ModelArtifact,
+    ) -> bool:
+        if any(
+            getattr(source, field) != getattr(copied, field)
+            for field in (
+                "source_digest",
+                "model_digest",
+                "project_digest",
+                "three_mf_digest",
+            )
+        ):
+            return False
+        source_files = sorted(
+            (
+                item.role,
+                item.path,
+                item.digest,
+                item.size_bytes,
+                item.part_id,
+            )
+            for item in source.files
+        )
+        copied_files = sorted(
+            (
+                item.role,
+                item.path,
+                item.digest,
+                item.size_bytes,
+                item.part_id,
+            )
+            for item in copied.files
+        )
+        return source_files == copied_files
 
     async def refresh_print(self, workflow_id: str) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
@@ -1242,17 +2235,33 @@ class PrintingApplication:
             )
 
     async def cancel(self, workflow_id: str) -> None:
-        workflow = await self.repository.get_workflow(workflow_id)
-        PrintingApplication._ensure_not_archived(workflow)
-        if workflow.state in {WorkflowState.QUEUED, WorkflowState.PRINTING}:
-            job = await self.repository.get_latest_job(workflow_id)
-            if job is None:
-                raise ConflictError("Workflow has no printer job")
-            adapter = cast(PrinterAdapter, self.printers.get(job.printer_name))
-            cancelled = await adapter.cancel(job.external_id)
-            await self.repository.save_job(cancelled)
-        await self.repository.transition(
-            workflow_id,
-            WorkflowState.CANCELLED,
-            event_kind="workflow.cancelled",
-        )
+        lock = self._cancel_locks.setdefault(workflow_id, asyncio.Lock())
+        async with lock:
+            workflow = await self.repository.get_workflow(workflow_id)
+            PrintingApplication._ensure_not_archived(workflow)
+            if workflow.state == WorkflowState.CANCELLED:
+                return
+            if workflow.state in {WorkflowState.QUEUED, WorkflowState.PRINTING}:
+                job = await self.repository.get_latest_job(workflow_id)
+                if job is None:
+                    raise ConflictError("Workflow has no printer job")
+                adapter = cast(PrinterAdapter, self.printers.get(job.printer_name))
+                cancelled = await adapter.cancel(job.external_id)
+                await self.repository.save_job(cancelled)
+            if workflow.state in {
+                WorkflowState.SLICE_REQUESTED,
+                WorkflowState.SLICING,
+                WorkflowState.SLICE_VALIDATING,
+                WorkflowState.AWAITING_SLICE_REVIEW,
+            }:
+                job = await self.repository.get_latest_slice_job(workflow_id)
+                if workflow.state == WorkflowState.SLICING:
+                    await self.slicers.get(job.slicer_driver_id).cancel(job.id)
+                await self.repository.complete_spool_reservations(
+                    job.id,
+                )
+            await self.repository.transition(
+                workflow_id,
+                WorkflowState.CANCELLED,
+                event_kind="workflow.cancelled",
+            )
