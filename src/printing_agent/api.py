@@ -145,6 +145,24 @@ def create_app(container: Container | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def cache_static_content(
+        request: Request,
+        call_next,
+    ):
+        response = await call_next(request)
+        if request.method in {"GET", "HEAD"}:
+            content_type = response.headers.get("content-type", "")
+            if content_type.startswith("text/html"):
+                response.headers["Cache-Control"] = (
+                    "no-store, no-cache, must-revalidate"
+                )
+            elif request.url.path.startswith("/assets/"):
+                response.headers["Cache-Control"] = (
+                    "public, max-age=31536000, immutable"
+                )
+        return response
+
     @app.exception_handler(PrintingAgentError)
     async def printing_error_handler(
         request: Request,
