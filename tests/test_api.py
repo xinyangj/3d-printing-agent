@@ -273,7 +273,9 @@ async def test_slicing_profile_cannot_override_server_executable(
 
     assert rejected.status_code == 422
     assert response.status_code == 201
-    assert response.json()["spec"]["slicer"]["executable_path"] is None
+    assert response.json()["spec"]["slicer"]["executable_path"] == (
+        settings.bambu_studio_path
+    )
 
 
 def test_fastapi_bind_rejects_non_loopback(tmp_path: Path) -> None:
