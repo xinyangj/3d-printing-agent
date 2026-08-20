@@ -179,6 +179,21 @@ type PrinterProfile = {
   }
 }
 
+type FabricationReadiness = {
+  profile_id: string
+  profile_revision: number
+  display_name: string
+  slicing_capable: boolean
+  ready_for_fabrication: boolean
+  slicer: { ready: boolean; message: string }
+  submission: {
+    ready: boolean
+    message: string
+    account_login: 'not_applicable' | 'external_user_action'
+    account_message: string | null
+  }
+}
+
 type MaterialAssignmentPayload = {
   id: string
   requires_confirmation: boolean
@@ -790,9 +805,281 @@ function ModelThumbnail({ url }: { url: string }) {
   return <div className="model-thumbnail" ref={containerRef} aria-label="3D model preview" />
 }
 
+function PrintWithBambuDialog({
+  source,
+  profiles,
+  readiness,
+  onClose,
+  onCreated,
+}: {
+  source: WorkflowResponse
+  profiles: PrinterProfile[]
+  readiness: FabricationReadiness[]
+  onClose: () => void
+  onCreated: (id: string) => void
+}) {
+  const slicingProfiles = profiles.filter(
+    (profile) => profile.spec.slicer.driver_id !== 'simulator_passthrough',
+  )
+  const [profileId, setProfileId] = useState(
+    slicingProfiles.find((profile) => profile.profile_id === 'bambu-h2d')?.profile_id ??
+      slicingProfiles[0]?.profile_id ??
+      '',
+  )
+  const [toolheadId, setToolheadId] = useState('')
+  const [plateId, setPlateId] = useState('')
+  const [layerHeight, setLayerHeight] = useState(0.2)
+  const [infill, setInfill] = useState(20)
+  const [supports, setSupports] = useState(false)
+  const [allowManualSwaps, setAllowManualSwaps] = useState(true)
+  const [maximumColorDistance, setMaximumColorDistance] = useState(12)
+  const [forbiddenSlots, setForbiddenSlots] = useState<string[]>([])
+  const selectedProfile = slicingProfiles.find((profile) => profile.profile_id === profileId)
+  const selectedReadiness = readiness.find(
+    (item) =>
+      item.profile_id === profileId &&
+      item.profile_revision === selectedProfile?.revision,
+  )
+  const hasAdminToken = Boolean(sessionStorage.getItem('printing-agent-admin-token'))
+  const create = useMutation({
+    mutationFn: () =>
+      api<WorkflowResponse>(`/workflows/${source.workflow.id}/fabrication-copies`, {
+        method: 'POST',
+        body: JSON.stringify({
+          profile_id: profileId,
+          overrides: {
+            toolhead_id: toolheadId || null,
+            nozzle_diameter_mm: null,
+            plate_id: plateId || null,
+            layer_height_mm: layerHeight,
+            infill_percent: infill,
+            supports,
+            brim: null,
+            raft: null,
+            timelapse: null,
+            calibration: null,
+            forbidden_slot_ids: forbiddenSlots,
+            allowed_slot_ids: null,
+            part_allowed_slot_ids: {},
+            part_forbidden_slot_ids: {},
+            allow_manual_swaps: allowManualSwaps,
+            maximum_color_distance: maximumColorDistance,
+          } satisfies JobOverrides,
+        }),
+      }),
+    onSuccess: (created) => onCreated(created.workflow.id),
+  })
+  const canCreate =
+    Boolean(selectedProfile) &&
+    selectedReadiness?.ready_for_fabrication === true &&
+    hasAdminToken
+
+  const toggleForbidden = (slotId: string) => {
+    setForbiddenSlots((current) =>
+      current.includes(slotId)
+        ? current.filter((candidate) => candidate !== slotId)
+        : [...current, slotId],
+    )
+  }
+
+  return (
+    <div
+      className="dialog-backdrop"
+      onMouseDown={(event) => {
+        if (event.currentTarget === event.target && !create.isPending) onClose()
+      }}
+    >
+      <section
+        aria-labelledby="print-with-bambu-title"
+        aria-modal="true"
+        className="fabrication-dialog"
+        role="dialog"
+      >
+        <header>
+          <div>
+            <span className="eyebrow">Existing model → printer workflow</span>
+            <h2 id="print-with-bambu-title">Print with Bambu</h2>
+            <p>{source.workflow.requirement}</p>
+          </div>
+          <button
+            aria-label="Close printer setup"
+            className="dialog-close"
+            disabled={create.isPending}
+            onClick={onClose}
+          >
+            ×
+          </button>
+        </header>
+
+        <div className="dialog-grid">
+          <div className="job-overrides">
+            <label>
+              Printer profile
+              <select
+                value={profileId}
+                onChange={(event) => {
+                  setProfileId(event.target.value)
+                  setToolheadId('')
+                  setPlateId('')
+                  setForbiddenSlots([])
+                }}
+              >
+                {slicingProfiles.map((profile) => (
+                  <option key={profile.profile_id} value={profile.profile_id}>
+                    {profile.spec.display_name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Toolhead
+              <select value={toolheadId} onChange={(event) => setToolheadId(event.target.value)}>
+                <option value="">Profile default</option>
+                {(selectedProfile?.spec.toolheads ?? []).map((toolhead) => (
+                  <option key={toolhead.id} value={toolhead.id}>
+                    {toolhead.name} · {toolhead.nozzle_diameter_mm} mm
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Plate
+              <select value={plateId} onChange={(event) => setPlateId(event.target.value)}>
+                <option value="">Profile default</option>
+                {(selectedProfile?.spec.plates ?? []).map((plate) => (
+                  <option key={plate.id} value={plate.id}>{plate.name}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Layer height
+              <input
+                max="1"
+                min="0.05"
+                onChange={(event) => setLayerHeight(Number(event.target.value))}
+                step="0.05"
+                type="number"
+                value={layerHeight}
+              />
+            </label>
+            <label>
+              Infill %
+              <input
+                max="100"
+                min="0"
+                onChange={(event) => setInfill(Number(event.target.value))}
+                type="number"
+                value={infill}
+              />
+            </label>
+            <label>
+              Maximum color distance
+              <input
+                max="100"
+                min="0"
+                onChange={(event) => setMaximumColorDistance(Number(event.target.value))}
+                step="0.5"
+                type="number"
+                value={maximumColorDistance}
+              />
+            </label>
+            <label className="checkbox-label">
+              <input
+                checked={supports}
+                onChange={(event) => setSupports(event.target.checked)}
+                type="checkbox"
+              />
+              Generate supports
+            </label>
+            <label className="checkbox-label">
+              <input
+                checked={allowManualSwaps}
+                onChange={(event) => setAllowManualSwaps(event.target.checked)}
+                type="checkbox"
+              />
+              Allow manual spool swaps
+            </label>
+            <span className="section-label">Forbidden slots for this print</span>
+            <div className="override-slots">
+              {(selectedProfile?.spec.material_slots ?? []).map((slot) => (
+                <label className="checkbox-label" key={slot.id}>
+                  <input
+                    checked={forbiddenSlots.includes(slot.id)}
+                    onChange={() => toggleForbidden(slot.id)}
+                    type="checkbox"
+                  />
+                  {slot.name}
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <aside className="readiness-card">
+            <span className="section-label">Local slicing</span>
+            <strong className={selectedReadiness?.slicer.ready ? 'ready' : 'not-ready'}>
+              {selectedReadiness?.slicer.ready ? 'Bambu Studio ready' : 'Bambu Studio setup required'}
+            </strong>
+            <p>{selectedReadiness?.slicer.message ?? 'No slicing-capable profile is configured.'}</p>
+
+            <span className="section-label">Cloud handoff</span>
+            <strong className={selectedReadiness?.submission.ready ? 'ready' : 'not-ready'}>
+              {selectedReadiness?.submission.ready
+                ? 'Bambu Connect detected'
+                : 'Bambu Connect setup required'}
+            </strong>
+            <p>{selectedReadiness?.submission.message}</p>
+            <p className="account-boundary">
+              {selectedReadiness?.submission.account_message ??
+                'Bambu account sign-in is not handled by this server.'}
+            </p>
+
+            {!hasAdminToken && (
+              <div className="prerequisite-warning">
+                <strong>Admin API token required</strong>
+                <p>Save the deployment token for this browser session before creating the workflow.</p>
+                <button
+                  className="text-button"
+                  onClick={() => {
+                    onClose()
+                    window.location.hash = '/fabrication'
+                  }}
+                >
+                  Open Printers &amp; materials
+                </button>
+              </div>
+            )}
+            {!selectedReadiness?.submission.ready && (
+              <p className="muted">
+                You can prepare materials and slice after Bambu Studio is ready. Connect must be
+                installed and signed in before cloud submission.
+              </p>
+            )}
+          </aside>
+        </div>
+
+        <footer>
+          <button className="secondary-action" disabled={create.isPending} onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            className="primary-action"
+            disabled={!canCreate || create.isPending}
+            onClick={() => create.mutate()}
+          >
+            {create.isPending ? 'Creating print workflow…' : 'Continue to model approval'}
+            <span>→</span>
+          </button>
+        </footer>
+        {create.error && <p className="error-copy">{create.error.message}</p>}
+      </section>
+    </div>
+  )
+}
+
 function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
   const queryClient = useQueryClient()
   const [filter, setFilter] = useState<DashboardFilter>('all')
+  const [printSource, setPrintSource] = useState<WorkflowResponse | null>(null)
   const workflows = useQuery({
     queryKey: ['workflows'],
     queryFn: () => api<WorkflowResponse[]>('/workflows'),
@@ -802,6 +1089,14 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
       )
         ? 2500
         : 10000,
+  })
+  const profiles = useQuery({
+    queryKey: ['printer-profiles'],
+    queryFn: () => api<PrinterProfile[]>('/printer-profiles'),
+  })
+  const readiness = useQuery({
+    queryKey: ['fabrication-readiness'],
+    queryFn: () => api<FabricationReadiness[]>('/fabrication/readiness'),
   })
   const copy = useMutation({
     mutationFn: (id: string) =>
@@ -872,7 +1167,8 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
         <div className="empty-dashboard">No models match this lifecycle filter.</div>
       )}
       <section className="model-grid">
-        {items.map(({ workflow, artifact, job, revision_failure, printer_snapshot }) => {
+        {items.map((entry) => {
+          const { workflow, artifact, job, revision_failure, printer_snapshot } = entry
           const modelUrl = artifact
             ? artifactPreviewUrl(workflow.id, artifact)
             : null
@@ -930,6 +1226,12 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
                   <button className="secondary-action" onClick={() => onOpen(workflow.id)}>
                     {workflow.state === 'awaiting_approval'
                       ? 'Inspect & approve'
+                      : ['slice_requested', 'slicing', 'slice_validating'].includes(workflow.state)
+                        ? 'View slicing'
+                        : workflow.state === 'awaiting_slice_review'
+                          ? 'Review slice'
+                          : workflow.state === 'external_confirmation_required'
+                            ? 'Continue in Bambu Connect'
                       : ['submitting', 'queued', 'printing', 'completed', 'print_failed'].includes(
                             workflow.state,
                           )
@@ -953,6 +1255,14 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
                           onClick={() => copy.mutate(workflow.id)}
                         >
                           Make a copy
+                        </button>
+                      )}
+                      {artifact && (
+                        <button
+                          className="primary-action"
+                          onClick={() => setPrintSource(entry)}
+                        >
+                          Print with Bambu <span>→</span>
                         </button>
                       )}
                       {['awaiting_approval', 'approved'].includes(workflow.state) &&
@@ -988,7 +1298,7 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
                           className="primary-action"
                           onClick={() => onOpen(workflow.id)}
                         >
-                          Continue to slicing <span>→</span>
+                          Continue material setup <span>→</span>
                         </button>
                       )}
                     </>
@@ -1004,7 +1314,77 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
           {copy.error?.message ?? print.error?.message ?? archive.error?.message}
         </p>
       )}
+      {printSource && (
+        <PrintWithBambuDialog
+          onClose={() => setPrintSource(null)}
+          onCreated={onOpen}
+          profiles={profiles.data ?? []}
+          readiness={readiness.data ?? []}
+          source={printSource}
+        />
+      )}
     </main>
+  )
+}
+
+function FabricationStepper({
+  workflow,
+  data,
+}: {
+  workflow: Workflow
+  data: WorkflowResponse
+}) {
+  const approvalComplete = workflow.state !== 'awaiting_approval'
+  const materialComplete = Boolean(data.material_assignment?.confirmed_at)
+  const sliceComplete = Boolean(data.sliced_artifact)
+  const reviewComplete = [
+    'external_confirmation_required',
+    'user_confirmed_submitted',
+  ].includes(workflow.state)
+  const connectComplete = workflow.state === 'user_confirmed_submitted'
+  const statuses: Array<'complete' | 'active' | 'pending'> = [
+    approvalComplete ? 'complete' : 'active',
+    materialComplete
+      ? 'complete'
+      : workflow.state === 'approved'
+        ? 'active'
+        : 'pending',
+    sliceComplete
+      ? 'complete'
+      : materialComplete ||
+          ['slice_requested', 'slicing', 'slice_validating', 'slice_failed'].includes(
+            workflow.state,
+          )
+        ? 'active'
+        : 'pending',
+    reviewComplete
+      ? 'complete'
+      : workflow.state === 'awaiting_slice_review'
+        ? 'active'
+        : 'pending',
+    connectComplete
+      ? 'complete'
+      : workflow.state === 'external_confirmation_required'
+        ? 'active'
+        : 'pending',
+  ]
+  const steps = [
+    ['1', 'Model approval'],
+    ['2', 'Material assignment'],
+    ['3', 'Slice in Bambu Studio'],
+    ['4', 'Review sliced file'],
+    ['5', 'Sign in & submit in Connect'],
+  ]
+
+  return (
+    <ol className="fabrication-stepper">
+      {steps.map(([number, label], index) => (
+        <li className={statuses[index]} key={number}>
+          <span>{statuses[index] === 'complete' ? '✓' : number}</span>
+          <strong>{label}</strong>
+        </li>
+      ))}
+    </ol>
   )
 }
 
@@ -1033,11 +1413,28 @@ function WorkflowPanel({
   const data = workflowQuery.data
   const artifact = data?.artifact
   const workflow = data?.workflow
+  const pinnedProfileId = data?.printer_snapshot?.profile_id
+  const pinnedProfileRevision = data?.printer_snapshot?.profile_revision
+  const readinessQuery = useQuery({
+    queryKey: [
+      'fabrication-readiness',
+      pinnedProfileId,
+      pinnedProfileRevision,
+    ],
+    queryFn: () =>
+      api<FabricationReadiness[]>(
+        `/fabrication/readiness?profile_id=${encodeURIComponent(
+          pinnedProfileId!,
+        )}&profile_revision=${pinnedProfileRevision}`,
+      ),
+    enabled: Boolean(pinnedProfileId && pinnedProfileRevision),
+  })
   const revisionFailure = data?.revision_failure
   const revisionVerification = data?.revision_verification
   const requiresSlicing =
     Boolean(data?.printer_snapshot) &&
     data?.printer_snapshot?.profile.slicer.driver_id !== 'simulator_passthrough'
+  const profileReadiness = readinessQuery.data?.[0]
   useEffect(() => {
     const partIds = new Set(artifact?.project?.parts.map((part) => part.id) ?? [])
     setScopedPartIds((current) => current.filter((partId) => partIds.has(partId)))
@@ -1611,12 +2008,14 @@ function WorkflowPanel({
           {!workflow.archived_at &&
             requiresSlicing &&
             [
+              'awaiting_approval',
               'approved',
               'slice_requested',
               'slicing',
               'slice_validating',
               'awaiting_slice_review',
               'slice_failed',
+              'submission_handoff_requested',
               'external_confirmation_required',
               'user_confirmed_submitted',
             ].includes(workflow.state) && (
@@ -1631,6 +2030,7 @@ function WorkflowPanel({
                     authorization are separate immutable boundaries.
                   </p>
                 </div>
+                <FabricationStepper data={data} workflow={workflow} />
 
                 {!data.material_assignment && workflow.state === 'approved' && (
                   <button
@@ -1690,8 +2090,8 @@ function WorkflowPanel({
                       {slice.isPending
                         ? 'Requesting slice…'
                         : workflow.state === 'approved'
-                          ? 'Slice for printer'
-                          : 'Reslice for printer'}
+                          ? 'Slice in Bambu Studio'
+                          : 'Reslice in Bambu Studio'}
                     </button>
                   )}
 
@@ -1722,13 +2122,36 @@ function WorkflowPanel({
                 )}
 
                 {workflow.state === 'awaiting_slice_review' && data.sliced_artifact && (
-                  <button
-                    className="primary-action"
-                    disabled={handoff.isPending}
-                    onClick={() => handoff.mutate()}
-                  >
-                    {handoff.isPending ? 'Opening Bambu Connect…' : 'Open in Bambu Connect'}
-                  </button>
+                  <div className="connect-boundary">
+                    <span className="section-label">Bambu account boundary</span>
+                    <strong>
+                      {profileReadiness?.submission.ready
+                        ? 'Bambu Connect is ready to open'
+                        : 'Bambu Connect setup is required'}
+                    </strong>
+                    <p>
+                      {profileReadiness?.submission.account_message ??
+                        'Sign in only inside the official Bambu Connect application.'}
+                    </p>
+                    <p>{profileReadiness?.submission.message}</p>
+                    <div>
+                      <button
+                        className="primary-action"
+                        disabled={
+                          handoff.isPending ||
+                          profileReadiness?.submission.ready !== true
+                        }
+                        onClick={() => handoff.mutate()}
+                      >
+                        {handoff.isPending ? 'Opening Bambu Connect…' : 'Open in Bambu Connect'}
+                      </button>
+                      {profileReadiness?.submission.ready !== true && (
+                        <a className="text-button" href="#/fabrication">
+                          Open Connect setup guidance
+                        </a>
+                      )}
+                    </div>
+                  </div>
                 )}
 
                 {!workflow.archived_at &&
@@ -1750,8 +2173,12 @@ function WorkflowPanel({
 
                 {workflow.state === 'external_confirmation_required' && (
                   <div className="external-confirmation">
-                    <strong>Confirm the result in Bambu Connect</strong>
+                    <strong>Sign in and submit with Bambu Connect</strong>
                     <p>{data.submission_handoff?.message}</p>
+                    <p>
+                      Account login, H2D selection, and final cloud submission happen only in
+                      the official Connect app. No Bambu credentials are stored here.
+                    </p>
                     <button
                       className="primary-action"
                       onClick={() => confirmHandoff.mutate(true)}

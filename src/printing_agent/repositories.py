@@ -2434,15 +2434,30 @@ class WorkflowRepository:
         plan: ModelPlan,
         handoff: ModelingHandoff | None,
         artifact: ModelArtifact,
+        snapshot: WorkflowPrinterSnapshot,
+        approval: ArtifactApproval | None,
         *,
         source_workflow_id: str,
         source_artifact_version: int,
+        fabrication: bool = False,
     ) -> PrintWorkflow:
+        if snapshot.workflow_id != workflow.id:
+            raise ValueError("Copy printer snapshot must match the new workflow")
+        if approval is not None and (
+            approval.workflow_id != workflow.id
+            or approval.artifact_version != artifact.version
+            or approval.manifest_digest != artifact.manifest_digest
+            or workflow.state != WorkflowState.APPROVED
+        ):
+            raise ValueError("Carried approval must match the copied artifact")
         db = await self._connect()
         try:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
-                "SELECT archived_at FROM workflows WHERE id = ?",
+                """
+                SELECT archived_at, active_artifact_version
+                FROM workflows WHERE id = ?
+                """,
                 (source_workflow_id,),
             )
             source = await cursor.fetchone()
@@ -2450,6 +2465,45 @@ class WorkflowRepository:
                 raise NotFoundError(f"Workflow '{source_workflow_id}' was not found")
             if source["archived_at"] is not None:
                 raise ConflictError("Restore the archived workflow before copying it")
+            if int(source["active_artifact_version"] or 0) != source_artifact_version:
+                raise ConflictError(
+                    "Source workflow artifact changed before the copy was created"
+                )
+            if fabrication:
+                cursor = await db.execute(
+                    """
+                    SELECT p.active_revision, r.digest
+                    FROM printer_profiles p
+                    JOIN printer_profile_revisions r
+                      ON r.profile_id = p.id AND r.revision = p.active_revision
+                    WHERE p.id = ? AND p.enabled = 1 AND p.archived_at IS NULL
+                    """,
+                    (snapshot.profile_id,),
+                )
+                profile_row = await cursor.fetchone()
+                profile_valid = (
+                    profile_row is not None
+                    and int(profile_row["active_revision"])
+                    == snapshot.profile_revision
+                    and profile_row["digest"] == snapshot.profile_digest
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    SELECT digest FROM printer_profile_revisions
+                    WHERE profile_id = ? AND revision = ?
+                    """,
+                    (snapshot.profile_id, snapshot.profile_revision),
+                )
+                profile_row = await cursor.fetchone()
+                profile_valid = (
+                    profile_row is not None
+                    and profile_row["digest"] == snapshot.profile_digest
+                )
+            if not profile_valid:
+                raise ConflictError(
+                    "Printer profile changed or was unavailable before copy creation"
+                )
             await db.execute(
                 """
                 INSERT INTO workflows (
@@ -2507,14 +2561,52 @@ class WorkflowRepository:
                     artifact.created_at.isoformat(),
                 ),
             )
+            await db.execute(
+                """
+                INSERT INTO workflow_printer_snapshots (
+                    workflow_id, profile_id, profile_revision,
+                    digest, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot.workflow_id,
+                    snapshot.profile_id,
+                    snapshot.profile_revision,
+                    snapshot.digest,
+                    snapshot.model_dump_json(),
+                    snapshot.created_at.isoformat(),
+                ),
+            )
+            if approval is not None:
+                await db.execute(
+                    """
+                    INSERT INTO approvals (
+                        workflow_id, artifact_version, manifest_digest,
+                        approved_by, approved_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        approval.workflow_id,
+                        approval.artifact_version,
+                        approval.manifest_digest,
+                        approval.approved_by,
+                        approval.approved_at.isoformat(),
+                    ),
+                )
             await self._insert_event(
                 db,
                 workflow.id,
-                "workflow.copied",
+                (
+                    "workflow.fabrication_copy_created"
+                    if fabrication
+                    else "workflow.copied"
+                ),
                 workflow.state,
                 {
                     "source_workflow_id": source_workflow_id,
                     "source_artifact_version": source_artifact_version,
+                    "target_profile_id": snapshot.profile_id,
+                    "approval_carried": approval is not None,
                 },
             )
             await db.commit()

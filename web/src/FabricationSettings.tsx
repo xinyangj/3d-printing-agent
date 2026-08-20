@@ -251,6 +251,18 @@ export function FabricationSettings() {
           </p>
         </section>
         <section className="inspection-panel">
+          <span className="section-label">Bambu Connect account</span>
+          <h2>Sign in only in the official Connect app</h2>
+          <p>
+            Install Bambu Connect, launch it from Windows, sign in to your Bambu account, and bind
+            or select the intended H2D there.
+          </p>
+          <p>
+            This WebUI never requests or stores a Bambu password, cloud token, cookie, or login
+            session. It can detect the Connect URL handler, but it cannot verify account login.
+          </p>
+        </section>
+        <section className="inspection-panel">
           <span className="section-label">Printer profile</span>
           <select value={selectedProfileId} onChange={(event) => setSelectedProfileId(event.target.value)}>
             {(profiles.data ?? []).map((profile) => (

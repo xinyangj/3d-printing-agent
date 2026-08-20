@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
@@ -112,6 +114,27 @@ async def test_fabrication_profiles_and_material_inventory_api(
 
     assert h2d["spec"]["submission"]["driver_id"] == "bambu_connect_cloud"
     assert listing.json()[0]["slot_id"] == "ams1_1"
+
+
+async def test_fabrication_readiness_keeps_bambu_login_external(
+    settings: Settings,
+) -> None:
+    container = await build_container(settings)
+    app = create_app(container)
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/fabrication/readiness")
+
+    assert response.status_code == 200
+    h2d = next(
+        item for item in response.json() if item["profile_id"] == "bambu-h2d"
+    )
+    assert h2d["submission"]["account_login"] == "external_user_action"
+    assert "official Bambu Connect" in h2d["submission"]["account_message"]
+    serialized = json.dumps(h2d).casefold()
+    assert "password" not in serialized
+    assert "cloud token" not in serialized
+    assert "cookie" not in serialized
 
 
 async def test_remote_mutations_require_admin_token(settings: Settings) -> None:
