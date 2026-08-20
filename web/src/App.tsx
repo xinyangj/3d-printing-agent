@@ -4,7 +4,6 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
 import './App.css'
-import { FabricationSettings } from './FabricationSettings'
 import { MultipartPartsViewer } from './MultipartModelViewer'
 
 type Dimensions = {
@@ -121,21 +120,6 @@ type WorkflowResponse = {
   job: PrintJob | null
   revision_failure: RevisionVerification | null
   revision_verification: RevisionVerification | null
-  printer_snapshot: {
-    profile_id: string
-    profile_revision: number
-    digest: string
-    profile: PrinterProfile['spec']
-    overrides: JobOverrides
-    resolved_slot_policy: {
-      forbidden_slot_ids: string[]
-      allowed_slot_ids: string[] | null
-    }
-  } | null
-  material_assignment: MaterialAssignmentPayload | null
-  slice_job: SliceJobPayload | null
-  sliced_artifact: SlicedArtifactPayload | null
-  submission_handoff: SubmissionHandoffPayload | null
 }
 
 type Printer = {
@@ -143,85 +127,6 @@ type Printer = {
   build_volume: Dimensions
   accepted_formats: string[]
   supported_materials: string[]
-}
-
-type JobOverrides = {
-  toolhead_id: string | null
-  nozzle_diameter_mm: number | null
-  plate_id: string | null
-  layer_height_mm: number | null
-  infill_percent: number | null
-  supports: boolean | null
-  brim: boolean | null
-  raft: boolean | null
-  timelapse: boolean | null
-  calibration: boolean | null
-  forbidden_slot_ids: string[]
-  allowed_slot_ids: string[] | null
-  part_allowed_slot_ids: Record<string, string[]>
-  part_forbidden_slot_ids: Record<string, string[]>
-  allow_manual_swaps: boolean | null
-  maximum_color_distance: number
-}
-
-type PrinterProfile = {
-  profile_id: string
-  revision: number
-  digest: string
-  spec: {
-    display_name: string
-    build_volume: Dimensions
-    toolheads: Array<{ id: string; name: string; nozzle_diameter_mm: number }>
-    plates: Array<{ id: string; name: string }>
-    material_slots: Array<{ id: string; name: string; automatic_assignment: boolean }>
-    slicer: { driver_id: string }
-    submission: { driver_id: string; mode: string }
-  }
-}
-
-type MaterialAssignmentPayload = {
-  id: string
-  requires_confirmation: boolean
-  confirmed_at: string | null
-  digest: string
-  requests: Array<{ part_id: string; part_name: string; requested_color: string }>
-  assignments: Array<{
-    part_id: string
-    spool_id: string
-    slot_id: string
-    toolhead_id: string
-    material_id: string
-    color_distance: number
-    confidence: number
-    rationale: string
-    alternatives: string[]
-  }>
-}
-
-type SliceJobPayload = {
-  id: string
-  status: string
-  message: string | null
-  updated_at: string
-}
-
-type SlicedArtifactPayload = {
-  slice_job_id: string
-  digest: string
-  size_bytes: number
-  slicer_version: string
-  machine_profile_id: string
-  process_profile_id: string
-  estimated_time_seconds: number | null
-  filament_usage_g: Record<string, number>
-  warnings: string[]
-  manifest_digest: string
-}
-
-type SubmissionHandoffPayload = {
-  id: string
-  status: string
-  message: string | null
 }
 
 type WorkflowEvent = {
@@ -244,7 +149,6 @@ const TERMINAL_STATES = new Set([
   'cancelled',
   'preparation_failed',
   'print_failed',
-  'slice_failed',
 ])
 const INSPECTABLE_STATE = new Set([
   'awaiting_approval',
@@ -254,13 +158,6 @@ const INSPECTABLE_STATE = new Set([
   'printing',
   'completed',
   'print_failed',
-  'slice_requested',
-  'slicing',
-  'slice_validating',
-  'awaiting_slice_review',
-  'slice_failed',
-  'external_confirmation_required',
-  'user_confirmed_submitted',
 ])
 const ACTIVE_STATES = new Set([
   'received',
@@ -278,10 +175,6 @@ const ACTIVE_STATES = new Set([
   'submitting',
   'queued',
   'printing',
-  'slice_requested',
-  'slicing',
-  'slice_validating',
-  'external_confirmation_required',
 ])
 const ARCHIVABLE_STATES = new Set([
   'awaiting_approval',
@@ -314,12 +207,10 @@ const FILTERS: { value: DashboardFilter; label: string }[] = [
 ]
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
-  const token = sessionStorage.getItem('printing-agent-admin-token')
   const response = await fetch(`${API}${path}`, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { 'X-Printing-Agent-Token': token } : {}),
       ...options?.headers,
     },
   })
@@ -344,28 +235,12 @@ function matchesFilter(workflow: Workflow, filter: DashboardFilter) {
   const state = workflow.state
   if (filter === 'all') return true
   if (filter === 'in_progress')
-    return (
-      ACTIVE_STATES.has(state) &&
-      !['submitting', 'queued', 'printing', 'slice_requested', 'slicing', 'slice_validating'].includes(
-        state,
-      )
-    )
+    return ACTIVE_STATES.has(state) && !['submitting', 'queued', 'printing'].includes(state)
   if (filter === 'needs_approval') return state === 'awaiting_approval'
   if (filter === 'approved') return state === 'approved'
-  if (filter === 'printing')
-    return [
-      'submitting',
-      'queued',
-      'printing',
-      'slice_requested',
-      'slicing',
-      'slice_validating',
-      'awaiting_slice_review',
-      'external_confirmation_required',
-      'user_confirmed_submitted',
-    ].includes(state)
+  if (filter === 'printing') return ['submitting', 'queued', 'printing'].includes(state)
   if (filter === 'completed') return state === 'completed'
-  return ['preparation_failed', 'print_failed', 'slice_failed', 'cancelled'].includes(state)
+  return ['preparation_failed', 'print_failed', 'cancelled'].includes(state)
 }
 
 function useWorkflowEvents(workflowId: string | null) {
@@ -585,46 +460,12 @@ function StartPanel({ onCreated }: { onCreated: (id: string) => void }) {
     'Create a compact wall-mounted headphone hook, 70 mm tall, with rounded edges, printed in PLA.',
   )
   const [printer, setPrinter] = useState('simulator')
-  const [advanced, setAdvanced] = useState(false)
-  const [layerHeight, setLayerHeight] = useState(0.2)
-  const [infill, setInfill] = useState(20)
-  const [supports, setSupports] = useState(false)
-  const [plateId, setPlateId] = useState<string | null>(null)
-  const [toolheadId, setToolheadId] = useState<string | null>(null)
-  const [forbiddenSlots, setForbiddenSlots] = useState<string[]>([])
-  const [maximumColorDistance, setMaximumColorDistance] = useState(12)
   const printers = useQuery({ queryKey: ['printers'], queryFn: () => api<Printer[]>('/printers') })
-  const profiles = useQuery({
-    queryKey: ['printer-profiles'],
-    queryFn: () => api<PrinterProfile[]>('/printer-profiles'),
-  })
-  const selectedProfile = profiles.data?.find((item) => item.profile_id === printer)
   const create = useMutation({
     mutationFn: () =>
       api<Workflow>('/workflows', {
         method: 'POST',
-        body: JSON.stringify({
-          requirement,
-          printer_name: printer,
-          overrides: {
-            toolhead_id: toolheadId,
-            nozzle_diameter_mm: null,
-            plate_id: plateId,
-            layer_height_mm: layerHeight,
-            infill_percent: infill,
-            supports,
-            brim: null,
-            raft: null,
-            timelapse: null,
-            calibration: null,
-            forbidden_slot_ids: forbiddenSlots,
-            allowed_slot_ids: null,
-            part_allowed_slot_ids: {},
-            part_forbidden_slot_ids: {},
-            allow_manual_swaps: true,
-            maximum_color_distance: maximumColorDistance,
-          },
-        }),
+        body: JSON.stringify({ requirement, printer_name: printer }),
       }),
     onSuccess: (workflow) => onCreated(workflow.id),
   })
@@ -661,68 +502,6 @@ function StartPanel({ onCreated }: { onCreated: (id: string) => void }) {
           ))}
           {!printers.data?.length && <option value="simulator">simulator</option>}
         </select>
-        <button className="text-button" onClick={() => setAdvanced(!advanced)}>
-          {advanced ? 'Hide job overrides' : 'Configure job overrides'}
-        </button>
-        {advanced && selectedProfile && (
-          <div className="job-overrides">
-            <label>
-              Toolhead
-              <select value={toolheadId ?? ''} onChange={(event) => setToolheadId(event.target.value || null)}>
-                <option value="">Profile default</option>
-                {selectedProfile.spec.toolheads.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.name} · {item.nozzle_diameter_mm} mm
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Plate
-              <select value={plateId ?? ''} onChange={(event) => setPlateId(event.target.value || null)}>
-                <option value="">Profile default</option>
-                {selectedProfile.spec.plates.map((item) => (
-                  <option key={item.id} value={item.id}>{item.name}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Layer height
-              <input type="number" min="0.05" max="1" step="0.05" value={layerHeight} onChange={(event) => setLayerHeight(Number(event.target.value))} />
-            </label>
-            <label>
-              Infill %
-              <input type="number" min="0" max="100" value={infill} onChange={(event) => setInfill(Number(event.target.value))} />
-            </label>
-            <label className="checkbox-label">
-              <input type="checkbox" checked={supports} onChange={(event) => setSupports(event.target.checked)} />
-              Generate supports
-            </label>
-            <label>
-              Maximum color distance
-              <input type="number" min="0" max="100" step="0.5" value={maximumColorDistance} onChange={(event) => setMaximumColorDistance(Number(event.target.value))} />
-            </label>
-            <span className="section-label">Forbidden slots for this job</span>
-            <div className="override-slots">
-              {selectedProfile.spec.material_slots.map((slot) => (
-                <label key={slot.id} className="checkbox-label">
-                  <input
-                    type="checkbox"
-                    checked={forbiddenSlots.includes(slot.id)}
-                    onChange={() =>
-                      setForbiddenSlots((current) =>
-                        current.includes(slot.id)
-                          ? current.filter((id) => id !== slot.id)
-                          : [...current, slot.id],
-                      )
-                    }
-                  />
-                  {slot.name}
-                </label>
-              ))}
-            </div>
-          </div>
-        )}
         <button
           className="primary-action"
           disabled={!requirement.trim() || create.isPending}
@@ -872,7 +651,7 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
         <div className="empty-dashboard">No models match this lifecycle filter.</div>
       )}
       <section className="model-grid">
-        {items.map(({ workflow, artifact, job, revision_failure, printer_snapshot }) => {
+        {items.map(({ workflow, artifact, job, revision_failure }) => {
           const modelUrl = artifact
             ? artifactPreviewUrl(workflow.id, artifact)
             : null
@@ -970,25 +749,13 @@ function DashboardPanel({ onOpen }: { onOpen: (id: string) => void }) {
                           Archive model
                         </button>
                       )}
-                      {workflow.state === 'approved' &&
-                        printer_snapshot?.profile.slicer.driver_id ===
-                        'simulator_passthrough' && (
+                      {workflow.state === 'approved' && (
                         <button
                           className="primary-action"
                           disabled={print.isPending}
                           onClick={() => print.mutate(workflow.id)}
                         >
                           Send to printer <span>→</span>
-                        </button>
-                      )}
-                      {workflow.state === 'approved' &&
-                      printer_snapshot?.profile.slicer.driver_id !==
-                        'simulator_passthrough' && (
-                        <button
-                          className="primary-action"
-                          onClick={() => onOpen(workflow.id)}
-                        >
-                          Continue to slicing <span>→</span>
                         </button>
                       )}
                     </>
@@ -1035,9 +802,6 @@ function WorkflowPanel({
   const workflow = data?.workflow
   const revisionFailure = data?.revision_failure
   const revisionVerification = data?.revision_verification
-  const requiresSlicing =
-    Boolean(data?.printer_snapshot) &&
-    data?.printer_snapshot?.profile.slicer.driver_id !== 'simulator_passthrough'
   useEffect(() => {
     const partIds = new Set(artifact?.project?.parts.map((part) => part.id) ?? [])
     setScopedPartIds((current) => current.filter((partId) => partIds.has(partId)))
@@ -1078,48 +842,6 @@ function WorkflowPanel({
       void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
       void queryClient.invalidateQueries({ queryKey: ['workflows'] })
     },
-  })
-  const proposeMaterials = useMutation({
-    mutationFn: () =>
-      api<MaterialAssignmentPayload>(`/workflows/${workflowId}/material-assignment`, {
-        method: 'POST',
-      }),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
-  })
-  const confirmMaterials = useMutation({
-    mutationFn: (assignmentId: string) =>
-      api(`/workflows/${workflowId}/material-assignment/confirm`, {
-        method: 'POST',
-        body: JSON.stringify({
-          assignment_id: assignmentId,
-          confirmed_by: 'local-web',
-        }),
-      }),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
-  })
-  const slice = useMutation({
-    mutationFn: () => api(`/workflows/${workflowId}/slice`, { method: 'POST' }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
-      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
-    },
-  })
-  const handoff = useMutation({
-    mutationFn: () =>
-      api(`/workflows/${workflowId}/submission-handoff`, { method: 'POST' }),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
-  })
-  const confirmHandoff = useMutation({
-    mutationFn: (submitted: boolean) =>
-      api(`/workflows/${workflowId}/submission-handoff/confirm`, {
-        method: 'POST',
-        body: JSON.stringify({ submitted, confirmed_by: 'local-web' }),
-      }),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
   })
   const revise = useMutation({
     mutationFn: (mode: 'refine_current' | 'search_new_base') =>
@@ -1583,7 +1305,7 @@ function WorkflowPanel({
                       {approve.isPending ? 'Approving…' : 'Approve model'}
                       <span>✓</span>
                     </button>
-                  ) : !requiresSlicing ? (
+                  ) : (
                     <button
                       className="primary-action"
                       disabled={print.isPending}
@@ -1592,8 +1314,6 @@ function WorkflowPanel({
                       {print.isPending ? 'Queuing…' : 'Send to printer'}
                       <span>→</span>
                     </button>
-                  ) : (
-                    <span className="muted">Continue with material assignment below.</span>
                   )}
                 </div>
                 {(approve.error || revise.error || print.error || copy.error) && (
@@ -1607,181 +1327,6 @@ function WorkflowPanel({
               </div>
             </section>
           )}
-
-          {!workflow.archived_at &&
-            requiresSlicing &&
-            [
-              'approved',
-              'slice_requested',
-              'slicing',
-              'slice_validating',
-              'awaiting_slice_review',
-              'slice_failed',
-              'external_confirmation_required',
-              'user_confirmed_submitted',
-            ].includes(workflow.state) && (
-              <section className="fabrication-panel">
-                <div>
-                  <span className="section-label">
-                    Printer profile · {data.printer_snapshot?.profile.display_name}
-                  </span>
-                  <h2>Materials, slicing &amp; submission</h2>
-                  <p>
-                    Model approval, material confirmation, sliced-job review, and Bambu Connect
-                    authorization are separate immutable boundaries.
-                  </p>
-                </div>
-
-                {!data.material_assignment && workflow.state === 'approved' && (
-                  <button
-                    className="primary-action"
-                    disabled={proposeMaterials.isPending}
-                    onClick={() => proposeMaterials.mutate()}
-                  >
-                    {proposeMaterials.isPending ? 'Matching materials…' : 'Match configured materials'}
-                  </button>
-                )}
-
-                {data.material_assignment && (
-                  <div className="material-assignment-review">
-                    <span className="section-label">Part material assignment</span>
-                    {data.material_assignment.assignments.map((assignment) => {
-                      const request = data.material_assignment!.requests.find(
-                        (item) => item.part_id === assignment.part_id,
-                      )
-                      return (
-                        <div key={assignment.part_id}>
-                          <span
-                            className="part-color"
-                            style={{ background: request?.requested_color ?? '#b7c4d4' }}
-                          />
-                          <strong>{request?.part_name ?? assignment.part_id}</strong>
-                          <small>
-                            {assignment.material_id} · {assignment.slot_id} ·{' '}
-                            {assignment.toolhead_id} · ΔE {assignment.color_distance.toFixed(2)}
-                          </small>
-                          <p>{assignment.rationale}</p>
-                        </div>
-                      )
-                    })}
-                    {data.material_assignment.confirmed_at ? (
-                      <span className="verified-label">Material assignment confirmed</span>
-                    ) : (
-                      <button
-                        className="primary-action"
-                        disabled={confirmMaterials.isPending}
-                        onClick={() => confirmMaterials.mutate(data.material_assignment!.id)}
-                      >
-                        Confirm material assignment
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                {['approved', 'slice_failed', 'awaiting_slice_review'].includes(
-                  workflow.state,
-                ) &&
-                  data.material_assignment?.confirmed_at && (
-                    <button
-                      className="primary-action"
-                      disabled={slice.isPending}
-                      onClick={() => slice.mutate()}
-                    >
-                      {slice.isPending
-                        ? 'Requesting slice…'
-                        : workflow.state === 'approved'
-                          ? 'Slice for printer'
-                          : 'Reslice for printer'}
-                    </button>
-                  )}
-
-                {data.slice_job && (
-                  <div className="slice-review">
-                    <span className="section-label">Slice job · {data.slice_job.id.slice(0, 8)}</span>
-                    <strong>{formatState(data.slice_job.status)}</strong>
-                    {data.slice_job.message && <p>{data.slice_job.message}</p>}
-                    {data.sliced_artifact && (
-                      <>
-                        <dl>
-                          <dt>Slicer</dt><dd>{data.sliced_artifact.slicer_version}</dd>
-                          <dt>Machine profile</dt><dd>{data.sliced_artifact.machine_profile_id}</dd>
-                          <dt>Process profile</dt><dd>{data.sliced_artifact.process_profile_id}</dd>
-                          <dt>Size</dt><dd>{formatNumber(data.sliced_artifact.size_bytes / 1024, 0)} KB</dd>
-                          <dt>Digest</dt><dd><code>{data.sliced_artifact.digest}</code></dd>
-                        </dl>
-                        <a
-                          className="secondary-action"
-                          href={`${API}/workflows/${workflowId}/slices/${data.slice_job.id}/download`}
-                          download
-                        >
-                          Download sliced .gcode.3mf
-                        </a>
-                      </>
-                    )}
-                  </div>
-                )}
-
-                {workflow.state === 'awaiting_slice_review' && data.sliced_artifact && (
-                  <button
-                    className="primary-action"
-                    disabled={handoff.isPending}
-                    onClick={() => handoff.mutate()}
-                  >
-                    {handoff.isPending ? 'Opening Bambu Connect…' : 'Open in Bambu Connect'}
-                  </button>
-                )}
-
-                {!workflow.archived_at &&
-                  [
-                    'slice_requested',
-                    'slicing',
-                    'slice_validating',
-                    'awaiting_slice_review',
-                    'submission_handoff_requested',
-                  ].includes(workflow.state) && (
-                    <button
-                      className="danger-action"
-                      disabled={cancel.isPending}
-                      onClick={() => cancel.mutate()}
-                    >
-                      {cancel.isPending ? 'Cancelling…' : 'Cancel fabrication job'}
-                    </button>
-                  )}
-
-                {workflow.state === 'external_confirmation_required' && (
-                  <div className="external-confirmation">
-                    <strong>Confirm the result in Bambu Connect</strong>
-                    <p>{data.submission_handoff?.message}</p>
-                    <button
-                      className="primary-action"
-                      onClick={() => confirmHandoff.mutate(true)}
-                    >
-                      I submitted the job
-                    </button>
-                    <button
-                      className="secondary-action"
-                      onClick={() => confirmHandoff.mutate(false)}
-                    >
-                      I cancelled
-                    </button>
-                  </div>
-                )}
-
-                {(proposeMaterials.error ||
-                  confirmMaterials.error ||
-                  slice.error ||
-                  handoff.error ||
-                  confirmHandoff.error) && (
-                  <p className="error-copy">
-                    {proposeMaterials.error?.message ??
-                      confirmMaterials.error?.message ??
-                      slice.error?.message ??
-                      handoff.error?.message ??
-                      confirmHandoff.error?.message}
-                  </p>
-                )}
-              </section>
-            )}
 
           {data.job && (
             <section className="print-status">
@@ -1808,11 +1353,7 @@ function WorkflowPanel({
           <p>{workflow.failure_message}</p>
         </section>
       )}
-      {(archive.error || cancel.error) && (
-        <p className="error-copy">
-          {archive.error?.message ?? cancel.error?.message}
-        </p>
-      )}
+      {archive.error && <p className="error-copy">{archive.error.message}</p>}
     </main>
   )
 }
@@ -1820,21 +1361,19 @@ function WorkflowPanel({
 type AppRoute =
   | { page: 'create' }
   | { page: 'models' }
-  | { page: 'fabrication' }
   | { page: 'workflow'; workflowId: string }
 
 function readRoute(): AppRoute {
   const workflow = window.location.hash.match(/^#\/workflows\/(.+)$/)
   if (workflow) return { page: 'workflow', workflowId: workflow[1] }
   if (window.location.hash === '#/models') return { page: 'models' }
-  if (window.location.hash === '#/fabrication') return { page: 'fabrication' }
   return { page: 'create' }
 }
 
 function App() {
   const [route, setRoute] = useState<AppRoute>(readRoute)
 
-  const navigate = (path: '/' | '/models' | '/fabrication' | `/workflows/${string}`) => {
+  const navigate = (path: '/' | '/models' | `/workflows/${string}`) => {
     window.location.hash = path
     setRoute(readRoute())
   }
@@ -1861,18 +1400,11 @@ function App() {
             Create
           </button>
           <button
-            className={route.page === 'models' || route.page === 'workflow' ? 'active' : ''}
-            aria-current={route.page === 'models' || route.page === 'workflow' ? 'page' : undefined}
+            className={route.page !== 'create' ? 'active' : ''}
+            aria-current={route.page !== 'create' ? 'page' : undefined}
             onClick={() => navigate('/models')}
           >
             Models
-          </button>
-          <button
-            className={route.page === 'fabrication' ? 'active' : ''}
-            aria-current={route.page === 'fabrication' ? 'page' : undefined}
-            onClick={() => navigate('/fabrication')}
-          >
-            Printers &amp; materials
           </button>
         </div>
       </nav>
@@ -1880,8 +1412,6 @@ function App() {
         <WorkflowPanel workflowId={route.workflowId} onReset={() => navigate('/models')} />
       ) : route.page === 'models' ? (
         <DashboardPanel onOpen={(id) => navigate(`/workflows/${id}`)} />
-      ) : route.page === 'fabrication' ? (
-        <FabricationSettings />
       ) : (
         <StartPanel onCreated={(id) => navigate(`/workflows/${id}`)} />
       )}

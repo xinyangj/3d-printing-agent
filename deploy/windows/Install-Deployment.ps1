@@ -2,7 +2,6 @@
 param(
     [string]$AuthUsername = "printing-agent",
     [switch]$EnableLanAccess,
-    [switch]$SkipBambuTools,
     [switch]$SkipPackageInstall,
     [switch]$SkipScheduledTasks,
     [switch]$SkipFunnel
@@ -15,18 +14,11 @@ function Install-WinGetPackage {
         [Parameter(Mandatory = $true)]
         [string]$Id,
         [Parameter(Mandatory = $true)]
-        [string]$CommandName,
-        [string[]]$Fallbacks = @()
+        [string]$CommandName
     )
 
     if ($null -ne (Get-Command $CommandName -ErrorAction SilentlyContinue)) {
         return
-    }
-    foreach ($candidate in $Fallbacks) {
-        $expanded = [Environment]::ExpandEnvironmentVariables($candidate)
-        if (Test-Path $expanded -PathType Leaf) {
-            return
-        }
     }
 
     $winget = Get-ExecutablePath -Name "winget.exe"
@@ -81,15 +73,6 @@ if (-not $SkipPackageInstall) {
     Install-WinGetPackage -Id "OpenSCAD.OpenSCAD" -CommandName "openscad.exe"
     Install-WinGetPackage -Id "Tailscale.Tailscale" -CommandName "tailscale.exe"
     Install-WinGetPackage -Id "CaddyServer.Caddy" -CommandName "caddy.exe"
-    if (-not $SkipBambuTools) {
-        Install-WinGetPackage `
-            -Id "Bambulab.Bambustudio" `
-            -CommandName "bambu-studio.exe" `
-            -Fallbacks @(
-                "%ProgramFiles%\Bambu Studio\bambu-studio.exe",
-                "%LOCALAPPDATA%\Programs\Bambu Studio\bambu-studio.exe"
-            )
-    }
 }
 
 Update-ProcessPath
@@ -102,13 +85,6 @@ $caddy = Get-ExecutablePath -Name "caddy.exe" -Fallbacks @(
     "%LOCALAPPDATA%\Microsoft\WinGet\Links\caddy.exe",
     "%ProgramFiles%\Caddy\caddy.exe"
 )
-$bambuStudio = $null
-if (-not $SkipBambuTools) {
-    $bambuStudio = Get-ExecutablePath -Name "bambu-studio.exe" -Fallbacks @(
-        "%ProgramFiles%\Bambu Studio\bambu-studio.exe",
-        "%LOCALAPPDATA%\Programs\Bambu Studio\bambu-studio.exe"
-    )
-}
 
 if (-not (Test-Path ".venv\Scripts\python.exe" -PathType Leaf)) {
     Invoke-Checked -Executable $pythonLauncher -Arguments @(
@@ -139,19 +115,6 @@ $envLines = Set-EnvironmentEntry `
     -Lines $envLines `
     -Name "PRINTING_AGENT_OPENSCAD_PATH" `
     -Value $openscad
-if ($null -ne $bambuStudio) {
-    $envLines = Set-EnvironmentEntry `
-        -Lines $envLines `
-        -Name "PRINTING_AGENT_BAMBU_STUDIO_PATH" `
-        -Value $bambuStudio
-    $resourceRoot = Join-Path (Split-Path $bambuStudio) "resources\profiles"
-    if (Test-Path $resourceRoot -PathType Container) {
-        $envLines = Set-EnvironmentEntry `
-            -Lines $envLines `
-            -Name "PRINTING_AGENT_BAMBU_STUDIO_RESOURCE_DIR" `
-            -Value $resourceRoot
-    }
-}
 if ($EnableLanAccess) {
     $envLines = Set-EnvironmentEntry `
         -Lines $envLines `
@@ -169,26 +132,6 @@ if ($EnableLanAccess) {
             -LocalPort 8000 `
             -Profile Private | Out-Null
     }
-}
-$configuredAdminToken = $envLines |
-    Where-Object { $_.StartsWith("PRINTING_AGENT_ADMIN_API_TOKEN=") } |
-    ForEach-Object { $_.Substring("PRINTING_AGENT_ADMIN_API_TOKEN=".Length).Trim() } |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_.Length -ge 32 } |
-    Select-Object -First 1
-if ([string]::IsNullOrWhiteSpace($configuredAdminToken)) {
-    $tokenBytes = [byte[]]::new(32)
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try {
-        $rng.GetBytes($tokenBytes)
-    } finally {
-        $rng.Dispose()
-    }
-    $adminToken = ([BitConverter]::ToString($tokenBytes) -replace "-", "").ToLowerInvariant()
-    $envLines = Set-EnvironmentEntry `
-        -Lines $envLines `
-        -Name "PRINTING_AGENT_ADMIN_API_TOKEN" `
-        -Value $adminToken
-    Write-Host "Generated PRINTING_AGENT_ADMIN_API_TOKEN in the protected .env file."
 }
 $utf8WithoutBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllLines($envPath, $envLines, $utf8WithoutBom)
@@ -231,9 +174,6 @@ Write-Host ""
 Write-Host "Deployment installation completed."
 Write-Host "Set PRINTING_AGENT_THINGIVERSE_TOKEN in .env before creating live workflows."
 Write-Host "Run Get-DeploymentStatus.ps1 to inspect the services and Funnel."
-if (-not $SkipBambuTools) {
-    Write-Host "Install Bambu Connect from the official Bambu Lab Wiki, log in, and bind the H2D."
-}
 if ($EnableLanAccess) {
     Write-Host "LAN access is enabled on TCP port 8000 for Private network profiles."
 }
