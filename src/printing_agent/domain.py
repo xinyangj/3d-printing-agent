@@ -47,6 +47,14 @@ class WorkflowState(StrEnum):
     AWAITING_APPROVAL = "awaiting_approval"
     REVISION_REQUESTED = "revision_requested"
     APPROVED = "approved"
+    SLICE_REQUESTED = "slice_requested"
+    SLICING = "slicing"
+    SLICE_VALIDATING = "slice_validating"
+    AWAITING_SLICE_REVIEW = "awaiting_slice_review"
+    SLICE_FAILED = "slice_failed"
+    SUBMISSION_HANDOFF_REQUESTED = "submission_handoff_requested"
+    EXTERNAL_CONFIRMATION_REQUIRED = "external_confirmation_required"
+    USER_CONFIRMED_SUBMITTED = "user_confirmed_submitted"
     SUBMITTING = "submitting"
     QUEUED = "queued"
     PRINTING = "printing"
@@ -73,6 +81,7 @@ class PrintJobStatus(StrEnum):
 
 class WorkKind(StrEnum):
     PREPARE = "prepare"
+    SLICE = "slice"
     SUBMIT = "submit"
     REFRESH_PRINT = "refresh_print"
 
@@ -696,8 +705,48 @@ _ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
     },
     WorkflowState.APPROVED: {
         WorkflowState.REVISION_REQUESTED,
+        WorkflowState.SLICE_REQUESTED,
         WorkflowState.SUBMITTING,
         WorkflowState.PRINT_FAILED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.SLICE_REQUESTED: {
+        WorkflowState.SLICING,
+        WorkflowState.SLICE_FAILED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.SLICING: {
+        WorkflowState.SLICE_VALIDATING,
+        WorkflowState.SLICE_FAILED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.SLICE_VALIDATING: {
+        WorkflowState.AWAITING_SLICE_REVIEW,
+        WorkflowState.SLICE_FAILED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.AWAITING_SLICE_REVIEW: {
+        WorkflowState.SUBMISSION_HANDOFF_REQUESTED,
+        WorkflowState.EXTERNAL_CONFIRMATION_REQUIRED,
+        WorkflowState.SLICE_REQUESTED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.SUBMISSION_HANDOFF_REQUESTED: {
+        WorkflowState.AWAITING_SLICE_REVIEW,
+        WorkflowState.EXTERNAL_CONFIRMATION_REQUIRED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.SLICE_FAILED: {
+        WorkflowState.SLICE_REQUESTED,
+        WorkflowState.REVISION_REQUESTED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.EXTERNAL_CONFIRMATION_REQUIRED: {
+        WorkflowState.USER_CONFIRMED_SUBMITTED,
+        WorkflowState.CANCELLED,
+    },
+    WorkflowState.USER_CONFIRMED_SUBMITTED: {
+        WorkflowState.COMPLETED,
         WorkflowState.CANCELLED,
     },
     WorkflowState.SUBMITTING: {

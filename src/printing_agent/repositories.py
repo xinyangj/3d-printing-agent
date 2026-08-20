@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -30,6 +31,20 @@ from printing_agent.domain import (
     utc_now,
 )
 from printing_agent.errors import ConflictError, NotFoundError
+from printing_agent.fabrication import (
+    HandoffStatus,
+    MaterialAssignment,
+    MaterialDefinitionRevision,
+    PhysicalSpool,
+    PrinterProfileRevision,
+    SlicedArtifact,
+    SliceJob,
+    SliceJobStatus,
+    SpoolReservation,
+    SpoolStatus,
+    SubmissionHandoff,
+    WorkflowPrinterSnapshot,
+)
 
 _SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -212,6 +227,123 @@ CREATE TABLE IF NOT EXISTS work_items (
 
 CREATE INDEX IF NOT EXISTS idx_work_items_ready
 ON work_items(status, available_at);
+
+CREATE TABLE IF NOT EXISTS printer_profiles (
+    id TEXT PRIMARY KEY,
+    active_revision INTEGER NOT NULL,
+    enabled INTEGER NOT NULL,
+    archived_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS printer_profile_revisions (
+    profile_id TEXT NOT NULL REFERENCES printer_profiles(id),
+    revision INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, revision),
+    UNIQUE(profile_id, digest)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_printer_snapshots (
+    workflow_id TEXT PRIMARY KEY REFERENCES workflows(id),
+    profile_id TEXT NOT NULL,
+    profile_revision INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS material_definitions (
+    id TEXT PRIMARY KEY,
+    active_revision INTEGER NOT NULL,
+    enabled INTEGER NOT NULL,
+    archived_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS material_definition_revisions (
+    material_id TEXT NOT NULL REFERENCES material_definitions(id),
+    revision INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (material_id, revision),
+    UNIQUE(material_id, digest)
+);
+
+CREATE TABLE IF NOT EXISTS physical_spools (
+    id TEXT PRIMARY KEY,
+    material_id TEXT NOT NULL,
+    material_revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    printer_profile_id TEXT,
+    slot_id TEXT,
+    payload_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(printer_profile_id, slot_id)
+);
+
+CREATE TABLE IF NOT EXISTS material_assignments (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+    artifact_version INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    confirmed INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_material_assignments_workflow
+ON material_assignments(workflow_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS spool_reservations (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+    slice_job_id TEXT,
+    spool_id TEXT NOT NULL REFERENCES physical_spools(id),
+    reserved_weight_g REAL NOT NULL,
+    actual_usage_g REAL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS slice_jobs (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+    status TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sliced_artifacts (
+    slice_job_id TEXT PRIMARY KEY REFERENCES slice_jobs(id),
+    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+    digest TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS submission_handoffs (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+    slice_job_id TEXT NOT NULL REFERENCES slice_jobs(id),
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_submission_handoffs_workflow
+ON submission_handoffs(workflow_id, created_at DESC);
 """
 
 
@@ -262,6 +394,12 @@ class WorkflowRepository:
                 )
             if "base_state" not in revision_columns:
                 await db.execute("ALTER TABLE revision_requests ADD COLUMN base_state TEXT")
+            cursor = await db.execute("PRAGMA table_info(spool_reservations)")
+            reservation_columns = {row[1] for row in await cursor.fetchall()}
+            if "actual_usage_g" not in reservation_columns:
+                await db.execute(
+                    "ALTER TABLE spool_reservations ADD COLUMN actual_usage_g REAL"
+                )
             await db.commit()
 
     async def _connect(self) -> aiosqlite.Connection:
@@ -307,6 +445,100 @@ class WorkflowRepository:
                 {"printer_name": printer_name},
             )
             await self._insert_work_item(db, work_item)
+            await db.commit()
+            return workflow
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def create_workflow_with_snapshot(
+        self,
+        workflow: PrintWorkflow,
+        snapshot: WorkflowPrinterSnapshot,
+    ) -> PrintWorkflow:
+        if snapshot.workflow_id != workflow.id or snapshot.digest is None:
+            raise ValueError("Workflow printer snapshot does not match workflow")
+        item = WorkItem(workflow_id=workflow.id, kind=WorkKind.PREPARE)
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT p.active_revision, r.digest
+                FROM printer_profiles p
+                JOIN printer_profile_revisions r
+                  ON r.profile_id = p.id AND r.revision = p.active_revision
+                WHERE p.id = ? AND p.enabled = 1 AND p.archived_at IS NULL
+                """,
+                (snapshot.profile_id,),
+            )
+            profile = await cursor.fetchone()
+            if (
+                profile is None
+                or int(profile["active_revision"]) != snapshot.profile_revision
+                or profile["digest"] != snapshot.profile_digest
+            ):
+                raise ConflictError(
+                    "Printer profile changed or was archived before workflow creation"
+                )
+            await db.execute(
+                """
+                INSERT INTO workflows (
+                    id, requirement, printer_name, state, version,
+                    discovery_session_id, modeling_session_id,
+                    active_handoff_version, active_artifact_version,
+                    failure_code, failure_message, archived_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    workflow.id,
+                    workflow.requirement,
+                    workflow.printer_name,
+                    workflow.state.value,
+                    workflow.version,
+                    workflow.discovery_session_id,
+                    workflow.modeling_session_id,
+                    workflow.active_handoff_version,
+                    workflow.active_artifact_version,
+                    workflow.failure_code,
+                    workflow.failure_message,
+                    workflow.archived_at.isoformat()
+                    if workflow.archived_at
+                    else None,
+                    workflow.created_at.isoformat(),
+                    workflow.updated_at.isoformat(),
+                ),
+            )
+            await db.execute(
+                """
+                INSERT INTO workflow_printer_snapshots (
+                    workflow_id, profile_id, profile_revision, digest,
+                    payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot.workflow_id,
+                    snapshot.profile_id,
+                    snapshot.profile_revision,
+                    snapshot.digest,
+                    snapshot.model_dump_json(),
+                    snapshot.created_at.isoformat(),
+                ),
+            )
+            await self._insert_event(
+                db,
+                workflow.id,
+                "workflow.created",
+                workflow.state,
+                {
+                    "printer_name": workflow.printer_name,
+                    "printer_snapshot_digest": snapshot.digest,
+                },
+            )
+            await self._insert_work_item(db, item)
             await db.commit()
             return workflow
         except Exception:
@@ -1513,6 +1745,529 @@ class WorkflowRepository:
         finally:
             await db.close()
 
+    async def enqueue_slice(
+        self,
+        job: SliceJob,
+        reservations: list[SpoolReservation],
+    ) -> WorkItem:
+        item = WorkItem(workflow_id=job.workflow_id, kind=WorkKind.SLICE)
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT state, version, active_artifact_version, archived_at
+                FROM workflows WHERE id = ?
+                """,
+                (job.workflow_id,),
+            )
+            workflow = await cursor.fetchone()
+            if workflow is None:
+                raise NotFoundError(f"Workflow '{job.workflow_id}' was not found")
+            if workflow["archived_at"] is not None:
+                raise ConflictError("Restore the archived workflow before slicing")
+            if workflow["state"] not in {
+                WorkflowState.APPROVED.value,
+                WorkflowState.SLICE_FAILED.value,
+                WorkflowState.AWAITING_SLICE_REVIEW.value,
+            }:
+                raise ConflictError("Workflow is not ready for slicing or reslicing")
+            cursor = await db.execute(
+                """
+                SELECT artifact_version, manifest_digest FROM approvals
+                WHERE workflow_id = ?
+                """,
+                (job.workflow_id,),
+            )
+            approval = await cursor.fetchone()
+            if (
+                approval is None
+                or approval["artifact_version"] != workflow["active_artifact_version"]
+                or approval["manifest_digest"] != job.artifact_manifest_digest
+            ):
+                raise ConflictError("Slice job does not match the approved artifact")
+            if workflow["state"] != WorkflowState.APPROVED.value:
+                await db.execute(
+                    """
+                    UPDATE spool_reservations
+                    SET status = 'released', updated_at = ?
+                    WHERE workflow_id = ? AND status = 'reserved'
+                    """,
+                    (utc_now().isoformat(), job.workflow_id),
+                )
+            await db.execute(
+                """
+                INSERT INTO slice_jobs (
+                    id, workflow_id, status, idempotency_key,
+                    payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job.id,
+                    job.workflow_id,
+                    job.status.value,
+                    job.idempotency_key,
+                    job.model_dump_json(),
+                    job.created_at.isoformat(),
+                    job.updated_at.isoformat(),
+                ),
+            )
+            for reservation in reservations:
+                cursor = await db.execute(
+                    "SELECT payload_json FROM physical_spools WHERE id = ?",
+                    (reservation.spool_id,),
+                )
+                spool_row = await cursor.fetchone()
+                if spool_row is None:
+                    raise ConflictError(
+                        f"Spool '{reservation.spool_id}' is unavailable"
+                    )
+                spool = PhysicalSpool.model_validate_json(spool_row["payload_json"])
+                if spool.status not in {SpoolStatus.AVAILABLE, SpoolStatus.LOADED}:
+                    raise ConflictError(
+                        f"Spool '{reservation.spool_id}' is not available"
+                    )
+                cursor = await db.execute(
+                    """
+                    SELECT COALESCE(SUM(reserved_weight_g), 0) AS reserved
+                    FROM spool_reservations
+                    WHERE spool_id = ? AND status = 'reserved'
+                    """,
+                    (reservation.spool_id,),
+                )
+                reserved = float((await cursor.fetchone())["reserved"])
+                if (
+                    spool.remaining_weight_g - reserved
+                    < reservation.reserved_weight_g
+                ):
+                    raise ConflictError(
+                        f"Spool '{reservation.spool_id}' has insufficient material"
+                    )
+                await db.execute(
+                    """
+                    INSERT INTO spool_reservations (
+                        id, workflow_id, slice_job_id, spool_id,
+                        reserved_weight_g, actual_usage_g, status,
+                        payload_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        reservation.id,
+                        reservation.workflow_id,
+                        reservation.slice_job_id,
+                        reservation.spool_id,
+                        reservation.reserved_weight_g,
+                        reservation.actual_usage_g,
+                        reservation.status,
+                        reservation.model_dump_json(),
+                        reservation.created_at.isoformat(),
+                        reservation.updated_at.isoformat(),
+                    ),
+                )
+            now = utc_now()
+            cursor = await db.execute(
+                """
+                UPDATE workflows
+                SET state = ?, version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    WorkflowState.SLICE_REQUESTED.value,
+                    now.isoformat(),
+                    job.workflow_id,
+                    workflow["version"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed while requesting slicing")
+            await self._insert_event(
+                db,
+                job.workflow_id,
+                "slice.requested",
+                WorkflowState.SLICE_REQUESTED,
+                {"slice_job_id": job.id},
+            )
+            await self._insert_work_item(db, item)
+            await db.commit()
+            return item
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def finalize_slice(
+        self,
+        job: SliceJob,
+        artifact: SlicedArtifact,
+    ) -> None:
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT state, version FROM workflows WHERE id = ?",
+                (job.workflow_id,),
+            )
+            workflow = await cursor.fetchone()
+            if workflow is None:
+                raise NotFoundError(f"Workflow '{job.workflow_id}' was not found")
+            if workflow["state"] != WorkflowState.SLICE_VALIDATING.value:
+                raise ConflictError("Workflow is no longer validating a slice")
+            await db.execute(
+                """
+                UPDATE slice_jobs SET status = ?, payload_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    job.status.value,
+                    job.model_dump_json(),
+                    job.updated_at.isoformat(),
+                    job.id,
+                ),
+            )
+            await db.execute(
+                """
+                INSERT INTO sliced_artifacts (
+                    slice_job_id, workflow_id, digest, manifest_digest,
+                    payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact.slice_job_id,
+                    artifact.workflow_id,
+                    artifact.digest,
+                    artifact.manifest_digest,
+                    artifact.model_dump_json(),
+                    artifact.created_at.isoformat(),
+                ),
+            )
+            now = utc_now()
+            cursor = await db.execute(
+                """
+                UPDATE workflows SET state = ?, version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    WorkflowState.AWAITING_SLICE_REVIEW.value,
+                    now.isoformat(),
+                    job.workflow_id,
+                    workflow["version"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed while finalizing slice")
+            await self._insert_event(
+                db,
+                job.workflow_id,
+                "slice.ready",
+                WorkflowState.AWAITING_SLICE_REVIEW,
+                {
+                    "slice_job_id": job.id,
+                    "sliced_artifact_digest": artifact.digest,
+                },
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def fail_slice(self, job: SliceJob, message: str) -> None:
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT state, version FROM workflows WHERE id = ?",
+                (job.workflow_id,),
+            )
+            workflow = await cursor.fetchone()
+            if workflow is None:
+                raise NotFoundError(f"Workflow '{job.workflow_id}' was not found")
+            if workflow["state"] == WorkflowState.CANCELLED.value:
+                cancelled_job = job.model_copy(
+                    update={
+                        "status": SliceJobStatus.CANCELLED,
+                        "message": "Slice cancelled",
+                        "updated_at": utc_now(),
+                    }
+                )
+                await db.execute(
+                    """
+                    UPDATE slice_jobs SET status = ?, payload_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        cancelled_job.status.value,
+                        cancelled_job.model_dump_json(),
+                        cancelled_job.updated_at.isoformat(),
+                        cancelled_job.id,
+                    ),
+                )
+                await db.execute(
+                    """
+                    UPDATE spool_reservations SET status = 'released', updated_at = ?
+                    WHERE slice_job_id = ? AND status = 'reserved'
+                    """,
+                    (utc_now().isoformat(), job.id),
+                )
+                await db.commit()
+                return
+            if workflow["state"] not in {
+                WorkflowState.SLICE_REQUESTED.value,
+                WorkflowState.SLICING.value,
+                WorkflowState.SLICE_VALIDATING.value,
+            }:
+                raise ConflictError("Workflow is no longer running this slice")
+            failed_job = job.model_copy(
+                update={
+                    "status": SliceJobStatus.FAILED,
+                    "message": message[-2_000:],
+                    "updated_at": utc_now(),
+                }
+            )
+            await db.execute(
+                """
+                UPDATE slice_jobs SET status = ?, payload_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    failed_job.status.value,
+                    failed_job.model_dump_json(),
+                    failed_job.updated_at.isoformat(),
+                    failed_job.id,
+                ),
+            )
+            await db.execute(
+                """
+                UPDATE spool_reservations
+                SET status = 'released', updated_at = ?
+                WHERE slice_job_id = ? AND status = 'reserved'
+                """,
+                (utc_now().isoformat(), job.id),
+            )
+            now = utc_now()
+            cursor = await db.execute(
+                """
+                UPDATE workflows SET state = ?, version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    WorkflowState.SLICE_FAILED.value,
+                    now.isoformat(),
+                    job.workflow_id,
+                    workflow["version"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed while failing slice")
+            await self._insert_event(
+                db,
+                job.workflow_id,
+                "slice.failed",
+                WorkflowState.SLICE_FAILED,
+                {"slice_job_id": job.id, "message": message[-2_000:]},
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def list_spool_reservations(
+        self,
+        slice_job_id: str,
+    ) -> list[SpoolReservation]:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT payload_json, status, actual_usage_g
+                FROM spool_reservations
+                WHERE slice_job_id = ? ORDER BY spool_id
+                """,
+                (slice_job_id,),
+            )
+            return [
+                SpoolReservation.model_validate_json(row["payload_json"]).model_copy(
+                    update={
+                        "status": row["status"],
+                        "actual_usage_g": row["actual_usage_g"],
+                    }
+                )
+                for row in await cursor.fetchall()
+            ]
+        finally:
+            await db.close()
+
+    async def reconcile_spool_reservations(
+        self,
+        slice_job_id: str,
+        usage_by_spool: dict[str, float],
+    ) -> None:
+        if not usage_by_spool:
+            raise ConflictError("Sliced output has no reconcilable filament usage")
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT id, spool_id, payload_json FROM spool_reservations
+                WHERE slice_job_id = ? AND status = 'reserved'
+                """,
+                (slice_job_id,),
+            )
+            reservation_rows = await cursor.fetchall()
+            reservations = {
+                str(row["spool_id"]): row for row in reservation_rows
+            }
+            reserved_spool_ids = set(reservations)
+            if set(usage_by_spool) != reserved_spool_ids:
+                raise ConflictError(
+                    "Sliced filament usage does not match every reserved spool"
+                )
+            for spool_id, usage in usage_by_spool.items():
+                if not math.isfinite(usage) or usage <= 0:
+                    raise ConflictError(
+                        f"Sliced usage for spool '{spool_id}' must be finite and positive"
+                    )
+                required = usage * 1.1
+                cursor = await db.execute(
+                    "SELECT payload_json FROM physical_spools WHERE id = ?",
+                    (spool_id,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise ConflictError(f"Spool '{spool_id}' was removed")
+                spool = PhysicalSpool.model_validate_json(row["payload_json"])
+                cursor = await db.execute(
+                    """
+                    SELECT COALESCE(SUM(reserved_weight_g), 0) AS reserved
+                    FROM spool_reservations
+                    WHERE spool_id = ? AND status = 'reserved'
+                      AND slice_job_id != ?
+                    """,
+                    (spool_id, slice_job_id),
+                )
+                other_reserved = float((await cursor.fetchone())["reserved"])
+                if spool.remaining_weight_g - other_reserved < required:
+                    raise ConflictError(
+                        f"Spool '{spool_id}' is insufficient for sliced usage"
+                    )
+                cursor = await db.execute(
+                    """
+                    UPDATE spool_reservations
+                    SET reserved_weight_g = ?, actual_usage_g = ?,
+                        payload_json = ?, updated_at = ?
+                    WHERE spool_id = ? AND slice_job_id = ?
+                      AND status = 'reserved'
+                    """,
+                    (
+                        required,
+                        usage,
+                        SpoolReservation.model_validate_json(
+                            reservations[spool_id]["payload_json"]
+                        ).model_copy(
+                            update={
+                                "reserved_weight_g": required,
+                                "actual_usage_g": usage,
+                                "updated_at": utc_now(),
+                            }
+                        ).model_dump_json(),
+                        utc_now().isoformat(),
+                        spool_id,
+                        slice_job_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ConflictError(
+                        f"Reservation for spool '{spool_id}' is no longer active"
+                    )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def complete_spool_reservations(
+        self,
+        slice_job_id: str,
+        *,
+        consumed: bool,
+    ) -> None:
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT id, spool_id,
+                       COALESCE(actual_usage_g, reserved_weight_g) AS consumed_weight_g,
+                       payload_json
+                FROM spool_reservations
+                WHERE slice_job_id = ? AND status = 'reserved'
+                """,
+                (slice_job_id,),
+            )
+            rows = await cursor.fetchall()
+            now = utc_now()
+            for row in rows:
+                if consumed:
+                    spool_cursor = await db.execute(
+                        "SELECT payload_json FROM physical_spools WHERE id = ?",
+                        (row["spool_id"],),
+                    )
+                    spool_row = await spool_cursor.fetchone()
+                    if spool_row is None:
+                        raise ConflictError(
+                            f"Reserved spool '{row['spool_id']}' was removed"
+                        )
+                    spool = PhysicalSpool.model_validate_json(
+                        spool_row["payload_json"]
+                    )
+                    updated_spool = spool.model_copy(
+                        update={
+                            "remaining_weight_g": max(
+                                0,
+                                spool.remaining_weight_g
+                                - float(row["consumed_weight_g"]),
+                            ),
+                            "updated_at": now,
+                        }
+                    )
+                    await db.execute(
+                        """
+                        UPDATE physical_spools
+                        SET status = ?, payload_json = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            updated_spool.status.value,
+                            updated_spool.model_dump_json(),
+                            now.isoformat(),
+                            updated_spool.id,
+                        ),
+                    )
+                await db.execute(
+                    """
+                    UPDATE spool_reservations
+                    SET status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "consumed" if consumed else "released",
+                        now.isoformat(),
+                        row["id"],
+                    ),
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
     async def get_approval(self, workflow_id: str) -> ArtifactApproval:
         db = await self._connect()
         try:
@@ -1804,6 +2559,776 @@ class WorkflowRepository:
                 ),
                 created_at=row["created_at"],
             )
+        finally:
+            await db.close()
+
+    async def save_printer_profile(
+        self,
+        profile: PrinterProfileRevision,
+        *,
+        enabled: bool = True,
+        expected_revision: int | None = None,
+    ) -> None:
+        if profile.digest is None:
+            raise ValueError("Printer profile revision requires a digest")
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            if expected_revision is not None:
+                cursor = await db.execute(
+                    """
+                    SELECT active_revision FROM printer_profiles
+                    WHERE id = ? AND archived_at IS NULL
+                    """,
+                    (profile.profile_id,),
+                )
+                row = await cursor.fetchone()
+                current_revision = (
+                    int(row["active_revision"]) if row is not None else 0
+                )
+                if current_revision != expected_revision:
+                    raise ConflictError(
+                        "Printer profile changed; reload before saving a new revision"
+                    )
+            await db.execute(
+                """
+                INSERT INTO printer_profiles (
+                    id, active_revision, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    active_revision = excluded.active_revision,
+                    enabled = excluded.enabled,
+                    archived_at = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    profile.profile_id,
+                    profile.revision,
+                    int(enabled),
+                    profile.created_at.isoformat(),
+                    utc_now().isoformat(),
+                ),
+            )
+            await db.execute(
+                """
+                INSERT INTO printer_profile_revisions (
+                    profile_id, revision, digest, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    profile.profile_id,
+                    profile.revision,
+                    profile.digest,
+                    profile.model_dump_json(),
+                    profile.created_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError as exc:
+            await db.rollback()
+            raise ConflictError("Printer profile revision already exists") from exc
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def get_printer_profile(
+        self,
+        profile_id: str,
+        revision: int | None = None,
+    ) -> PrinterProfileRevision:
+        db = await self._connect()
+        try:
+            if revision is None:
+                cursor = await db.execute(
+                    """
+                    SELECT active_revision FROM printer_profiles
+                    WHERE id = ? AND enabled = 1 AND archived_at IS NULL
+                    """,
+                    (profile_id,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise NotFoundError(f"Printer profile '{profile_id}' was not found")
+                revision = int(row["active_revision"])
+            cursor = await db.execute(
+                """
+                SELECT payload_json FROM printer_profile_revisions
+                WHERE profile_id = ? AND revision = ?
+                """,
+                (profile_id, revision),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"Printer profile '{profile_id}' revision {revision} was not found"
+                )
+            return PrinterProfileRevision.model_validate_json(row["payload_json"])
+        finally:
+            await db.close()
+
+    async def list_printer_profiles(
+        self,
+        *,
+        include_archived: bool = False,
+    ) -> list[PrinterProfileRevision]:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT r.payload_json
+                FROM printer_profiles p
+                JOIN printer_profile_revisions r
+                  ON r.profile_id = p.id AND r.revision = p.active_revision
+                WHERE (? OR p.archived_at IS NULL)
+                ORDER BY p.id
+                """,
+                (int(include_archived),),
+            )
+            return [
+                PrinterProfileRevision.model_validate_json(row["payload_json"])
+                for row in await cursor.fetchall()
+            ]
+        finally:
+            await db.close()
+
+    async def archive_printer_profile(self, profile_id: str) -> None:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                UPDATE printer_profiles
+                SET archived_at = ?, enabled = 0, updated_at = ?
+                WHERE id = ? AND archived_at IS NULL
+                """,
+                (utc_now().isoformat(), utc_now().isoformat(), profile_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError(
+                    f"Active printer profile '{profile_id}' was not found"
+                )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def save_workflow_printer_snapshot(
+        self,
+        snapshot: WorkflowPrinterSnapshot,
+    ) -> None:
+        if snapshot.digest is None:
+            raise ValueError("Workflow printer snapshot requires a digest")
+        db = await self._connect()
+        try:
+            await db.execute(
+                """
+                INSERT INTO workflow_printer_snapshots (
+                    workflow_id, profile_id, profile_revision, digest,
+                    payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot.workflow_id,
+                    snapshot.profile_id,
+                    snapshot.profile_revision,
+                    snapshot.digest,
+                    snapshot.model_dump_json(),
+                    snapshot.created_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError as exc:
+            raise ConflictError("Workflow printer snapshot already exists") from exc
+        finally:
+            await db.close()
+
+    async def get_workflow_printer_snapshot(
+        self,
+        workflow_id: str,
+    ) -> WorkflowPrinterSnapshot:
+        payload = await self._get_single_payload(
+            "workflow_printer_snapshots",
+            "workflow_id",
+            workflow_id,
+        )
+        return WorkflowPrinterSnapshot.model_validate_json(payload)
+
+    async def save_material_definition(
+        self,
+        material: MaterialDefinitionRevision,
+        *,
+        enabled: bool = True,
+    ) -> None:
+        if material.digest is None:
+            raise ValueError("Material definition revision requires a digest")
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """
+                INSERT INTO material_definitions (
+                    id, active_revision, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    active_revision = excluded.active_revision,
+                    enabled = excluded.enabled,
+                    archived_at = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    material.material_id,
+                    material.revision,
+                    int(enabled),
+                    material.created_at.isoformat(),
+                    utc_now().isoformat(),
+                ),
+            )
+            await db.execute(
+                """
+                INSERT INTO material_definition_revisions (
+                    material_id, revision, digest, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    material.material_id,
+                    material.revision,
+                    material.digest,
+                    material.model_dump_json(),
+                    material.created_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError as exc:
+            await db.rollback()
+            raise ConflictError("Material definition revision already exists") from exc
+        finally:
+            await db.close()
+
+    async def get_material_definition(
+        self,
+        material_id: str,
+        revision: int | None = None,
+    ) -> MaterialDefinitionRevision:
+        db = await self._connect()
+        try:
+            if revision is None:
+                cursor = await db.execute(
+                    "SELECT active_revision FROM material_definitions WHERE id = ?",
+                    (material_id,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise NotFoundError(
+                        f"Material definition '{material_id}' was not found"
+                    )
+                revision = int(row["active_revision"])
+            cursor = await db.execute(
+                """
+                SELECT payload_json FROM material_definition_revisions
+                WHERE material_id = ? AND revision = ?
+                """,
+                (material_id, revision),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"Material definition '{material_id}' revision {revision} was not found"
+                )
+            return MaterialDefinitionRevision.model_validate_json(
+                row["payload_json"]
+            )
+        finally:
+            await db.close()
+
+    async def list_material_definitions(self) -> list[MaterialDefinitionRevision]:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT r.payload_json
+                FROM material_definitions m
+                JOIN material_definition_revisions r
+                  ON r.material_id = m.id AND r.revision = m.active_revision
+                WHERE m.archived_at IS NULL AND m.enabled = 1
+                ORDER BY m.id
+                """
+            )
+            return [
+                MaterialDefinitionRevision.model_validate_json(row["payload_json"])
+                for row in await cursor.fetchall()
+            ]
+        finally:
+            await db.close()
+
+    async def save_spool(self, spool: PhysicalSpool) -> None:
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT COUNT(*) AS count FROM spool_reservations
+                WHERE spool_id = ? AND status = 'reserved'
+                """,
+                (spool.id,),
+            )
+            has_reservation = int((await cursor.fetchone())["count"]) > 0
+            if has_reservation:
+                cursor = await db.execute(
+                    "SELECT payload_json FROM physical_spools WHERE id = ?",
+                    (spool.id,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise ConflictError("Reserved spool record is unavailable")
+                current = PhysicalSpool.model_validate_json(row["payload_json"])
+                if (
+                    current.material_id != spool.material_id
+                    or current.material_revision != spool.material_revision
+                    or current.material_digest != spool.material_digest
+                    or current.printer_profile_id != spool.printer_profile_id
+                    or current.slot_id != spool.slot_id
+                    or current.status != spool.status
+                    or current.remaining_weight_g != spool.remaining_weight_g
+                ):
+                    raise ConflictError(
+                        "Reserved spool material, slot, status, and quantity are immutable"
+                    )
+            await db.execute(
+                """
+                INSERT INTO physical_spools (
+                    id, material_id, material_revision, status,
+                    printer_profile_id, slot_id, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    material_id = excluded.material_id,
+                    material_revision = excluded.material_revision,
+                    status = excluded.status,
+                    printer_profile_id = excluded.printer_profile_id,
+                    slot_id = excluded.slot_id,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    spool.id,
+                    spool.material_id,
+                    spool.material_revision,
+                    spool.status.value,
+                    spool.printer_profile_id,
+                    spool.slot_id,
+                    spool.model_dump_json(),
+                    spool.updated_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError as exc:
+            await db.rollback()
+            raise ConflictError("Material slot already contains another spool") from exc
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def get_spool(self, spool_id: str) -> PhysicalSpool:
+        payload = await self._get_single_payload("physical_spools", "id", spool_id)
+        return PhysicalSpool.model_validate_json(payload)
+
+    async def list_spools(
+        self,
+        *,
+        printer_profile_id: str | None = None,
+    ) -> list[PhysicalSpool]:
+        db = await self._connect()
+        try:
+            if printer_profile_id is None:
+                cursor = await db.execute(
+                    "SELECT payload_json FROM physical_spools ORDER BY id"
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    SELECT payload_json FROM physical_spools
+                    WHERE printer_profile_id = ? ORDER BY slot_id, id
+                    """,
+                    (printer_profile_id,),
+                )
+            return [
+                PhysicalSpool.model_validate_json(row["payload_json"])
+                for row in await cursor.fetchall()
+            ]
+        finally:
+            await db.close()
+
+    async def save_material_assignment(
+        self,
+        assignment: MaterialAssignment,
+    ) -> None:
+        if assignment.digest is None:
+            raise ValueError("Material assignment requires a digest")
+        db = await self._connect()
+        try:
+            await db.execute(
+                """
+                INSERT INTO material_assignments (
+                    id, workflow_id, artifact_version, digest,
+                    confirmed, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    digest = excluded.digest,
+                    confirmed = excluded.confirmed,
+                    payload_json = excluded.payload_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    assignment.id,
+                    assignment.workflow_id,
+                    assignment.artifact_version,
+                    assignment.digest,
+                    int(assignment.confirmed_at is not None),
+                    assignment.model_dump_json(),
+                    assignment.created_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def get_latest_material_assignment(
+        self,
+        workflow_id: str,
+    ) -> MaterialAssignment:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT payload_json FROM material_assignments
+                WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1
+                """,
+                (workflow_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError("Workflow has no material assignment")
+            return MaterialAssignment.model_validate_json(row["payload_json"])
+        finally:
+            await db.close()
+
+    async def save_slice_job(self, job: SliceJob) -> None:
+        db = await self._connect()
+        try:
+            await db.execute(
+                """
+                INSERT INTO slice_jobs (
+                    id, workflow_id, status, idempotency_key,
+                    payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    status = excluded.status,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    job.id,
+                    job.workflow_id,
+                    job.status.value,
+                    job.idempotency_key,
+                    job.model_dump_json(),
+                    job.created_at.isoformat(),
+                    job.updated_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def get_slice_job(self, job_id: str) -> SliceJob:
+        payload = await self._get_single_payload("slice_jobs", "id", job_id)
+        return SliceJob.model_validate_json(payload)
+
+    async def get_latest_slice_job(self, workflow_id: str) -> SliceJob:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT payload_json FROM slice_jobs
+                WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1
+                """,
+                (workflow_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError("Workflow has no slice job")
+            return SliceJob.model_validate_json(row["payload_json"])
+        finally:
+            await db.close()
+
+    async def save_sliced_artifact(self, artifact: SlicedArtifact) -> None:
+        db = await self._connect()
+        try:
+            await db.execute(
+                """
+                INSERT INTO sliced_artifacts (
+                    slice_job_id, workflow_id, digest, manifest_digest,
+                    payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact.slice_job_id,
+                    artifact.workflow_id,
+                    artifact.digest,
+                    artifact.manifest_digest,
+                    artifact.model_dump_json(),
+                    artifact.created_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def get_sliced_artifact(self, slice_job_id: str) -> SlicedArtifact:
+        payload = await self._get_single_payload(
+            "sliced_artifacts",
+            "slice_job_id",
+            slice_job_id,
+        )
+        return SlicedArtifact.model_validate_json(payload)
+
+    async def save_submission_handoff(
+        self,
+        handoff: SubmissionHandoff,
+    ) -> None:
+        db = await self._connect()
+        try:
+            await db.execute(
+                """
+                INSERT INTO submission_handoffs (
+                    id, workflow_id, slice_job_id, status,
+                    payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    handoff.id,
+                    handoff.workflow_id,
+                    handoff.slice_job_id,
+                    handoff.status.value,
+                    handoff.model_dump_json(),
+                    handoff.created_at.isoformat(),
+                    handoff.updated_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def get_latest_submission_handoff(
+        self,
+        workflow_id: str,
+    ) -> SubmissionHandoff:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT payload_json FROM submission_handoffs
+                WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1
+                """,
+                (workflow_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError("Workflow has no submission handoff")
+            return SubmissionHandoff.model_validate_json(row["payload_json"])
+        finally:
+            await db.close()
+
+    async def confirm_submission_handoff(
+        self,
+        workflow_id: str,
+        handoff_id: str,
+        *,
+        submitted: bool,
+        confirmed_by: str,
+    ) -> SubmissionHandoff:
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT state, version FROM workflows WHERE id = ?",
+                (workflow_id,),
+            )
+            workflow = await cursor.fetchone()
+            if workflow is None:
+                raise NotFoundError(f"Workflow '{workflow_id}' was not found")
+            if workflow["state"] != WorkflowState.EXTERNAL_CONFIRMATION_REQUIRED.value:
+                raise ConflictError("Workflow is not awaiting external confirmation")
+            cursor = await db.execute(
+                """
+                SELECT payload_json FROM submission_handoffs
+                WHERE id = ? AND workflow_id = ?
+                """,
+                (handoff_id, workflow_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError("Submission handoff was not found")
+            handoff = SubmissionHandoff.model_validate_json(row["payload_json"])
+            if handoff.status != HandoffStatus.EXTERNAL_CONFIRMATION_REQUIRED:
+                raise ConflictError("Submission handoff was already confirmed")
+            now = utc_now()
+            status = (
+                HandoffStatus.USER_CONFIRMED_SUBMITTED
+                if submitted
+                else HandoffStatus.CANCELLED
+            )
+            updated = handoff.model_copy(
+                update={
+                    "status": status,
+                    "confirmed_by": confirmed_by,
+                    "confirmed_at": now,
+                    "updated_at": now,
+                    "message": (
+                        "User confirmed submission in Bambu Connect"
+                        if submitted
+                        else "User cancelled the Bambu Connect handoff"
+                    ),
+                }
+            )
+            await db.execute(
+                """
+                UPDATE submission_handoffs
+                SET status = ?, payload_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    updated.status.value,
+                    updated.model_dump_json(),
+                    now.isoformat(),
+                    updated.id,
+                ),
+            )
+            cursor = await db.execute(
+                """
+                SELECT id, spool_id,
+                       COALESCE(actual_usage_g, reserved_weight_g) AS consumed_weight_g
+                FROM spool_reservations
+                WHERE slice_job_id = ? AND status = 'reserved'
+                """,
+                (handoff.slice_job_id,),
+            )
+            reservations = await cursor.fetchall()
+            for reservation in reservations:
+                if submitted:
+                    spool_cursor = await db.execute(
+                        "SELECT payload_json FROM physical_spools WHERE id = ?",
+                        (reservation["spool_id"],),
+                    )
+                    spool_row = await spool_cursor.fetchone()
+                    if spool_row is None:
+                        raise ConflictError(
+                            f"Reserved spool '{reservation['spool_id']}' was removed"
+                        )
+                    spool = PhysicalSpool.model_validate_json(
+                        spool_row["payload_json"]
+                    )
+                    updated_spool = spool.model_copy(
+                        update={
+                            "remaining_weight_g": max(
+                                0,
+                                spool.remaining_weight_g
+                                - float(reservation["consumed_weight_g"]),
+                            ),
+                            "updated_at": now,
+                        }
+                    )
+                    await db.execute(
+                        """
+                        UPDATE physical_spools
+                        SET status = ?, payload_json = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            updated_spool.status.value,
+                            updated_spool.model_dump_json(),
+                            now.isoformat(),
+                            updated_spool.id,
+                        ),
+                    )
+                await db.execute(
+                    """
+                    UPDATE spool_reservations SET status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "consumed" if submitted else "released",
+                        now.isoformat(),
+                        reservation["id"],
+                    ),
+                )
+            target = (
+                WorkflowState.USER_CONFIRMED_SUBMITTED
+                if submitted
+                else WorkflowState.CANCELLED
+            )
+            cursor = await db.execute(
+                """
+                UPDATE workflows SET state = ?, version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    target.value,
+                    now.isoformat(),
+                    workflow_id,
+                    workflow["version"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("Workflow changed during handoff confirmation")
+            await self._insert_event(
+                db,
+                workflow_id,
+                (
+                    "submission.user_confirmed"
+                    if submitted
+                    else "submission.cancelled"
+                ),
+                target,
+                {"handoff_id": handoff_id},
+            )
+            await db.commit()
+            return updated
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def _get_single_payload(
+        self,
+        table: str,
+        key_column: str,
+        key_value: str,
+    ) -> str:
+        allowed = {
+            ("workflow_printer_snapshots", "workflow_id"),
+            ("physical_spools", "id"),
+            ("slice_jobs", "id"),
+            ("sliced_artifacts", "slice_job_id"),
+        }
+        if (table, key_column) not in allowed:
+            raise ValueError("Unsupported payload lookup")
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                f"SELECT payload_json FROM {table} WHERE {key_column} = ?",
+                (key_value,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError(f"{table} record '{key_value}' was not found")
+            return str(row["payload_json"])
         finally:
             await db.close()
 

@@ -786,6 +786,134 @@ select:focus {
   line-height: 1.6;
 }
 
+.settings-layout {
+  margin: 0 auto;
+  max-width: 1280px;
+  padding: 42px 24px 80px;
+}
+
+.settings-grid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.settings-grid label {
+  color: var(--ink-soft);
+  display: grid;
+  font-size: 11px;
+  gap: 5px;
+}
+
+.settings-grid input,
+.settings-grid select,
+.settings-grid textarea {
+  background: white;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  padding: 9px;
+}
+
+.settings-grid details {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.settings-grid summary {
+  cursor: pointer;
+  font-size: 11px;
+  margin-bottom: 8px;
+}
+
+.settings-grid details textarea {
+  font-family: var(--mono);
+  font-size: 10px;
+  width: 100%;
+}
+
+.job-overrides {
+  background: #f5f5ef;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.job-overrides label {
+  color: var(--ink-soft);
+  display: grid;
+  font-size: 11px;
+  gap: 5px;
+}
+
+.job-overrides input,
+.job-overrides select {
+  background: white;
+  border: 1px solid var(--line);
+  padding: 8px;
+}
+
+.checkbox-label {
+  align-items: center;
+  display: flex !important;
+  gap: 7px !important;
+}
+
+.override-slots {
+  display: grid;
+  gap: 5px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.slot-grid,
+.material-list {
+  display: grid;
+  gap: 7px;
+}
+
+.slot-card {
+  background: #f5f5ef;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  display: grid;
+  gap: 3px;
+  padding: 10px;
+  text-align: left;
+}
+
+.slot-card.forbidden {
+  background: #fff0ec;
+  border-color: #c85d4e;
+  color: #872e25;
+}
+
+.slot-card small,
+.slot-card span {
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.material-list > div {
+  align-items: center;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 18px 1fr auto;
+  padding: 8px;
+}
+
+.material-list span {
+  border: 1px solid var(--line-strong);
+  height: 16px;
+  width: 16px;
+}
+
+@media (max-width: 900px) {
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .part-scope-check {
   align-items: center;
   border: 1px solid var(--line-strong);
@@ -973,6 +1101,71 @@ select:focus {
   grid-template-columns: 0.8fr 1.2fr;
   margin-top: 18px;
   padding: 28px;
+}
+
+.fabrication-panel {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 18px;
+  margin-top: 18px;
+  padding: 28px;
+}
+
+.fabrication-panel h2 {
+  color: var(--ink);
+  font-family: var(--display);
+  margin: 6px 0;
+}
+
+.material-assignment-review,
+.slice-review,
+.external-confirmation {
+  background: #f5f5ef;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+}
+
+.material-assignment-review > div {
+  align-items: start;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 5px 10px;
+  grid-template-columns: 16px minmax(120px, 0.6fr) 1fr;
+  padding: 8px 0;
+}
+
+.material-assignment-review > div p {
+  color: var(--ink-soft);
+  font-size: 11px;
+  grid-column: 2 / -1;
+  margin: 0;
+}
+
+.verified-label {
+  color: var(--teal-dark);
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.slice-review dl {
+  display: grid;
+  font-size: 11px;
+  gap: 6px 12px;
+  grid-template-columns: 120px 1fr;
+  margin: 0;
+}
+
+.slice-review dt {
+  color: var(--muted);
+}
+
+.slice-review dd {
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .approval-panel h2,

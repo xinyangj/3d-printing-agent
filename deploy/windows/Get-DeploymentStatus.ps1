@@ -47,3 +47,17 @@ if ($null -eq $tailscale) {
 } else {
     & $tailscale.Source funnel status
 }
+
+Write-Host ""
+Write-Host "Bambu tools"
+foreach ($tool in @(
+    @{ Name = "Bambu Studio"; Command = "bambu-studio.exe" },
+    @{ Name = "Bambu Connect"; Command = "Bambu Connect.exe" }
+)) {
+    $command = Get-Command $tool.Command -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        Write-Host "  $($tool.Name): installed ($($command.Source))"
+    } else {
+        Write-Host "  $($tool.Name): not detected"
+    }
+}

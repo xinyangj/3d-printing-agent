@@ -147,6 +147,55 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\deploy\windows\Install-Deployment.ps1
 ```
 
+## Bambu Lab H2D slicing and cloud handoff
+
+The production H2D workflow is intentionally split into two official-tool stages:
+
+```text
+verified model
+→ configured material/spool/slot assignment
+→ Bambu Studio CLI slicing
+→ reviewed .gcode.3mf
+→ Bambu Connect import
+→ user authorizes cloud submission
+```
+
+Prerequisites:
+
+1. Install the official Bambu Studio. The Windows installer script can install the
+   WinGet package `Bambulab.Bambustudio`.
+2. Install Bambu Connect from the
+   [official Bambu Connect page](https://wiki.bambulab.com/en/software/bambu-connect).
+3. Log in to Bambu Connect and bind the intended H2D.
+4. Configure these values in `.env` when auto-detection is insufficient:
+
+```dotenv
+PRINTING_AGENT_BAMBU_STUDIO_PATH=C:\Program Files\Bambu Studio\bambu-studio.exe
+PRINTING_AGENT_BAMBU_STUDIO_RESOURCE_DIR=C:\Program Files\Bambu Studio\resources\profiles
+```
+
+Use **Printers & materials** in the WebUI to:
+
+- review or clone the built-in H2D profile;
+- configure nozzle, plate, slicer profile, and Bambu Connect submission method;
+- create reusable material definitions;
+- load physical spools into AMS/external slots;
+- forbid slots globally for automatic assignment.
+
+Job creation supports stricter per-job slot restrictions and slicing overrides.
+Forbidden slots are removed before the material-assignment agent receives candidates.
+
+Remote mutation requests require `PRINTING_AGENT_ADMIN_API_TOKEN`. The Windows
+installer generates a random token in the protected `.env`; enter it on the
+**Printers & materials** page for the current browser session. Loopback requests
+remain available for local administration, while Caddy authentication protects
+proxied access.
+
+The server never stores Bambu credentials. **Open in Bambu Connect** launches the
+official `bambu-connect://import-file` URL for an immutable sliced `.gcode.3mf`; the
+user must select/confirm the printer and start the job inside Bambu Connect. Opening
+Connect is not treated as proof that the printer accepted the job.
+
 The installer:
 
 - installs Node.js LTS, OpenSCAD, Tailscale, and Caddy with WinGet when missing;
