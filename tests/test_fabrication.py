@@ -7,20 +7,17 @@ from pathlib import Path
 import pytest
 import trimesh
 
-from printing_agent.application import PrintingApplication
-from printing_agent.artifact_store import ArtifactStore, sha256_file
+from printing_agent.artifact_store import sha256_file
 from printing_agent.domain import (
     AnnotationOrigin,
     ArtifactApproval,
     ArtifactProvenance,
     MaterialDefinition,
     ModelArtifact,
-    ModelPlan,
     PartDefinition,
     PartGeometryKind,
     PartInstance,
     PartProject,
-    PrintWorkflow,
     WorkflowState,
 )
 from printing_agent.errors import ConflictError, NotFoundError, ValidationError
@@ -48,11 +45,9 @@ from printing_agent.fabrication_drivers import (
     BambuConnectCloudDriver,
     BambuStudioCliDriver,
     SliceRequest,
-    SlicerRegistry,
 )
 from printing_agent.fabrication_profiles import (
     built_in_h2d_profile,
-    built_in_simulator_profile,
     resolve_profile_dependency_digests,
     resolve_slicer_profile_payload,
 )
@@ -62,8 +57,6 @@ from printing_agent.material_assignment import (
     MaterialAssignmentService,
 )
 from printing_agent.modeling import MeshInspector
-from printing_agent.multipart import single_part_project, write_project_artifact
-from printing_agent.printers import PrinterRegistry, ProfilePrinterAdapter
 from printing_agent.repositories import WorkflowRepository
 
 
@@ -90,19 +83,6 @@ class DeterministicAssignmentAgent:
             ],
             rationale="Closest compatible colors selected.",
         )
-
-
-class ReadySlicer:
-    id = "bambu_studio_cli"
-
-    async def validate_profile(self, profile) -> None:
-        del profile
-
-    async def slice(self, request):
-        raise AssertionError(f"Unexpected slice request: {request}")
-
-    async def cancel(self, slice_job_id: str) -> None:
-        del slice_job_id
 
 
 def _material(
@@ -168,118 +148,6 @@ async def _artifact(
     )
 
 
-async def _stored_source_artifact(
-    repository: WorkflowRepository,
-    store: ArtifactStore,
-    tmp_path: Path,
-    *,
-    schema_version: str,
-    approved: bool,
-) -> tuple[PrintWorkflow, ModelArtifact]:
-    profile = built_in_simulator_profile()
-    try:
-        await repository.get_printer_profile(profile.profile_id, profile.revision)
-    except NotFoundError:
-        await repository.save_printer_profile(profile)
-    workflow = await repository.create_workflow("Create a printable cube", "simulator")
-    pending = await repository.lease_next()
-    assert pending is not None
-    await repository.complete_work(pending.id)
-    await repository.transition(workflow.id, WorkflowState.PLANNING)
-    await repository.save_plan(
-        workflow.id,
-        ModelPlan(
-            search_query="cube",
-            geometry_summary="A printable cube",
-            target_dimensions=profile.spec.build_volume,
-        ),
-    )
-    for state in (
-        WorkflowState.DISCOVERING,
-        WorkflowState.SELECTING,
-        WorkflowState.VALIDATING,
-    ):
-        await repository.transition(workflow.id, state)
-    source_dir = tmp_path / workflow.id
-    source_dir.mkdir()
-    base = await _artifact(source_dir, workflow.id)
-    if schema_version == "2":
-        staging = store.workflow_root(workflow.id) / "staging" / "artifact-1"
-        project = single_part_project(
-            source_digest=base.model_digest,
-            imported=True,
-            source_filename=base.model_path.name,
-        )
-        manifest, files = write_project_artifact(
-            directory=staging,
-            workflow_id=workflow.id,
-            version=1,
-            project=project,
-            source_path=base.model_path,
-            model_path=base.model_path,
-            mesh=base.mesh,
-            provenance=base.provenance,
-            handoff_digest=None,
-            diagnostics=None,
-            imported=True,
-        )
-        adopted = store.adopt_project(workflow.id, 1, staging)
-        artifact = ModelArtifact(
-            schema_version="2",
-            workflow_id=workflow.id,
-            version=1,
-            source_path=adopted / "project" / "main.scad",
-            model_path=adopted / "outputs" / "parts" / "base_model.stl",
-            project_path=adopted / "project" / "project.json",
-            three_mf_path=adopted / "outputs" / "model.3mf",
-            source_digest=base.model_digest,
-            model_digest=str(manifest["model_digest"]),
-            project_digest=str(manifest["project_digest"]),
-            three_mf_digest=str(manifest["three_mf_digest"]),
-            manifest_digest=str(manifest["manifest_digest"]),
-            mesh=base.mesh,
-            project=project,
-            part_meshes={"base_model": base.mesh},
-            files=files,
-            provenance=base.provenance,
-        )
-    else:
-        artifact = base
-    await repository.save_artifact(artifact)
-    await repository.transition(workflow.id, WorkflowState.AWAITING_APPROVAL)
-    if approved:
-        await repository.approve_artifact(
-            ArtifactApproval(
-                workflow_id=workflow.id,
-                artifact_version=artifact.version,
-                manifest_digest=artifact.manifest_digest,
-                approved_by="test",
-            )
-        )
-    return await repository.get_workflow(workflow.id), artifact
-
-
-async def _copy_application(
-    repository: WorkflowRepository,
-    store: ArtifactStore,
-) -> PrintingApplication:
-    h2d = built_in_h2d_profile()
-    try:
-        await repository.get_printer_profile(h2d.profile_id, h2d.revision)
-    except NotFoundError:
-        await repository.save_printer_profile(h2d)
-    printers = PrinterRegistry()
-    printers.register(ProfilePrinterAdapter(h2d))
-    slicers = SlicerRegistry()
-    slicers.register(ReadySlicer())
-    application = object.__new__(PrintingApplication)
-    application.repository = repository
-    application.artifacts = store
-    application.printers = printers
-    application.slicers = slicers
-    return application
-
-
 def test_ciede2000_matches_reference_pair() -> None:
     assert ciede2000(
         (50.0, 2.6772, -79.7751),
@@ -306,72 +174,6 @@ def test_job_policy_cannot_reenable_profile_forbidden_slot() -> None:
 
     assert resolved.forbidden_slot_ids == {"ams1_1", "ams1_3"}
     assert resolved.allowed_slot_ids == {"ams1_2"}
-
-
-async def test_fabrication_copy_carries_exact_schema_v2_approval(
-    repository: WorkflowRepository,
-    tmp_path: Path,
-) -> None:
-    store = ArtifactStore(tmp_path / "artifacts")
-    source, source_artifact = await _stored_source_artifact(
-        repository,
-        store,
-        tmp_path,
-        schema_version="2",
-        approved=True,
-    )
-    application = await _copy_application(repository, store)
-
-    copied = await application.copy_workflow(
-        source.id,
-        target_printer_name="bambu-h2d",
-        overrides=JobOverrides(
-            plate_id="smooth_pei",
-            forbidden_slot_ids={"ams1_4"},
-        ),
-    )
-
-    copied_artifact = await repository.get_artifact(copied.id, 1)
-    copied_approval = await repository.get_approval(copied.id)
-    copied_snapshot = await repository.get_workflow_printer_snapshot(copied.id)
-    assert copied.state == WorkflowState.APPROVED
-    assert copied.printer_name == "bambu-h2d"
-    assert copied_approval.manifest_digest == copied_artifact.manifest_digest
-    assert copied_approval.approved_by.startswith(f"carried-from:{source.id}:")
-    assert copied_snapshot.overrides.plate_id == "smooth_pei"
-    assert copied_snapshot.resolved_slot_policy.forbidden_slot_ids == {"ams1_4"}
-    assert copied_artifact.manifest_digest != source_artifact.manifest_digest
-    assert copied_artifact.model_digest == source_artifact.model_digest
-    assert copied_artifact.three_mf_digest == source_artifact.three_mf_digest
-    assert copied_artifact.files == source_artifact.files
-
-
-async def test_fabrication_copy_upgrades_legacy_artifact_without_approval(
-    repository: WorkflowRepository,
-    tmp_path: Path,
-) -> None:
-    store = ArtifactStore(tmp_path / "artifacts")
-    source, _ = await _stored_source_artifact(
-        repository,
-        store,
-        tmp_path,
-        schema_version="1",
-        approved=True,
-    )
-    application = await _copy_application(repository, store)
-
-    copied = await application.copy_workflow(
-        source.id,
-        target_printer_name="bambu-h2d",
-    )
-
-    copied_artifact = await repository.get_artifact(copied.id, 1)
-    assert copied.state == WorkflowState.AWAITING_APPROVAL
-    assert copied_artifact.schema_version == "2"
-    assert copied_artifact.three_mf_path is not None
-    assert copied_artifact.three_mf_path.is_file()
-    with pytest.raises(NotFoundError, match="not been approved"):
-        await repository.get_approval(copied.id)
 
 
 async def test_forbidden_spools_are_removed_before_assignment(

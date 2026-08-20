@@ -47,11 +47,6 @@ class CreateWorkflowRequest(BaseModel):
     overrides: JobOverrides = Field(default_factory=JobOverrides)
 
 
-class CreateFabricationCopyRequest(BaseModel):
-    profile_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
-    overrides: JobOverrides = Field(default_factory=JobOverrides)
-
-
 class ConfirmMaterialAssignmentRequest(BaseModel):
     assignment_id: str
     confirmed_by: str = Field(default="local-web", min_length=1, max_length=200)
@@ -481,23 +476,6 @@ def create_app(container: Container | None = None) -> FastAPI:
         workflow = await container.application.copy_workflow(workflow_id)
         return await serialize_workflow(container, workflow)
 
-    @app.post(
-        "/api/v1/workflows/{workflow_id}/fabrication-copies",
-        status_code=201,
-    )
-    async def create_fabrication_copy(
-        workflow_id: str,
-        body: CreateFabricationCopyRequest,
-        request: Request,
-    ) -> dict[str, object]:
-        container = get_container(request)
-        workflow = await container.application.copy_workflow(
-            workflow_id,
-            target_printer_name=body.profile_id,
-            overrides=body.overrides,
-        )
-        return await serialize_workflow(container, workflow)
-
     @app.post("/api/v1/workflows/{workflow_id}/archive")
     async def archive_workflow(
         workflow_id: str,
@@ -530,21 +508,6 @@ def create_app(container: Container | None = None) -> FastAPI:
     async def list_printer_profiles(request: Request) -> list[dict[str, object]]:
         profiles = await get_container(request).repository.list_printer_profiles()
         return [item.model_dump(mode="json") for item in profiles]
-
-    @app.get("/api/v1/fabrication/readiness")
-    async def fabrication_readiness(
-        request: Request,
-        profile_id: str | None = None,
-        profile_revision: int | None = None,
-    ) -> list[dict[str, object]]:
-        if profile_revision is not None and profile_id is None:
-            raise ValidationError(
-                "profile_revision requires a matching profile_id"
-            )
-        return await get_container(request).application.fabrication_readiness(
-            profile_id,
-            profile_revision,
-        )
 
     @app.post("/api/v1/printer-profiles/{profile_id}", status_code=201)
     async def save_printer_profile(
