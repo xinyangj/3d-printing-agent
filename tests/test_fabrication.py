@@ -634,6 +634,65 @@ async def test_fabrication_copy_rejects_printer_from_previous_account(
         )
 
 
+def test_observed_topology_adds_second_ams_and_preserves_external_slots() -> None:
+    profile = built_in_h2d_profile()
+    snapshot = parse_h2d_snapshot(
+        {
+            "print": {
+                "nozzles": [
+                    {"position": "left", "diameter": 0.4, "type": "HS01"},
+                    {"position": "right", "diameter": 0.4, "type": "HS01"},
+                ],
+                "ams": {
+                    "ams": [
+                        {"id": "0", "tray": [{"id": str(index)} for index in range(4)]},
+                        {"id": "1", "tray": [{"id": str(index)} for index in range(4)]},
+                    ],
+                    "vt_tray": [
+                        {"id": "254", "state": 0},
+                        {"id": "255", "state": 0},
+                    ],
+                },
+            }
+        },
+        DeviceSummary(
+            device_id="H2D-PRIVATE-SERIAL",
+            name="Workshop H2D",
+            model="H2D",
+            online=True,
+        ),
+    )
+
+    slots = PrintingApplication._observed_material_slots(profile, snapshot)
+
+    assert [slot.id for slot in slots] == [
+        "ams1_1",
+        "ams1_2",
+        "ams1_3",
+        "ams1_4",
+        "ams2_1",
+        "ams2_2",
+        "ams2_3",
+        "ams2_4",
+        "external_left",
+        "external_right",
+    ]
+    assert slots[4].unit == 2
+    assert slots[4].tray == 1
+    assert slots[4].compatible_toolhead_ids == {"left", "right"}
+    assert slots[-2].manual_swap_required is True
+    assert slots[-1].manual_swap_required is True
+    restricted = PrintingApplication._restrict_slot_policy(
+        SlotPolicy(
+            part_allowed_slot_ids={"body": {"ams1_1"}},
+            part_forbidden_slot_ids={"lid": {"ams1_1"}},
+        ),
+        {"ams2_1"},
+    )
+    assert restricted.part_allowed_slot_ids == {"body": set()}
+    assert restricted.part_forbidden_slot_ids == {}
+
+
 async def test_fabrication_copy_upgrades_legacy_artifact_without_approval(
     repository: WorkflowRepository,
     tmp_path: Path,

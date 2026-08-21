@@ -52,10 +52,13 @@ from printing_agent.fabrication import (
     JobOverrides,
     MaterialAssignment,
     MaterialDefinitionRevision,
+    MaterialSlotSpec,
     PhysicalSpool,
     PrinterProfileRevision,
+    ProfileOrigin,
     SliceJob,
     SliceJobStatus,
+    SlotPolicy,
     SpoolReservation,
     SpoolStatus,
     WorkflowPrinterSnapshot,
@@ -325,6 +328,148 @@ class PrintingApplication:
             return await self.inventory.list_devices()
         except CloudInventoryError as exc:
             raise ExternalServiceError(str(exc)) from exc
+
+    async def bind_cloud_device(
+        self,
+        profile_id: str,
+        device_ref: str,
+    ) -> PrinterProfileRevision:
+        devices = await self.list_cloud_devices()
+        selected = next(
+            (
+                item
+                for item in devices
+                if hashlib.sha256(item.device_id.encode()).hexdigest() == device_ref
+            ),
+            None,
+        )
+        if selected is None:
+            raise NotFoundError("Cloud device reference was not found")
+        try:
+            snapshot = await self.inventory.snapshot(selected.device_id)
+        except CloudInventoryError as exc:
+            raise ExternalServiceError(str(exc)) from exc
+        current = await self.repository.get_printer_profile(profile_id)
+        material_slots = self._observed_material_slots(current, snapshot)
+        slot_ids = {slot.id for slot in material_slots}
+        policy = self._restrict_slot_policy(
+            current.spec.default_slot_policy,
+            slot_ids,
+        )
+        profile = current.model_copy(
+            update={
+                "revision": current.revision + 1,
+                "origin": ProfileOrigin.CUSTOM,
+                "spec": current.spec.model_copy(
+                    update={
+                        "material_slots": material_slots,
+                        "default_slot_policy": policy,
+                        "cloud_region": snapshot.region,
+                        "cloud_device_name": selected.name,
+                        "cloud_device_serial": selected.device_id,
+                    }
+                ),
+                "digest": None,
+            }
+        ).with_digest()
+        await self.repository.save_printer_profile(
+            profile,
+            expected_revision=current.revision,
+        )
+        self.printers.upsert(ProfilePrinterAdapter(profile))
+        return profile
+
+    @staticmethod
+    def _observed_material_slots(
+        profile: PrinterProfileRevision,
+        snapshot: CloudDeviceSnapshot,
+    ) -> list[MaterialSlotSpec]:
+        existing = {slot.id: slot for slot in profile.spec.material_slots}
+        all_toolheads = {toolhead.id for toolhead in profile.spec.toolheads}
+        material_families = set(profile.spec.supported_material_families)
+        slots: list[MaterialSlotSpec] = []
+        for unit in snapshot.ams_units:
+            for fallback_tray, tray in enumerate(unit.trays, start=1):
+                if tray.slot_id in existing:
+                    slots.append(existing[tray.slot_id])
+                    continue
+                match = re.fullmatch(r"ams(_ht)?(\d+)_(\d+)", tray.slot_id)
+                unit_number = int(match.group(2)) if match else len(slots) // 4 + 1
+                tray_number = int(match.group(3)) if match else fallback_tray
+                system = "ams_ht" if unit.kind == "ams_ht" else "ams"
+                label = "AMS HT" if system == "ams_ht" else "AMS"
+                slots.append(
+                    MaterialSlotSpec(
+                        id=tray.slot_id,
+                        name=f"{label} {unit_number} slot {tray_number}",
+                        system=system,
+                        unit=unit_number,
+                        tray=tray_number,
+                        compatible_toolhead_ids=all_toolheads,
+                        supported_material_families=material_families,
+                    )
+                )
+        observed_external_ids = {tray.slot_id for tray in snapshot.external_trays}
+        for slot_id in sorted(observed_external_ids):
+            if slot_id in existing:
+                slots.append(existing[slot_id])
+                continue
+            toolheads = (
+                {"left"}
+                if slot_id.endswith("left")
+                else {"right"}
+                if slot_id.endswith("right")
+                else all_toolheads
+            )
+            name = (
+                "External spool — left toolhead"
+                if slot_id.endswith("left")
+                else "External spool — right toolhead"
+                if slot_id.endswith("right")
+                else f"External spool {slot_id}"
+            )
+            slots.append(
+                MaterialSlotSpec(
+                    id=slot_id,
+                    name=name,
+                    system="external",
+                    compatible_toolhead_ids=toolheads,
+                    supported_material_families=material_families,
+                    manual_swap_required=True,
+                )
+            )
+        return slots
+
+    @staticmethod
+    def _restrict_slot_policy(
+        policy: SlotPolicy,
+        slot_ids: set[str],
+    ) -> SlotPolicy:
+        def restrict_forbidden_parts(
+            values: dict[str, set[str]],
+        ) -> dict[str, set[str]]:
+            return {
+                part_id: restricted
+                for part_id, slots in values.items()
+                if (restricted := slots & slot_ids)
+            }
+
+        return SlotPolicy(
+            forbidden_slot_ids=policy.forbidden_slot_ids & slot_ids,
+            allowed_slot_ids=(
+                policy.allowed_slot_ids & slot_ids
+                if policy.allowed_slot_ids is not None
+                else None
+            ),
+            part_allowed_slot_ids={
+                part_id: slots & slot_ids
+                for part_id, slots in policy.part_allowed_slot_ids.items()
+            },
+            part_forbidden_slot_ids=restrict_forbidden_parts(
+                policy.part_forbidden_slot_ids
+            ),
+            allow_manual_swaps=policy.allow_manual_swaps,
+        )
 
     async def refresh_cloud_snapshot(
         self,

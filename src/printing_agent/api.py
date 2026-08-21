@@ -965,43 +965,10 @@ def create_app(container: Container | None = None) -> FastAPI:
         request: Request,
     ) -> dict[str, object]:
         container = get_container(request)
-        devices = await container.application.list_cloud_devices()
-        selected = next(
-            (
-                item
-                for item in devices
-                if hashlib.sha256(item.device_id.encode()).hexdigest()
-                == body.device_ref
-            ),
-            None,
+        profile = await container.application.bind_cloud_device(
+            profile_id,
+            body.device_ref,
         )
-        if selected is None:
-            raise NotFoundError("Cloud device reference was not found")
-        current = await container.repository.get_printer_profile(profile_id)
-        credential_status = await asyncio.to_thread(
-            container.cloud_credentials.status
-        )
-        if credential_status.region is None:
-            raise ConflictError("Cloud credential region is unavailable")
-        profile = current.model_copy(
-            update={
-                "revision": current.revision + 1,
-                "origin": ProfileOrigin.CUSTOM,
-                "spec": current.spec.model_copy(
-                    update={
-                        "cloud_region": credential_status.region,
-                        "cloud_device_name": selected.name,
-                        "cloud_device_serial": selected.device_id,
-                    }
-                ),
-                "digest": None,
-            }
-        ).with_digest()
-        await container.repository.save_printer_profile(
-            profile,
-            expected_revision=current.revision,
-        )
-        container.printers.upsert(ProfilePrinterAdapter(profile))
         return _masked_profile(profile)
 
     @app.get("/api/v1/materials")
