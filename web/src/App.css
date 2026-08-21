@@ -1587,6 +1587,75 @@ select:focus {
   gap: 8px;
 }
 
+.account-connection-panel {
+  grid-column: 1 / -1;
+}
+
+.account-connection-summary {
+  background: var(--canvas);
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+}
+
+.account-connection-summary small,
+.account-connection-step small {
+  color: var(--muted);
+}
+
+.account-connection-steps {
+  display: grid;
+  gap: 10px;
+  list-style: none;
+  margin: 18px 0;
+  padding: 0;
+}
+
+.account-connection-step {
+  align-items: start;
+  background: var(--canvas);
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 32px 1fr;
+  padding: 14px;
+}
+
+.account-connection-step p {
+  color: var(--muted);
+  margin: 5px 0 10px;
+}
+
+.account-step-number {
+  align-items: center;
+  background: var(--ink);
+  border-radius: 50%;
+  color: var(--paper);
+  display: flex;
+  font-size: 13px;
+  font-weight: 700;
+  height: 28px;
+  justify-content: center;
+  width: 28px;
+}
+
+.account-session-ready,
+.account-device-count {
+  color: #326447;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.advanced-account-fallback {
+  border-top: 1px solid var(--line);
+  margin-top: 16px;
+  padding-top: 14px;
+}
+
+.advanced-account-fallback summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
 .failure-panel {
   background: #fff1ee;
   border: 1px solid #e6b0a9;

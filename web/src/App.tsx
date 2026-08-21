@@ -1113,8 +1113,8 @@ function PrepareH2DSliceDialog({
               }
             >
               {credentialStatus.data?.configured
-                ? `Encrypted cloud token configured · ${credentialStatus.data.region}`
-                : 'Cloud token setup required on localhost'}
+                ? `Bambu account connected · ${credentialStatus.data.region}`
+                : 'Bambu account connection required on localhost'}
             </strong>
             {!credentialStatus.data?.configured && (
               <a className="text-button" href="#/fabrication">

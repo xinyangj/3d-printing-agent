@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import ipaddress
 import json
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI, Header, Request
@@ -17,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr, model_validator
 
+from printing_agent.bambu_studio_session import BambuStudioSessionError
 from printing_agent.bootstrap import Container, build_container
 from printing_agent.cloud_credentials import (
     CloudRegion,
@@ -73,6 +76,16 @@ class SaveCloudCredentialRequest(BaseModel):
             raise ValueError("Experimental private cloud API risk must be acknowledged")
         if not self.access_token.get_secret_value().strip():
             raise ValueError("Bambu Cloud access token cannot be empty")
+        return self
+
+
+class ImportBambuStudioCredentialRequest(BaseModel):
+    experimental_acknowledged: bool
+
+    @model_validator(mode="after")
+    def require_acknowledgement(self) -> ImportBambuStudioCredentialRequest:
+        if not self.experimental_acknowledged:
+            raise ValueError("Experimental private cloud API risk must be acknowledged")
         return self
 
 
@@ -137,6 +150,7 @@ def create_app(container: Container | None = None) -> FastAPI:
     if container is not None:
         app.state.container = container
     origins = container.settings.cors_origins if container else get_settings().cors_origins
+    credential_mutation_lock = asyncio.Lock()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
@@ -205,15 +219,47 @@ def create_app(container: Container | None = None) -> FastAPI:
     def get_container(request: Request) -> Container:
         return request.app.state.container
 
+    def is_loopback_hostname(value: str | None) -> bool:
+        if not value:
+            return False
+        if value.casefold() == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(value).is_loopback
+        except ValueError:
+            return False
+
+    def request_hostname(value: str | None, *, origin: bool = False) -> str | None:
+        if not value:
+            return None
+        try:
+            parsed = urlsplit(value if origin else f"//{value}")
+            return parsed.hostname
+        except ValueError:
+            return None
+
     def require_local_credential_request(request: Request) -> None:
         forwarded_headers = {
             "forwarded",
             "x-forwarded-for",
             "x-real-ip",
         }
+        client_host = request.client.host if request.client else None
+        host = request_hostname(request.headers.get("host"))
+        origin_header = request.headers.get("origin")
+        origin = request_hostname(origin_header, origin=True)
+        test_request = client_host == "testclient" and host == "testserver"
         if (
             request.client is None
-            or request.client.host not in {"127.0.0.1", "::1", "testclient"}
+            or not (is_loopback_hostname(client_host) or test_request)
+            or not (is_loopback_hostname(host) or test_request)
+            or (
+                origin_header is not None
+                and not (
+                    is_loopback_hostname(origin)
+                    or (test_request and origin == "testserver")
+                )
+            )
             or any(request.headers.get(name) for name in forwarded_headers)
         ):
             raise NotFoundError("Endpoint was not found")
@@ -608,6 +654,36 @@ def create_app(container: Container | None = None) -> FastAPI:
         )
         return status.model_dump(mode="json")
 
+    @app.get("/api/v1/local-account-management")
+    async def local_account_management(
+        request: Request,
+    ) -> dict[str, bool]:
+        require_local_credential_request(request)
+        return {"available": True}
+
+    @app.get("/api/v1/bambu-studio-session")
+    async def bambu_studio_session_status(
+        request: Request,
+    ) -> dict[str, object]:
+        require_local_credential_request(request)
+        status = await asyncio.to_thread(
+            get_container(request).bambu_studio_session.status
+        )
+        return status.model_dump(mode="json")
+
+    @app.post("/api/v1/bambu-studio-session/open")
+    async def open_bambu_studio(
+        request: Request,
+    ) -> dict[str, object]:
+        require_local_credential_request(request)
+        try:
+            status = await asyncio.to_thread(
+                get_container(request).bambu_studio_session.open
+            )
+        except BambuStudioSessionError as exc:
+            raise ValidationError(exc.message) from exc
+        return status.model_dump(mode="json")
+
     @app.post("/api/v1/cloud-credentials", status_code=201)
     async def save_cloud_credential(
         body: SaveCloudCredentialRequest,
@@ -616,20 +692,70 @@ def create_app(container: Container | None = None) -> FastAPI:
         require_local_credential_request(request)
         container = get_container(request)
         token = body.access_token.get_secret_value().strip()
-        try:
-            devices = await container.inventory.validate_token(
-                token,
-                body.region,
-            )
-            status = await asyncio.to_thread(
-                container.cloud_credentials.store,
-                token,
-                body.region,
-            )
-        except (CredentialStoreError, CloudInventoryError) as exc:
-            raise ValidationError(str(exc)) from exc
+        async with credential_mutation_lock:
+            try:
+                devices = await container.inventory.validate_token(
+                    token,
+                    body.region,
+                )
+                status = await asyncio.to_thread(
+                    container.cloud_credentials.store,
+                    token,
+                    body.region,
+                )
+            except (CredentialStoreError, CloudInventoryError) as exc:
+                raise ValidationError(str(exc)) from exc
         return {
             "credential": status.model_dump(mode="json"),
+            "devices": [item.masked_dump() for item in devices],
+        }
+
+    @app.post(
+        "/api/v1/cloud-credentials/import-bambu-studio",
+        status_code=201,
+    )
+    async def import_bambu_studio_credential(
+        body: ImportBambuStudioCredentialRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        require_local_credential_request(request)
+        container = get_container(request)
+        token = ""
+        async with credential_mutation_lock:
+            try:
+                session = await asyncio.to_thread(
+                    container.bambu_studio_session.read_signed_in_session
+                )
+                token = session.access_token.get_secret_value()
+                devices = await container.inventory.validate_token(
+                    token,
+                    session.region,
+                )
+                status = await asyncio.to_thread(
+                    container.cloud_credentials.store,
+                    token,
+                    session.region,
+                )
+            except (
+                BambuStudioSessionError,
+                CredentialStoreError,
+                CloudInventoryError,
+            ) as exc:
+                message = (
+                    exc.message
+                    if isinstance(exc, BambuStudioSessionError)
+                    else str(exc)
+                )
+                raise ValidationError(message) from exc
+            finally:
+                token = ""
+        return {
+            "credential": status.model_dump(mode="json"),
+            "studio": {
+                "region": session.region,
+                "account_hint": session.account_hint,
+                "session_updated_at": session.session_updated_at.isoformat(),
+            },
             "devices": [item.masked_dump() for item in devices],
         }
 
@@ -638,12 +764,13 @@ def create_app(container: Container | None = None) -> FastAPI:
         request: Request,
     ) -> dict[str, object]:
         require_local_credential_request(request)
-        try:
-            status = await asyncio.to_thread(
-                get_container(request).cloud_credentials.clear
-            )
-        except CredentialStoreError as exc:
-            raise ValidationError(str(exc)) from exc
+        async with credential_mutation_lock:
+            try:
+                status = await asyncio.to_thread(
+                    get_container(request).cloud_credentials.clear
+                )
+            except CredentialStoreError as exc:
+                raise ValidationError(str(exc)) from exc
         return status.model_dump(mode="json")
 
     @app.get("/api/v1/cloud-devices")

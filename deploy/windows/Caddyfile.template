@@ -13,6 +13,9 @@ http://127.0.0.1:8080 {
 	@cloud_credentials path /api/v1/cloud-credentials*
 	respond @cloud_credentials 404
 
+	@bambu_studio_session path /api/v1/bambu-studio-session*
+	respond @bambu_studio_session 404
+
 	reverse_proxy 127.0.0.1:8000
 
 	log {

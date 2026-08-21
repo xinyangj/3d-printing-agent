@@ -109,7 +109,8 @@ Open <http://127.0.0.1:8000>. FastAPI serves `web/dist` when present.
 
 Keep FastAPI bound to `127.0.0.1`. Do not expose port 8000 to LAN or the internet.
 Use the authenticated Caddy/Tailscale HTTPS deployment below for remote access.
-Cloud-token import and removal are intentionally unavailable through the reverse proxy.
+Bambu account-session import, Studio launch/status, and credential removal are intentionally
+unavailable through the reverse proxy.
 
 ## Windows deployment with Tailscale Funnel
 
@@ -157,13 +158,17 @@ Prerequisites:
 ```dotenv
 PRINTING_AGENT_BAMBU_STUDIO_PATH=C:\Program Files\Bambu Studio\bambu-studio.exe
 PRINTING_AGENT_BAMBU_STUDIO_RESOURCE_DIR=C:\Program Files\Bambu Studio\resources\profiles
+# Optional when Studio uses a non-default per-user configuration directory:
+PRINTING_AGENT_BAMBU_STUDIO_CONFIG_DIR=C:\Users\<user>\AppData\Roaming\BambuStudio
 ```
 
 Use **Slicing profiles & cloud** in the WebUI to:
 
 - review or clone the versioned built-in H2D slicing profile;
 - configure nozzle, plate, and Bambu Studio profile mappings;
-- configure a Bambu Cloud token from the server's localhost UI only;
+- connect a Bambu account from the server's localhost UI by opening official Bambu
+  Studio, completing its phone/SMS or email sign-in, and explicitly importing the
+  resulting local session;
 - bind one cloud-observed H2D to a slicing profile;
 - map cloud filament IDs to pinned local Bambu Studio filament profiles;
 - forbid slots globally for automatic assignment.
@@ -172,16 +177,19 @@ Job creation supports stricter per-job slot restrictions and slicing overrides.
 Forbidden slots are removed before the material-assignment agent receives candidates.
 
 > [!WARNING]
-> Bambu does not provide a supported public cloud inventory API. This optional,
-> experimental provider uses a pasted account access token to read bound devices and
-> AMS state. The token is accepted only over localhost and stored with Windows DPAPI.
+> Bambu does not provide a supported public cloud inventory API. Official Bambu Studio
+> performs account authentication; this optional, experimental provider imports its
+> local signed-in session to read bound devices and AMS state. The application never
+> handles the account password or SMS code. Session import is accepted only over
+> localhost, and the access token is immediately stored with Windows DPAPI. Manual
+> token entry remains available only as an advanced fallback.
 > The provider can publish only the non-mutating `get_version` and `pushall` status
 > requests. It cannot upload files, create cloud tasks, start/control a printer, or
 > send arbitrary G-code.
 
 FastAPI binds to `127.0.0.1`. Remote WebUI access goes through authenticated
-Caddy/Tailscale HTTPS. Caddy denies the cloud-token management path, so token setup
-must be performed directly at `http://127.0.0.1:8000`.
+Caddy/Tailscale HTTPS. Caddy denies Studio-session and credential-management paths,
+so account connection must be performed directly at `http://127.0.0.1:8000`.
 
 Cloud inventory is refreshed before material assignment and again before slicing.
 Slicing blocks if the selected H2D is offline or its nozzle/AMS/material/quantity

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +13,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from printing_agent.cloud_credentials import CloudCredentialStore
+from printing_agent.cloud_credentials import CloudCredentialStore, CredentialStoreError
 from printing_agent.cloud_inventory import (
     CHINA_ENDPOINTS,
     GLOBAL_ENDPOINTS,
@@ -113,6 +116,76 @@ def test_credential_store_roundtrip_never_exposes_plaintext(tmp_path: Path) -> N
     assert store.status().region == "global"
     assert store.clear().configured is False
     assert store.status().configured is False
+
+
+def test_credential_store_preserves_previous_value_when_replacement_fails(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "credentials.json"
+    existing = CloudCredentialStore(
+        path,
+        protector=FakeProtector(),
+        acl_restrictor=lambda _: None,
+    )
+    existing.store("working-token", "global")
+
+    def reject_acl(_: Path) -> None:
+        raise OSError("synthetic ACL failure")
+
+    replacement = CloudCredentialStore(
+        path,
+        protector=FakeProtector(),
+        acl_restrictor=reject_acl,
+    )
+
+    with pytest.raises(CredentialStoreError):
+        replacement.store("replacement-token", "china")
+
+    loaded = existing.load()
+    assert loaded.access_token.get_secret_value() == "working-token"
+    assert loaded.region == "global"
+
+
+def test_credential_store_serializes_concurrent_replacements(tmp_path: Path) -> None:
+    path = tmp_path / "credentials.json"
+    first_acl_started = threading.Event()
+    release_first_acl = threading.Event()
+    call_lock = threading.Lock()
+    acl_calls = 0
+
+    def controlled_acl(_: Path) -> None:
+        nonlocal acl_calls
+        with call_lock:
+            acl_calls += 1
+            is_first = acl_calls == 1
+        if is_first:
+            first_acl_started.set()
+            assert release_first_acl.wait(timeout=2)
+
+    first = CloudCredentialStore(
+        path,
+        protector=FakeProtector(),
+        acl_restrictor=controlled_acl,
+    )
+    second = CloudCredentialStore(
+        path,
+        protector=FakeProtector(),
+        acl_restrictor=controlled_acl,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_write = executor.submit(first.store, "first-token", "global")
+        assert first_acl_started.wait(timeout=2)
+        second_write = executor.submit(second.store, "second-token", "china")
+        time.sleep(0.05)
+        release_first_acl.set()
+        first_write.result(timeout=2)
+        second_write.result(timeout=2)
+
+    loaded = first.load()
+    assert loaded.access_token.get_secret_value() == "second-token"
+    assert loaded.region == "china"
+    assert list(tmp_path.glob("*.pending")) == []
 
 
 def test_global_and_china_endpoints_are_explicit() -> None:
@@ -369,6 +442,9 @@ async def test_provider_publishes_only_two_status_requests(
 
     def handle(request: httpx.Request) -> httpx.Response:
         assert request.url.path == GLOBAL_ENDPOINTS.bound_devices_path
+        assert request.headers["Authorization"] == (
+            f"Bearer header.{claims}.signature"
+        )
         return httpx.Response(
             200,
             json={

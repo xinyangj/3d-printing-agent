@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     slice_dir: Path = Path("var/slices")
     bambu_studio_path: str | None = None
     bambu_studio_resource_dir: Path | None = None
+    bambu_studio_config_dir: Path | None = None
     bambu_cloud_credential_path: Path = Path(
         "var/secrets/bambu-cloud-credentials.json"
     )

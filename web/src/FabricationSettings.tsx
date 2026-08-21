@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  BambuAccountConnection,
+  type CloudDevice,
+  type CredentialStatus,
+} from './BambuAccountConnection'
 
 const API = '/api/v1'
 
@@ -71,25 +76,14 @@ type MaterialDefinition = {
   }
 }
 
-type CredentialStatus = {
-  configured: boolean
-  region: 'global' | 'china' | null
-  protection: string
-}
-
-type CloudDevice = {
-  device_id: string
-  device_ref: string
-  name: string
-  model: string
-  online: boolean
-}
-
 export function FabricationSettings() {
   const queryClient = useQueryClient()
-  const localCredentialSetup = ['127.0.0.1', 'localhost', '::1'].includes(
-    window.location.hostname,
-  )
+  const localAccountManagement = useQuery({
+    queryKey: ['local-account-management'],
+    queryFn: () => request<{ available: boolean }>('/local-account-management'),
+    retry: false,
+  })
+  const localCredentialSetup = localAccountManagement.data?.available === true
   const profiles = useQuery({
     queryKey: ['slicing-profiles'],
     queryFn: () => request<SlicingProfile[]>('/slicing-profiles'),
@@ -108,9 +102,6 @@ export function FabricationSettings() {
     enabled: credentials.data?.configured === true,
   })
   const [selectedProfileId, setSelectedProfileId] = useState('bambu-h2d')
-  const [cloudRegion, setCloudRegion] = useState<'global' | 'china'>('global')
-  const [cloudToken, setCloudToken] = useState('')
-  const [riskAccepted, setRiskAccepted] = useState(false)
   const [selectedDeviceRef, setSelectedDeviceRef] = useState('')
   const [materialId, setMaterialId] = useState('red-pla')
   const [materialName, setMaterialName] = useState('Red PLA')
@@ -128,29 +119,6 @@ export function FabricationSettings() {
     setProfileJson(selectedProfile ? JSON.stringify(selectedProfile.spec, null, 2) : '')
   }, [selectedProfile])
 
-  const saveCredential = useMutation({
-    mutationFn: () =>
-      request('/cloud-credentials', {
-        method: 'POST',
-        body: JSON.stringify({
-          access_token: cloudToken,
-          region: cloudRegion,
-          experimental_acknowledged: riskAccepted,
-        }),
-      }),
-    onSuccess: () => {
-      setCloudToken('')
-      void queryClient.invalidateQueries({ queryKey: ['cloud-credential-status'] })
-      void queryClient.invalidateQueries({ queryKey: ['cloud-devices'] })
-    },
-  })
-  const clearCredential = useMutation({
-    mutationFn: () => request('/cloud-credentials', { method: 'DELETE' }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['cloud-credential-status'] })
-      queryClient.removeQueries({ queryKey: ['cloud-devices'] })
-    },
-  })
   const saveProfile = useMutation({
     mutationFn: (profile: SlicingProfile) =>
       request(`/slicing-profiles/${profile.profile_id}`, {
@@ -240,78 +208,11 @@ export function FabricationSettings() {
       </header>
 
       <section className="settings-grid">
-        <section className="inspection-panel">
-          <span className="section-label">Experimental Bambu Cloud inventory</span>
-          <strong>
-            {credentials.data?.configured
-              ? `Token protected with DPAPI · ${credentials.data.region}`
-              : 'No cloud token configured'}
-          </strong>
-          <p>
-            This uses an unsupported private API only to read bound devices and AMS state. It
-            cannot upload files, submit jobs, or control a printer.
-          </p>
-          {localCredentialSetup ? (
-            <>
-              <label>
-                Region
-                <select
-                  value={cloudRegion}
-                  onChange={(event) =>
-                    setCloudRegion(event.target.value as 'global' | 'china')
-                  }
-                >
-                  <option value="global">Global</option>
-                  <option value="china">China</option>
-                </select>
-              </label>
-              <label>
-                Existing Bambu access token
-                <input
-                  autoComplete="off"
-                  type="password"
-                  value={cloudToken}
-                  onChange={(event) => setCloudToken(event.target.value)}
-                />
-              </label>
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={riskAccepted}
-                  onChange={(event) => setRiskAccepted(event.target.checked)}
-                />
-                I understand this private API is unofficial and may change or revoke access.
-              </label>
-              <div className="settings-actions">
-                <button
-                  className="primary-action"
-                  disabled={!cloudToken.trim() || !riskAccepted || saveCredential.isPending}
-                  onClick={() => saveCredential.mutate()}
-                >
-                  Validate &amp; save encrypted token
-                </button>
-                {credentials.data?.configured && (
-                  <button
-                    className="danger-action"
-                    disabled={clearCredential.isPending}
-                    onClick={() => clearCredential.mutate()}
-                  >
-                    Remove cloud token
-                  </button>
-                )}
-              </div>
-            </>
-          ) : (
-            <p className="part-warning">
-              Token setup is available only from the server at http://127.0.0.1:8000.
-            </p>
-          )}
-          {(saveCredential.error || clearCredential.error) && (
-            <p className="error-copy">
-              {saveCredential.error?.message ?? clearCredential.error?.message}
-            </p>
-          )}
-        </section>
+        <BambuAccountConnection
+          credentialStatus={credentials.data}
+          devices={devices.data}
+          localCredentialSetup={localCredentialSetup}
+        />
 
         <section className="inspection-panel">
           <span className="section-label">Slicing profile</span>

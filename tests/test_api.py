@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -9,9 +10,13 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from printing_agent.api import RevisionRequestBody, create_app
+from printing_agent.bambu_studio_session import (
+    BambuStudioSessionStatus,
+    ImportedBambuStudioSession,
+)
 from printing_agent.bootstrap import build_container
 from printing_agent.cloud_credentials import CloudCredentialStore
-from printing_agent.cloud_inventory import DeviceSummary
+from printing_agent.cloud_inventory import CloudInventoryError, DeviceSummary
 from printing_agent.config import Settings
 from printing_agent.domain import RevisionMode, WorkflowState
 
@@ -42,6 +47,48 @@ class FakeInventoryProvider:
 
     async def snapshot(self, device_id: str):
         raise AssertionError(f"Unexpected snapshot request for {device_id}")
+
+
+class EmptyInventoryProvider(FakeInventoryProvider):
+    async def validate_token(self, access_token: str, region: str):
+        assert access_token == "private-cloud-token"
+        assert region == "china"
+        return ()
+
+
+class RejectingInventoryProvider(FakeInventoryProvider):
+    async def validate_token(self, access_token: str, region: str):
+        del access_token, region
+        raise CloudInventoryError("The Bambu Cloud session was rejected")
+
+
+class FakeStudioSessionAdapter:
+    def __init__(self) -> None:
+        self.opened = False
+
+    def status(self) -> BambuStudioSessionStatus:
+        return BambuStudioSessionStatus(
+            installed=True,
+            running=self.opened,
+            session_present=True,
+            signed_in=True,
+            region="china",
+            account_hint="***3456",
+            session_updated_at=datetime(2026, 8, 21, tzinfo=UTC),
+            message="Bambu Studio is signed in and ready to import",
+        )
+
+    def open(self) -> BambuStudioSessionStatus:
+        self.opened = True
+        return self.status()
+
+    def read_signed_in_session(self) -> ImportedBambuStudioSession:
+        return ImportedBambuStudioSession(
+            access_token="private-cloud-token",
+            region="china",
+            account_hint="***3456",
+            session_updated_at=datetime(2026, 8, 21, tzinfo=UTC),
+        )
 
 
 def test_revision_body_supports_optional_and_legacy_edit_scopes() -> None:
@@ -215,6 +262,150 @@ async def test_cloud_token_setup_is_local_encrypted_and_proxy_blocked(
     assert "private-cloud-token" not in saved.text
     assert "private-cloud-token" not in rejected.text
     assert "private-cloud-token" not in credential_path.read_text(encoding="utf-8")
+
+
+async def test_bambu_studio_import_is_explicit_local_and_secret_free(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    container = await build_container(settings)
+    credential_path = tmp_path / "studio-cloud-credential.json"
+    credential_store = CloudCredentialStore(
+        credential_path,
+        protector=FakeProtector(),
+        acl_restrictor=lambda _: None,
+    )
+    studio = FakeStudioSessionAdapter()
+    app = create_app(
+        replace(
+            container,
+            bambu_studio_session=studio,  # type: ignore[arg-type]
+            cloud_credentials=credential_store,
+            inventory=FakeInventoryProvider(),  # type: ignore[arg-type]
+        )
+    )
+
+    with TestClient(app) as client:
+        capability = client.get("/api/v1/local-account-management")
+        status = client.get("/api/v1/bambu-studio-session")
+        opened = client.post("/api/v1/bambu-studio-session/open")
+        rejected = client.post(
+            "/api/v1/cloud-credentials/import-bambu-studio",
+            json={"experimental_acknowledged": False},
+        )
+        imported = client.post(
+            "/api/v1/cloud-credentials/import-bambu-studio",
+            json={"experimental_acknowledged": True},
+        )
+        proxied = client.get(
+            "/api/v1/bambu-studio-session",
+            headers={"X-Forwarded-For": "100.64.0.2"},
+        )
+        proxied_import = client.post(
+            "/api/v1/cloud-credentials/import-bambu-studio",
+            headers={"X-Forwarded-For": "100.64.0.2"},
+            json={"experimental_acknowledged": True},
+        )
+        rebound_host = client.get(
+            "/api/v1/bambu-studio-session",
+            headers={"Host": "attacker.example"},
+        )
+        rebound_origin = client.post(
+            "/api/v1/cloud-credentials/import-bambu-studio",
+            headers={"Origin": "https://attacker.example"},
+            json={"experimental_acknowledged": True},
+        )
+        proxied_capability = client.get(
+            "/api/v1/local-account-management",
+            headers={"X-Forwarded-For": "100.64.0.2"},
+        )
+    with TestClient(app, client=("10.18.0.99", 50000)) as client:
+        remote = client.post("/api/v1/bambu-studio-session/open")
+
+    assert capability.json() == {"available": True}
+    assert status.status_code == 200
+    assert status.json()["account_hint"] == "***3456"
+    assert opened.status_code == 200
+    assert rejected.status_code == 422
+    assert imported.status_code == 201
+    assert imported.json()["credential"] == {
+        "configured": True,
+        "region": "china",
+        "protection": "windows-dpapi-current-user",
+    }
+    assert len(imported.json()["devices"]) == 1
+    assert "private-cloud-token" not in imported.text
+    assert "synthetic-refresh-token" not in imported.text
+    assert "private-cloud-token" not in credential_path.read_text(encoding="utf-8")
+    assert proxied.status_code == 404
+    assert proxied_import.status_code == 404
+    assert rebound_host.status_code == 404
+    assert rebound_origin.status_code == 404
+    assert proxied_capability.status_code == 404
+    assert remote.status_code == 404
+
+
+async def test_bambu_studio_import_accepts_account_with_no_bound_devices(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    container = await build_container(settings)
+    credential_store = CloudCredentialStore(
+        tmp_path / "empty-device-credential.json",
+        protector=FakeProtector(),
+        acl_restrictor=lambda _: None,
+    )
+    app = create_app(
+        replace(
+            container,
+            bambu_studio_session=FakeStudioSessionAdapter(),  # type: ignore[arg-type]
+            cloud_credentials=credential_store,
+            inventory=EmptyInventoryProvider(),  # type: ignore[arg-type]
+        )
+    )
+
+    with TestClient(app) as client:
+        imported = client.post(
+            "/api/v1/cloud-credentials/import-bambu-studio",
+            json={"experimental_acknowledged": True},
+        )
+
+    assert imported.status_code == 201
+    assert imported.json()["devices"] == []
+    assert imported.json()["credential"]["configured"] is True
+    assert credential_store.load().region == "china"
+
+
+async def test_failed_studio_refresh_preserves_existing_credential(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    container = await build_container(settings)
+    credential_store = CloudCredentialStore(
+        tmp_path / "existing-credential.json",
+        protector=FakeProtector(),
+        acl_restrictor=lambda _: None,
+    )
+    credential_store.store("working-token", "global")
+    app = create_app(
+        replace(
+            container,
+            bambu_studio_session=FakeStudioSessionAdapter(),  # type: ignore[arg-type]
+            cloud_credentials=credential_store,
+            inventory=RejectingInventoryProvider(),  # type: ignore[arg-type]
+        )
+    )
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/v1/cloud-credentials/import-bambu-studio",
+            json={"experimental_acknowledged": True},
+        )
+
+    assert rejected.status_code == 422
+    existing = credential_store.load()
+    assert existing.access_token.get_secret_value() == "working-token"
+    assert existing.region == "global"
 
 
 async def test_printer_profile_update_rejects_stale_revision(

@@ -5,10 +5,12 @@ import ctypes
 import json
 import os
 import subprocess
+import threading
 from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
 from typing import Literal, Protocol
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, SecretStr
 
@@ -44,6 +46,15 @@ class CloudCredentialStatus(BaseModel):
 
 
 CredentialStatus = CloudCredentialStatus
+
+_path_locks: dict[str, threading.Lock] = {}
+_path_locks_guard = threading.Lock()
+
+
+def _credential_path_lock(path: Path) -> threading.Lock:
+    key = os.path.normcase(str(path.absolute()))
+    with _path_locks_guard:
+        return _path_locks.setdefault(key, threading.Lock())
 
 
 class _DataBlob(ctypes.Structure):
@@ -195,6 +206,7 @@ class CloudCredentialStore:
         self._protector = protector
         self.path = path or default_credential_path()
         self._acl_restrictor = acl_restrictor
+        self._lock = _credential_path_lock(self.path)
 
     def store(
         self,
@@ -211,30 +223,38 @@ class CloudCredentialStore:
         if not raw:
             raise CredentialStoreError("The access token cannot be empty")
 
-        protected = self._protector.protect(raw.encode("utf-8"))
-        document = {
-            "version": 1,
-            "region": region,
-            "encrypted_access_token": base64.b64encode(protected).decode("ascii"),
-        }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        pending = self.path.with_suffix(f"{self.path.suffix}.pending")
-        try:
-            pending.write_text(
-                json.dumps(document, separators=(",", ":"), sort_keys=True),
-                encoding="utf-8",
+        with self._lock:
+            protected = self._protector.protect(raw.encode("utf-8"))
+            document = {
+                "version": 1,
+                "region": region,
+                "encrypted_access_token": base64.b64encode(protected).decode("ascii"),
+            }
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            pending = self.path.with_name(
+                f".{self.path.name}.{uuid4().hex}.pending"
             )
-            pending.replace(self.path)
-            self._acl_restrictor(self.path)
-        except Exception as exc:
-            pending.unlink(missing_ok=True)
-            self.path.unlink(missing_ok=True)
-            if isinstance(exc, CredentialStoreError):
-                raise
-            raise CredentialStoreError("Could not store the cloud credential safely") from exc
+            try:
+                pending.write_text(
+                    json.dumps(document, separators=(",", ":"), sort_keys=True),
+                    encoding="utf-8",
+                )
+                self._acl_restrictor(pending)
+                pending.replace(self.path)
+            except Exception as exc:
+                pending.unlink(missing_ok=True)
+                if isinstance(exc, CredentialStoreError):
+                    raise
+                raise CredentialStoreError(
+                    "Could not store the cloud credential safely"
+                ) from exc
         return CloudCredentialStatus(configured=True, region=region)
 
     def load(self) -> CloudCredentials:
+        with self._lock:
+            return self._load()
+
+    def _load(self) -> CloudCredentials:
         try:
             document = json.loads(self.path.read_text(encoding="utf-8"))
             if set(document) != {
@@ -268,28 +288,34 @@ class CloudCredentialStore:
             raise CredentialStoreError("The cloud credential file is invalid") from exc
 
     def clear(self) -> CloudCredentialStatus:
-        try:
-            self.path.unlink(missing_ok=True)
-            self.path.with_suffix(f"{self.path.suffix}.pending").unlink(missing_ok=True)
-        except OSError as exc:
-            raise CredentialStoreError("Could not clear the cloud credential") from exc
+        with self._lock:
+            try:
+                self.path.unlink(missing_ok=True)
+                self.path.with_suffix(f"{self.path.suffix}.pending").unlink(
+                    missing_ok=True
+                )
+            except OSError as exc:
+                raise CredentialStoreError(
+                    "Could not clear the cloud credential"
+                ) from exc
         return CloudCredentialStatus(configured=False)
 
     def status(self) -> CloudCredentialStatus:
-        if not self.path.is_file():
-            return CloudCredentialStatus(configured=False)
-        try:
-            document = json.loads(self.path.read_text(encoding="utf-8"))
-            region = document.get("region")
-            encrypted = document.get("encrypted_access_token")
-            if (
-                document.get("version") != 1
-                or region not in {"global", "china"}
-                or not isinstance(encrypted, str)
-                or not encrypted
-            ):
-                raise ValueError
-            base64.b64decode(encrypted, validate=True)
-            return CloudCredentialStatus(configured=True, region=region)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return CloudCredentialStatus(configured=False)
+        with self._lock:
+            if not self.path.is_file():
+                return CloudCredentialStatus(configured=False)
+            try:
+                document = json.loads(self.path.read_text(encoding="utf-8"))
+                region = document.get("region")
+                encrypted = document.get("encrypted_access_token")
+                if (
+                    document.get("version") != 1
+                    or region not in {"global", "china"}
+                    or not isinstance(encrypted, str)
+                    or not encrypted
+                ):
+                    raise ValueError
+                base64.b64decode(encrypted, validate=True)
+                return CloudCredentialStatus(configured=True, region=region)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return CloudCredentialStatus(configured=False)

@@ -6,6 +6,7 @@ from datetime import timedelta
 
 from printing_agent.application import PrintingApplication
 from printing_agent.artifact_store import ArtifactStore
+from printing_agent.bambu_studio_session import BambuStudioSessionAdapter
 from printing_agent.catalogs import ThingiverseCatalog
 from printing_agent.cloud_credentials import CloudCredentialStore
 from printing_agent.cloud_inventory import (
@@ -52,6 +53,7 @@ class Container:
     catalog: ThingiverseCatalog
     printers: PrinterRegistry
     slicers: SlicerRegistry
+    bambu_studio_session: BambuStudioSessionAdapter
     cloud_credentials: CloudCredentialStore
     inventory: InventoryProvider
     material_assignment: MaterialAssignmentService
@@ -149,6 +151,10 @@ async def build_container(settings: Settings | None = None) -> Container:
             printers.upsert(ProfilePrinterAdapter(profile))
     slicers = SlicerRegistry()
     slicers.register(BambuStudioCliDriver(settings.bambu_studio_path))
+    bambu_studio_session = BambuStudioSessionAdapter(
+        settings.bambu_studio_path,
+        settings.bambu_studio_config_dir,
+    )
     cloud_credentials = CloudCredentialStore(
         settings.bambu_cloud_credential_path
     )
@@ -187,6 +193,7 @@ async def build_container(settings: Settings | None = None) -> Container:
         catalog=catalog,
         printers=printers,
         slicers=slicers,
+        bambu_studio_session=bambu_studio_session,
         cloud_credentials=cloud_credentials,
         inventory=inventory,
         material_assignment=material_assignment,
