@@ -65,6 +65,10 @@ class RejectingInventoryProvider(FakeInventoryProvider):
 class FakeStudioSessionAdapter:
     def __init__(self) -> None:
         self.opened = False
+        self.token = "private-cloud-token"
+        self.account_hint = "***3456"
+        self.account_fingerprint = "a" * 64
+        self.session_ref = "c" * 64
 
     def status(self) -> BambuStudioSessionStatus:
         return BambuStudioSessionStatus(
@@ -73,10 +77,16 @@ class FakeStudioSessionAdapter:
             session_present=True,
             signed_in=True,
             region="china",
-            account_hint="***3456",
+            region_source="session",
+            account_hint=self.account_hint,
             session_updated_at=datetime(2026, 8, 21, tzinfo=UTC),
             message="Bambu Studio is signed in and ready to import",
         )
+
+    def inspect(
+        self,
+    ) -> tuple[BambuStudioSessionStatus, ImportedBambuStudioSession]:
+        return self.status(), self.read_signed_in_session()
 
     def open(self) -> BambuStudioSessionStatus:
         self.opened = True
@@ -84,9 +94,12 @@ class FakeStudioSessionAdapter:
 
     def read_signed_in_session(self) -> ImportedBambuStudioSession:
         return ImportedBambuStudioSession(
-            access_token="private-cloud-token",
+            access_token=self.token,
             region="china",
-            account_hint="***3456",
+            region_source="session",
+            session_ref=self.session_ref,
+            account_hint=self.account_hint,
+            account_fingerprint=self.account_fingerprint,
             session_updated_at=datetime(2026, 8, 21, tzinfo=UTC),
         )
 
@@ -291,12 +304,34 @@ async def test_bambu_studio_import_is_explicit_local_and_secret_free(
         opened = client.post("/api/v1/bambu-studio-session/open")
         rejected = client.post(
             "/api/v1/cloud-credentials/import-bambu-studio",
-            json={"experimental_acknowledged": False},
+            json={
+                "experimental_acknowledged": False,
+                "expected_session_ref": "c" * 64,
+            },
         )
         imported = client.post(
             "/api/v1/cloud-credentials/import-bambu-studio",
-            json={"experimental_acknowledged": True},
+            json={
+                "experimental_acknowledged": True,
+                "expected_session_ref": "c" * 64,
+            },
         )
+        studio.session_ref = "d" * 64
+        stale_import = client.post(
+            "/api/v1/cloud-credentials/import-bambu-studio",
+            json={
+                "experimental_acknowledged": True,
+                "expected_session_ref": "c" * 64,
+            },
+        )
+        studio.session_ref = "c" * 64
+        current = client.get("/api/v1/bambu-studio-session")
+        studio.token = "refreshed-private-cloud-token"
+        refreshed = client.get("/api/v1/bambu-studio-session")
+        studio.token = "private-cloud-token"
+        studio.account_hint = "***9999"
+        studio.account_fingerprint = "b" * 64
+        switched = client.get("/api/v1/bambu-studio-session")
         proxied = client.get(
             "/api/v1/bambu-studio-session",
             headers={"X-Forwarded-For": "100.64.0.2"},
@@ -304,7 +339,10 @@ async def test_bambu_studio_import_is_explicit_local_and_secret_free(
         proxied_import = client.post(
             "/api/v1/cloud-credentials/import-bambu-studio",
             headers={"X-Forwarded-For": "100.64.0.2"},
-            json={"experimental_acknowledged": True},
+            json={
+                "experimental_acknowledged": True,
+                "expected_session_ref": "c" * 64,
+            },
         )
         rebound_host = client.get(
             "/api/v1/bambu-studio-session",
@@ -313,7 +351,10 @@ async def test_bambu_studio_import_is_explicit_local_and_secret_free(
         rebound_origin = client.post(
             "/api/v1/cloud-credentials/import-bambu-studio",
             headers={"Origin": "https://attacker.example"},
-            json={"experimental_acknowledged": True},
+            json={
+                "experimental_acknowledged": True,
+                "expected_session_ref": "c" * 64,
+            },
         )
         proxied_capability = client.get(
             "/api/v1/local-account-management",
@@ -328,14 +369,23 @@ async def test_bambu_studio_import_is_explicit_local_and_secret_free(
     assert opened.status_code == 200
     assert rejected.status_code == 422
     assert imported.status_code == 201
-    assert imported.json()["credential"] == {
-        "configured": True,
-        "region": "china",
-        "protection": "windows-dpapi-current-user",
-    }
+    assert imported.json()["credential"]["configured"] is True
+    assert imported.json()["credential"]["region"] == "china"
+    assert imported.json()["credential"]["source"] == "bambu_studio"
+    assert imported.json()["credential"]["account_hint"] == "***3456"
     assert len(imported.json()["devices"]) == 1
+    assert stale_import.status_code == 422
+    assert "review the latest account" in stale_import.json()["error"]["message"]
+    assert current.json()["connection_relation"] == "same_account_current_session"
+    assert current.json()["import_required"] is False
+    assert refreshed.json()["connection_relation"] == "same_account_new_session"
+    assert refreshed.json()["import_required"] is True
+    assert switched.json()["connection_relation"] == "different_account"
+    assert switched.json()["import_required"] is True
+    assert switched.json()["connected_account_hint"] == "***3456"
     assert "private-cloud-token" not in imported.text
     assert "synthetic-refresh-token" not in imported.text
+    assert "a" * 64 not in imported.text
     assert "private-cloud-token" not in credential_path.read_text(encoding="utf-8")
     assert proxied.status_code == 404
     assert proxied_import.status_code == 404
@@ -367,7 +417,10 @@ async def test_bambu_studio_import_accepts_account_with_no_bound_devices(
     with TestClient(app) as client:
         imported = client.post(
             "/api/v1/cloud-credentials/import-bambu-studio",
-            json={"experimental_acknowledged": True},
+            json={
+                "experimental_acknowledged": True,
+                "expected_session_ref": "c" * 64,
+            },
         )
 
     assert imported.status_code == 201
@@ -399,7 +452,10 @@ async def test_failed_studio_refresh_preserves_existing_credential(
     with TestClient(app) as client:
         rejected = client.post(
             "/api/v1/cloud-credentials/import-bambu-studio",
-            json={"experimental_acknowledged": True},
+            json={
+                "experimental_acknowledged": True,
+                "expected_session_ref": "c" * 64,
+            },
         )
 
     assert rejected.status_code == 422

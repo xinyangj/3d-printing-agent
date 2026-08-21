@@ -190,7 +190,12 @@ type FabricationReadiness = {
   slicing_capable: boolean
   ready_for_fabrication: boolean
   slicer: { ready: boolean; message: string }
-  cloud_binding: { configured: boolean; device_name: string | null }
+  cloud_binding: {
+    configured: boolean
+    available: boolean
+    device_name: string | null
+    message: string
+  }
 }
 
 type CloudDeviceSnapshotPayload = {
@@ -1094,19 +1099,18 @@ function PrepareH2DSliceDialog({
             <span className="section-label">Cloud device snapshot</span>
             <strong
               className={
-                selectedReadiness?.cloud_binding.configured
+                selectedReadiness?.cloud_binding.available
                   ? 'ready'
                   : 'not-ready'
               }
             >
-              {selectedReadiness?.cloud_binding.configured
+              {selectedReadiness?.cloud_binding.available
                 ? `${selectedReadiness.cloud_binding.device_name} bound`
+                : selectedReadiness?.cloud_binding.configured
+                  ? `${selectedReadiness.cloud_binding.device_name} unavailable`
                 : 'Bind a cloud H2D before creating the slicing workflow'}
             </strong>
-            <p>
-              The next step reads the selected H2D and AMS inventory through the experimental,
-              read-only cloud provider. No printer job will be submitted.
-            </p>
+            <p>{selectedReadiness?.cloud_binding.message}</p>
             <strong
               className={
                 credentialStatus.data?.configured ? 'ready' : 'not-ready'

@@ -35,6 +35,7 @@ type SlicingProfile = {
   revision: number
   origin: string
   digest: string
+  cloud_device_ref: string | null
   spec: {
     display_name: string
     manufacturer: string
@@ -113,6 +114,13 @@ export function FabricationSettings() {
     () => profiles.data?.find((item) => item.profile_id === selectedProfileId),
     [profiles.data, selectedProfileId],
   )
+  const boundDeviceUnavailable =
+    credentials.data?.configured === true &&
+    devices.isSuccess &&
+    Boolean(selectedProfile?.cloud_device_ref) &&
+    !(devices.data ?? []).some(
+      (device) => device.device_ref === selectedProfile?.cloud_device_ref,
+    )
   const [profileJson, setProfileJson] = useState('')
 
   useEffect(() => {
@@ -244,6 +252,12 @@ export function FabricationSettings() {
                     : 'Select a bound cloud device below.'}
                 </small>
               </div>
+              {boundDeviceUnavailable && (
+                <p className="part-warning">
+                  This profile’s bound printer is unavailable under the connected account. Select
+                  a detected H2D below to create a new profile revision.
+                </p>
+              )}
               <label>
                 Bound cloud H2D
                 <select

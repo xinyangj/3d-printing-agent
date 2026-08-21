@@ -13,6 +13,7 @@ from printing_agent.catalogs import ThingiverseCatalog
 from printing_agent.cloud_inventory import (
     CloudDeviceSnapshot,
     CloudInventoryError,
+    DeviceSummary,
     InventoryProvider,
 )
 from printing_agent.config import Settings
@@ -144,6 +145,14 @@ class PrintingApplication:
     ) -> tuple[PrinterProfileRevision, WorkflowPrinterSnapshot]:
         profile = await self.repository.get_printer_profile(printer_name)
         self.printers.get(printer_name)
+        cloud_binding_available, cloud_binding_message = (
+            await self._cloud_binding_status(profile)
+        )
+        if (
+            profile.spec.slicer.driver_id != "simulator_passthrough"
+            and not cloud_binding_available
+        ):
+            raise ConflictError(cloud_binding_message)
         if profile.spec.slicer.driver_id == "bambu_studio_cli" and (
             resolved_overrides.timelapse is not None
             or resolved_overrides.calibration is not None
@@ -211,6 +220,17 @@ class PrintingApplication:
             ]
         else:
             profiles = await self.repository.list_printer_profiles()
+        cloud_devices: tuple[DeviceSummary, ...] | None = None
+        cloud_inventory_error: str | None = None
+        if any(
+            profile.spec.slicer.driver_id != "simulator_passthrough"
+            and profile.spec.cloud_device_serial is not None
+            for profile in profiles
+        ):
+            try:
+                cloud_devices = await self.inventory.list_devices()
+            except CloudInventoryError as exc:
+                cloud_inventory_error = str(exc)
         for profile in profiles:
             slicing_capable = (
                 profile.spec.slicer.driver_id != "simulator_passthrough"
@@ -239,6 +259,15 @@ class PrintingApplication:
                         "Bambu Studio and the configured profile resources "
                         "are available."
                     )
+            cloud_binding_available, cloud_binding_message = (
+                await self._cloud_binding_status(
+                    profile,
+                    devices=cloud_devices,
+                    inventory_error=cloud_inventory_error,
+                )
+                if slicing_capable
+                else (False, "This profile does not use a cloud printer binding.")
+            )
 
             values.append(
                 {
@@ -249,7 +278,7 @@ class PrintingApplication:
                     "ready_for_fabrication": (
                         slicing_capable
                         and slicer_ready
-                        and profile.spec.cloud_device_serial is not None
+                        and cloud_binding_available
                     ),
                     "slicer": {
                         "ready": slicer_ready,
@@ -259,11 +288,37 @@ class PrintingApplication:
                         "configured": (
                             profile.spec.cloud_device_serial is not None
                         ),
+                        "available": cloud_binding_available,
                         "device_name": profile.spec.cloud_device_name,
+                        "message": cloud_binding_message,
                     },
                 }
             )
         return values
+
+    async def _cloud_binding_status(
+        self,
+        profile: PrinterProfileRevision,
+        *,
+        devices: tuple[DeviceSummary, ...] | None = None,
+        inventory_error: str | None = None,
+    ) -> tuple[bool, str]:
+        device_id = profile.spec.cloud_device_serial
+        if device_id is None:
+            return False, "Bind a cloud printer before creating the slicing workflow."
+        if inventory_error is not None:
+            return False, inventory_error
+        if devices is None:
+            try:
+                devices = await self.inventory.list_devices()
+            except CloudInventoryError as exc:
+                return False, str(exc)
+        if not any(device.device_id == device_id for device in devices):
+            return (
+                False,
+                "The profile's bound printer is unavailable under the connected account.",
+            )
+        return True, "The bound printer is available under the connected account."
 
     async def list_cloud_devices(self):
         try:

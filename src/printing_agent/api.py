@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -81,6 +82,7 @@ class SaveCloudCredentialRequest(BaseModel):
 
 class ImportBambuStudioCredentialRequest(BaseModel):
     experimental_acknowledged: bool
+    expected_session_ref: str = Field(pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def require_acknowledgement(self) -> ImportBambuStudioCredentialRequest:
@@ -264,6 +266,85 @@ def create_app(container: Container | None = None) -> FastAPI:
         ):
             raise NotFoundError("Endpoint was not found")
 
+    async def bambu_studio_connection_status(
+        container: Container,
+    ) -> dict[str, object]:
+        studio_status, studio_session = await asyncio.to_thread(
+            container.bambu_studio_session.inspect
+        )
+        credential_status = await asyncio.to_thread(
+            container.cloud_credentials.status
+        )
+        relation = "not_configured"
+        import_required = studio_session is not None
+        message = studio_status.message
+
+        if credential_status.configured:
+            relation = "comparison_unavailable"
+            import_required = False
+            if studio_session is not None:
+                try:
+                    credentials = await asyncio.to_thread(
+                        container.cloud_credentials.load
+                    )
+                except CredentialStoreError:
+                    credentials = None
+                if credentials is not None and credentials.region != studio_session.region:
+                    relation = "different_account"
+                    import_required = True
+                    message = (
+                        "Bambu Studio uses a different cloud region; import the "
+                        "new account to replace this app's connection"
+                    )
+                elif (
+                    credentials is not None
+                    and credentials.source == "bambu_studio"
+                    and credentials.account_fingerprint
+                    and studio_session.account_fingerprint
+                ):
+                    if not secrets.compare_digest(
+                        credentials.account_fingerprint,
+                        studio_session.account_fingerprint,
+                    ):
+                        relation = "different_account"
+                        import_required = True
+                        message = (
+                            "Bambu Studio switched accounts; import the new account "
+                            "to replace this app's connection"
+                        )
+                    elif secrets.compare_digest(
+                        credentials.access_token.get_secret_value(),
+                        studio_session.access_token.get_secret_value(),
+                    ):
+                        relation = "same_account_current_session"
+                        message = "Bambu Studio and this app use the same account"
+                    else:
+                        relation = "same_account_new_session"
+                        import_required = True
+                        message = (
+                            "Bambu Studio refreshed this account session; import it "
+                            "to update this app"
+                        )
+                elif credentials is not None:
+                    message = (
+                        "This credential has no Studio account metadata; automatic "
+                        "same-region account comparison is unavailable"
+                    )
+
+        payload = studio_status.model_dump(mode="json")
+        payload.update(
+            {
+                "connection_relation": relation,
+                "import_required": import_required,
+                "connected_account_hint": credential_status.account_hint,
+                "session_ref": (
+                    studio_session.session_ref if studio_session is not None else None
+                ),
+                "message": message,
+            }
+        )
+        return payload
+
     def _masked_slicing_snapshot(snapshot) -> dict[str, object]:
         payload = snapshot.model_dump(mode="json")
         serial = payload["profile"].get("cloud_device_serial")
@@ -275,7 +356,12 @@ def create_app(container: Container | None = None) -> FastAPI:
         payload = profile.model_dump(mode="json")
         serial = payload["spec"].get("cloud_device_serial")
         if isinstance(serial, str) and serial:
+            payload["cloud_device_ref"] = hashlib.sha256(
+                serial.encode()
+            ).hexdigest()
             payload["spec"]["cloud_device_serial"] = mask_identifier(serial)
+        else:
+            payload["cloud_device_ref"] = None
         return payload
 
     async def serialize_workflow(
@@ -666,23 +752,21 @@ def create_app(container: Container | None = None) -> FastAPI:
         request: Request,
     ) -> dict[str, object]:
         require_local_credential_request(request)
-        status = await asyncio.to_thread(
-            get_container(request).bambu_studio_session.status
-        )
-        return status.model_dump(mode="json")
+        return await bambu_studio_connection_status(get_container(request))
 
     @app.post("/api/v1/bambu-studio-session/open")
     async def open_bambu_studio(
         request: Request,
     ) -> dict[str, object]:
         require_local_credential_request(request)
+        container = get_container(request)
         try:
-            status = await asyncio.to_thread(
-                get_container(request).bambu_studio_session.open
+            await asyncio.to_thread(
+                container.bambu_studio_session.open
             )
         except BambuStudioSessionError as exc:
             raise ValidationError(exc.message) from exc
-        return status.model_dump(mode="json")
+        return await bambu_studio_connection_status(container)
 
     @app.post("/api/v1/cloud-credentials", status_code=201)
     async def save_cloud_credential(
@@ -726,6 +810,15 @@ def create_app(container: Container | None = None) -> FastAPI:
                 session = await asyncio.to_thread(
                     container.bambu_studio_session.read_signed_in_session
                 )
+                if not secrets.compare_digest(
+                    session.session_ref,
+                    body.expected_session_ref,
+                ):
+                    raise BambuStudioSessionError(
+                        "session_unreadable",
+                        "Bambu Studio changed accounts or sessions; review the "
+                        "latest account before importing",
+                    )
                 token = session.access_token.get_secret_value()
                 devices = await container.inventory.validate_token(
                     token,
@@ -735,6 +828,9 @@ def create_app(container: Container | None = None) -> FastAPI:
                     container.cloud_credentials.store,
                     token,
                     session.region,
+                    source="bambu_studio",
+                    account_fingerprint=session.account_fingerprint,
+                    account_hint=session.account_hint,
                 )
             except (
                 BambuStudioSessionError,
@@ -753,6 +849,7 @@ def create_app(container: Container | None = None) -> FastAPI:
             "credential": status.model_dump(mode="json"),
             "studio": {
                 "region": session.region,
+                "region_source": session.region_source,
                 "account_hint": session.account_hint,
                 "session_updated_at": session.session_updated_at.isoformat(),
             },

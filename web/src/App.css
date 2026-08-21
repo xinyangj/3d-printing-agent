@@ -1645,6 +1645,29 @@ select:focus {
   font-weight: 700;
 }
 
+.account-change-warning,
+.account-session-notice {
+  border: 1px solid #d39a45;
+  margin-top: 14px;
+  padding: 12px;
+}
+
+.account-change-warning {
+  background: #fff4df;
+  color: #754814;
+}
+
+.account-session-notice {
+  background: #eef5ff;
+  border-color: #9bb7dd;
+  color: #2f537e;
+}
+
+.account-change-warning p,
+.account-session-notice p {
+  margin: 5px 0 0;
+}
+
 .advanced-account-fallback {
   border-top: 1px solid var(--line);
   margin-top: 16px;

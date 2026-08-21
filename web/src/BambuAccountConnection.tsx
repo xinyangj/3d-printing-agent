@@ -21,6 +21,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export type CredentialStatus = {
   configured: boolean
   region: 'global' | 'china' | null
+  source: 'manual' | 'bambu_studio' | null
+  account_hint: string | null
   protection: string
 }
 
@@ -38,9 +40,19 @@ type StudioSessionStatus = {
   session_present: boolean
   signed_in: boolean
   region: 'global' | 'china' | null
+  region_source: 'session' | 'studio_config' | null
   account_hint: string | null
   session_updated_at: string | null
   error_code: string | null
+  connection_relation:
+    | 'not_configured'
+    | 'same_account_current_session'
+    | 'same_account_new_session'
+    | 'different_account'
+    | 'comparison_unavailable'
+  import_required: boolean
+  connected_account_hint: string | null
+  session_ref: string | null
   message: string
 }
 
@@ -67,12 +79,18 @@ export function BambuAccountConnection({
     queryFn: () => request<StudioSessionStatus>('/bambu-studio-session'),
     enabled: localCredentialSetup,
     retry: false,
+    refetchInterval: localCredentialSetup ? 5_000 : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: 'always',
   })
 
-  const refreshConnectionQueries = async () => {
+  const refreshConnectionQueries = async (result: CredentialImportResult) => {
+    await queryClient.cancelQueries({ queryKey: ['cloud-devices'] })
+    queryClient.setQueryData(['cloud-devices'], result.devices)
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ['cloud-credential-status'] }),
-      queryClient.invalidateQueries({ queryKey: ['cloud-devices'] }),
+      queryClient.invalidateQueries({ queryKey: ['bambu-studio-session'] }),
+      queryClient.invalidateQueries({ queryKey: ['fabrication-readiness'] }),
     ])
   }
 
@@ -87,7 +105,10 @@ export function BambuAccountConnection({
     mutationFn: () =>
       request<CredentialImportResult>('/cloud-credentials/import-bambu-studio', {
         method: 'POST',
-        body: JSON.stringify({ experimental_acknowledged: riskAccepted }),
+        body: JSON.stringify({
+          experimental_acknowledged: riskAccepted,
+          expected_session_ref: studioSession.data?.session_ref,
+        }),
       }),
     onSuccess: refreshConnectionQueries,
   })
@@ -101,21 +122,26 @@ export function BambuAccountConnection({
           experimental_acknowledged: riskAccepted,
         }),
       }),
-    onSuccess: async () => {
+    onSuccess: async (result) => {
       setFallbackToken('')
-      await refreshConnectionQueries()
+      await refreshConnectionQueries(result)
     },
   })
   const disconnect = useMutation({
     mutationFn: () => request<CredentialStatus>('/cloud-credentials', { method: 'DELETE' }),
     onSuccess: async () => {
       queryClient.removeQueries({ queryKey: ['cloud-devices'] })
-      await queryClient.invalidateQueries({ queryKey: ['cloud-credential-status'] })
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['cloud-credential-status'] }),
+        queryClient.invalidateQueries({ queryKey: ['bambu-studio-session'] }),
+        queryClient.invalidateQueries({ queryKey: ['fabrication-readiness'] }),
+      ])
     },
   })
 
   const connected = credentialStatus?.configured === true
   const deviceCount = devices?.length
+  const relation = studioSession.data?.connection_relation
   const credentialMutationPending =
     importStudioSession.isPending || saveFallbackToken.isPending || disconnect.isPending
   const error =
@@ -131,7 +157,9 @@ export function BambuAccountConnection({
       <div className="account-connection-summary">
         <strong className={connected ? 'ready' : 'not-ready'}>
           {connected
-            ? `Bambu account connected · ${credentialStatus.region}`
+            ? `This app is connected${
+                credentialStatus.account_hint ? ` as ${credentialStatus.account_hint}` : ''
+              } · ${credentialStatus.region}`
             : 'Bambu account connection required'}
         </strong>
         {connected && (
@@ -146,6 +174,36 @@ export function BambuAccountConnection({
         never receives your password or SMS code and uses the unsupported private API only for
         read-only printer and AMS inventory.
       </p>
+
+      {relation === 'different_account' && (
+        <div className="account-change-warning">
+          <strong>
+            Bambu Studio switched
+            {studioSession.data?.account_hint
+              ? ` to ${studioSession.data.account_hint}`
+              : ' accounts'}
+          </strong>
+          <p>
+            This app is still connected
+            {studioSession.data?.connected_account_hint
+              ? ` to ${studioSession.data.connected_account_hint}`
+              : ' to the previous account'}
+            . Review the new account, then explicitly import it below.
+          </p>
+        </div>
+      )}
+      {relation === 'same_account_new_session' && (
+        <div className="account-session-notice">
+          <strong>Bambu Studio refreshed this account session</strong>
+          <p>Import the updated session to keep this app’s cloud access current.</p>
+        </div>
+      )}
+      {relation === 'comparison_unavailable' && (
+        <p className="part-warning">
+          {studioSession.data?.message ??
+            'Automatic account comparison is unavailable for this credential.'}
+        </p>
+      )}
 
       {connected && deviceCount === 0 && (
         <p className="part-warning">
@@ -220,7 +278,15 @@ export function BambuAccountConnection({
             <li className="account-connection-step">
               <span className="account-step-number">3</span>
               <div>
-                <strong>{connected ? 'Refresh this app’s connection' : 'Import signed-in session'}</strong>
+                <strong>
+                  {relation === 'different_account'
+                    ? 'Import new account'
+                    : relation === 'same_account_new_session'
+                      ? 'Import refreshed session'
+                      : connected
+                        ? 'Refresh this app’s connection'
+                        : 'Import signed-in session'}
+                </strong>
                 <p>
                   The access token is validated first, then stored with Windows DPAPI. It is never
                   returned to this browser or written to a plaintext file.
@@ -239,6 +305,7 @@ export function BambuAccountConnection({
                     className="primary-action"
                     disabled={
                       !studioSession.data?.signed_in ||
+                      !studioSession.data?.session_ref ||
                       !riskAccepted ||
                       credentialMutationPending
                     }
@@ -247,9 +314,13 @@ export function BambuAccountConnection({
                   >
                     {importStudioSession.isPending
                       ? 'Validating and importing…'
-                      : connected
-                        ? 'Refresh from Bambu Studio'
-                        : 'Import signed-in session'}
+                      : relation === 'different_account'
+                        ? 'Import new account'
+                        : relation === 'same_account_new_session'
+                          ? 'Import refreshed session'
+                          : connected
+                            ? 'Refresh from Bambu Studio'
+                            : 'Import signed-in session'}
                   </button>
                   {connected && (
                     <button

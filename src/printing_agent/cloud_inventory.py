@@ -23,6 +23,7 @@ from printing_agent.cloud_credentials import (
     CloudCredentialStatus,
     CloudCredentialStore,
     CloudRegion,
+    CredentialStoreError,
 )
 
 
@@ -694,7 +695,7 @@ class BambuCloudInventoryProvider:
         self._snapshot_ttl = snapshot_ttl
 
     async def list_devices(self) -> tuple[DeviceSummary, ...]:
-        credentials = self._credential_store.load()
+        credentials = self._load_credentials()
         return await self._list_devices(credentials)
 
     async def validate_token(
@@ -709,7 +710,7 @@ class BambuCloudInventoryProvider:
         return await self._list_devices(credentials)
 
     async def validate_credentials(self) -> CloudCredentialStatus:
-        credentials = self._credential_store.load()
+        credentials = self._load_credentials()
         await self._list_devices(credentials)
         return CloudCredentialStatus(configured=True, region=credentials.region)
 
@@ -739,7 +740,7 @@ class BambuCloudInventoryProvider:
         return devices
 
     async def snapshot(self, device_id: str) -> CloudDeviceSnapshot:
-        credentials = self._credential_store.load()
+        credentials = self._load_credentials()
         devices = await self._list_devices(credentials)
         device = next((item for item in devices if item.device_id == device_id), None)
         if device is None:
@@ -767,6 +768,14 @@ class BambuCloudInventoryProvider:
             ttl=self._snapshot_ttl,
             region=credentials.region,
         )
+
+    def _load_credentials(self) -> CloudCredentials:
+        try:
+            return self._credential_store.load()
+        except CredentialStoreError as exc:
+            raise CloudAuthenticationError(
+                "Bambu Cloud account connection is unavailable"
+            ) from exc
 
     async def get_snapshot(self, device_id: str) -> CloudDeviceSnapshot:
         return await self.snapshot(device_id)

@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Literal, Protocol
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 CloudRegion = Literal["global", "china"]
+CredentialSource = Literal["manual", "bambu_studio"]
 
 
 class CredentialStoreError(RuntimeError):
@@ -32,6 +33,9 @@ class CloudCredentials(BaseModel):
 
     access_token: SecretStr
     region: CloudRegion
+    source: CredentialSource | None = None
+    account_fingerprint: str | None = Field(default=None, exclude=True, repr=False)
+    account_hint: str | None = Field(default=None, exclude=True)
 
     def masked_dump(self) -> dict[str, str]:
         return {"access_token": "********", "region": self.region}
@@ -42,6 +46,8 @@ class CloudCredentialStatus(BaseModel):
 
     configured: bool
     region: CloudRegion | None = None
+    source: CredentialSource | None = None
+    account_hint: str | None = None
     protection: Literal["windows-dpapi-current-user"] = "windows-dpapi-current-user"
 
 
@@ -212,9 +218,15 @@ class CloudCredentialStore:
         self,
         access_token: str | SecretStr,
         region: CloudRegion,
+        *,
+        source: CredentialSource = "manual",
+        account_fingerprint: str | None = None,
+        account_hint: str | None = None,
     ) -> CloudCredentialStatus:
         if region not in {"global", "china"}:
             raise CredentialStoreError("Cloud region must be global or china")
+        if source not in {"manual", "bambu_studio"}:
+            raise CredentialStoreError("Cloud credential source is invalid")
         raw = (
             access_token.get_secret_value()
             if isinstance(access_token, SecretStr)
@@ -222,13 +234,40 @@ class CloudCredentialStore:
         ).strip()
         if not raw:
             raise CredentialStoreError("The access token cannot be empty")
+        if source == "manual":
+            account_fingerprint = None
+            account_hint = None
+        if account_fingerprint is not None and (
+            len(account_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in account_fingerprint)
+        ):
+            raise CredentialStoreError("Cloud credential account metadata is invalid")
+        if account_hint is not None:
+            account_hint = account_hint.strip()
+            if not account_hint or len(account_hint) > 255:
+                raise CredentialStoreError("Cloud credential account metadata is invalid")
 
         with self._lock:
-            protected = self._protector.protect(raw.encode("utf-8"))
+            payload = bytearray(
+                json.dumps(
+                    {
+                        "access_token": raw,
+                        "region": region,
+                        "source": source,
+                        "account_fingerprint": account_fingerprint,
+                        "account_hint": account_hint,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            try:
+                protected = self._protector.protect(bytes(payload))
+            finally:
+                payload[:] = b"\x00" * len(payload)
             document = {
-                "version": 1,
-                "region": region,
-                "encrypted_access_token": base64.b64encode(protected).decode("ascii"),
+                "version": 2,
+                "encrypted_payload": base64.b64encode(protected).decode("ascii"),
             }
             self.path.parent.mkdir(parents=True, exist_ok=True)
             pending = self.path.with_name(
@@ -248,7 +287,12 @@ class CloudCredentialStore:
                 raise CredentialStoreError(
                     "Could not store the cloud credential safely"
                 ) from exc
-        return CloudCredentialStatus(configured=True, region=region)
+        return CloudCredentialStatus(
+            configured=True,
+            region=region,
+            source=source,
+            account_hint=account_hint,
+        )
 
     def load(self) -> CloudCredentials:
         with self._lock:
@@ -257,28 +301,68 @@ class CloudCredentialStore:
     def _load(self) -> CloudCredentials:
         try:
             document = json.loads(self.path.read_text(encoding="utf-8"))
-            if set(document) != {
-                "version",
-                "region",
-                "encrypted_access_token",
-            }:
+            if not isinstance(document, dict):
                 raise ValueError
-            if document["version"] != 1 or document["region"] not in {"global", "china"}:
+            version = document.get("version")
+            if version == 1:
+                return self._load_v1(document)
+            if version != 2 or set(document) != {"version", "encrypted_payload"}:
                 raise ValueError
-            encrypted = base64.b64decode(
-                document["encrypted_access_token"],
-                validate=True,
-            )
+            encrypted = base64.b64decode(document["encrypted_payload"], validate=True)
             decrypted = bytearray(self._protector.unprotect(encrypted))
             try:
-                token = decrypted.decode("utf-8")
+                payload = json.loads(decrypted.decode("utf-8"))
             finally:
                 decrypted[:] = b"\x00" * len(decrypted)
-            if not token:
+            if not isinstance(payload, dict) or set(payload) != {
+                "access_token",
+                "region",
+                "source",
+                "account_fingerprint",
+                "account_hint",
+            }:
+                raise ValueError
+            token = payload["access_token"]
+            region = payload["region"]
+            source = payload["source"]
+            account_fingerprint = payload["account_fingerprint"]
+            account_hint = payload["account_hint"]
+            if (
+                not isinstance(token, str)
+                or not token
+                or region not in {"global", "china"}
+                or source not in {"manual", "bambu_studio"}
+                or (
+                    account_fingerprint is not None
+                    and (
+                        not isinstance(account_fingerprint, str)
+                        or len(account_fingerprint) != 64
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in account_fingerprint
+                        )
+                    )
+                )
+                or (
+                    account_hint is not None
+                    and (
+                        not isinstance(account_hint, str)
+                        or not account_hint
+                        or len(account_hint) > 255
+                    )
+                )
+                or (
+                    source == "manual"
+                    and (account_fingerprint is not None or account_hint is not None)
+                )
+            ):
                 raise ValueError
             return CloudCredentials(
                 access_token=SecretStr(token),
-                region=document["region"],
+                region=region,
+                source=source,
+                account_fingerprint=account_fingerprint,
+                account_hint=account_hint,
             )
         except FileNotFoundError as exc:
             raise CredentialStoreError("No Bambu Cloud credential is configured") from exc
@@ -286,6 +370,31 @@ class CloudCredentialStore:
             raise
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise CredentialStoreError("The cloud credential file is invalid") from exc
+
+    def _load_v1(self, document: object) -> CloudCredentials:
+        if not isinstance(document, dict) or set(document) != {
+            "version",
+            "region",
+            "encrypted_access_token",
+        }:
+            raise ValueError
+        if document["region"] not in {"global", "china"}:
+            raise ValueError
+        encrypted = base64.b64decode(
+            document["encrypted_access_token"],
+            validate=True,
+        )
+        decrypted = bytearray(self._protector.unprotect(encrypted))
+        try:
+            token = decrypted.decode("utf-8")
+        finally:
+            decrypted[:] = b"\x00" * len(decrypted)
+        if not token:
+            raise ValueError
+        return CloudCredentials(
+            access_token=SecretStr(token),
+            region=document["region"],
+        )
 
     def clear(self) -> CloudCredentialStatus:
         with self._lock:
@@ -305,17 +414,12 @@ class CloudCredentialStore:
             if not self.path.is_file():
                 return CloudCredentialStatus(configured=False)
             try:
-                document = json.loads(self.path.read_text(encoding="utf-8"))
-                region = document.get("region")
-                encrypted = document.get("encrypted_access_token")
-                if (
-                    document.get("version") != 1
-                    or region not in {"global", "china"}
-                    or not isinstance(encrypted, str)
-                    or not encrypted
-                ):
-                    raise ValueError
-                base64.b64decode(encrypted, validate=True)
-                return CloudCredentialStatus(configured=True, region=region)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                credentials = self._load()
+                return CloudCredentialStatus(
+                    configured=True,
+                    region=credentials.region,
+                    source=credentials.source,
+                    account_hint=credentials.account_hint,
+                )
+            except CredentialStoreError:
                 return CloudCredentialStatus(configured=False)

@@ -18,6 +18,7 @@ from printing_agent.cloud_inventory import (
     CHINA_ENDPOINTS,
     GLOBAL_ENDPOINTS,
     BambuCloudInventoryProvider,
+    CloudAuthenticationError,
     CloudInventoryError,
     DeviceSummary,
     build_read_only_status_request,
@@ -114,7 +115,85 @@ def test_credential_store_roundtrip_never_exposes_plaintext(tmp_path: Path) -> N
         "region": "global",
     }
     assert store.status().region == "global"
+    assert store.status().source == "manual"
     assert store.clear().configured is False
+    assert store.status().configured is False
+
+
+def test_credential_store_encrypts_studio_account_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "credentials.json"
+    store = CloudCredentialStore(
+        path,
+        protector=FakeProtector(),
+        acl_restrictor=lambda _: None,
+    )
+
+    status = store.store(
+        "studio-token",
+        "china",
+        source="bambu_studio",
+        account_fingerprint="a" * 64,
+        account_hint="***3456",
+    )
+    stored = path.read_text(encoding="utf-8")
+    loaded = store.load()
+
+    assert json.loads(stored)["version"] == 2
+    assert "studio-token" not in stored
+    assert "***3456" not in stored
+    assert "a" * 64 not in stored
+    assert loaded.source == "bambu_studio"
+    assert loaded.account_fingerprint == "a" * 64
+    assert loaded.account_hint == "***3456"
+    assert status.account_hint == "***3456"
+
+
+def test_credential_store_reads_legacy_version_one(tmp_path: Path) -> None:
+    path = tmp_path / "credentials.json"
+    protector = FakeProtector()
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "region": "global",
+                "encrypted_access_token": base64.b64encode(
+                    protector.protect(b"legacy-token")
+                ).decode("ascii"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = CloudCredentialStore(
+        path,
+        protector=protector,
+        acl_restrictor=lambda _: None,
+    )
+
+    loaded = store.load()
+    status = store.status()
+
+    assert loaded.access_token.get_secret_value() == "legacy-token"
+    assert loaded.source is None
+    assert status.configured is True
+    assert status.source is None
+
+
+@pytest.mark.parametrize("document", [[], None, "invalid", 42])
+def test_credential_store_rejects_non_object_json(
+    tmp_path: Path,
+    document: object,
+) -> None:
+    path = tmp_path / "credentials.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    store = CloudCredentialStore(
+        path,
+        protector=FakeProtector(),
+        acl_restrictor=lambda _: None,
+    )
+
+    with pytest.raises(CredentialStoreError):
+        store.load()
+
     assert store.status().configured is False
 
 
@@ -195,6 +274,20 @@ def test_global_and_china_endpoints_are_explicit() -> None:
     assert endpoints_for_region("china") == CHINA_ENDPOINTS
     assert CHINA_ENDPOINTS.api_base_url == "https://api.bambulab.cn"
     assert CHINA_ENDPOINTS.mqtt_host == "cn.mqtt.bambulab.com"
+
+
+async def test_provider_reports_missing_credentials_as_cloud_authentication(
+    tmp_path: Path,
+) -> None:
+    store = CloudCredentialStore(
+        tmp_path / "missing.json",
+        protector=FakeProtector(),
+        acl_restrictor=lambda _: None,
+    )
+    provider = BambuCloudInventoryProvider(store)
+
+    with pytest.raises(CloudAuthenticationError, match="connection is unavailable"):
+        await provider.list_devices()
 
 
 def _h2d_report() -> dict[str, object]:

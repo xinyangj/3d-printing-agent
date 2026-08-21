@@ -126,6 +126,19 @@ class StaticInventoryProvider:
         return self.value.model_copy(update={"id": new_id()})
 
 
+class CopyInventoryProvider:
+    def __init__(self, device_id: str = "H2D-PRIVATE-SERIAL") -> None:
+        self.device = DeviceSummary(
+            device_id=device_id,
+            name="Workshop H2D",
+            model="H2D",
+            online=True,
+        )
+
+    async def list_devices(self):
+        return (self.device,)
+
+
 def _material(
     material_id: str,
     color: str,
@@ -284,7 +297,19 @@ async def _copy_application(
     repository: WorkflowRepository,
     store: ArtifactStore,
 ) -> PrintingApplication:
-    h2d = built_in_h2d_profile()
+    base_h2d = built_in_h2d_profile()
+    h2d = base_h2d.model_copy(
+        update={
+            "spec": base_h2d.spec.model_copy(
+                update={
+                    "cloud_region": "global",
+                    "cloud_device_name": "Workshop H2D",
+                    "cloud_device_serial": "H2D-PRIVATE-SERIAL",
+                }
+            ),
+            "digest": None,
+        }
+    ).with_digest()
     try:
         await repository.get_printer_profile(h2d.profile_id, h2d.revision)
     except NotFoundError:
@@ -298,6 +323,7 @@ async def _copy_application(
     application.artifacts = store
     application.printers = printers
     application.slicers = slicers
+    application.inventory = CopyInventoryProvider()
     return application
 
 
@@ -584,6 +610,28 @@ async def test_fabrication_copy_carries_exact_schema_v2_approval(
     assert copied_artifact.model_digest == source_artifact.model_digest
     assert copied_artifact.three_mf_digest == source_artifact.three_mf_digest
     assert copied_artifact.files == source_artifact.files
+
+
+async def test_fabrication_copy_rejects_printer_from_previous_account(
+    repository: WorkflowRepository,
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, _ = await _stored_source_artifact(
+        repository,
+        store,
+        tmp_path,
+        schema_version="2",
+        approved=True,
+    )
+    application = await _copy_application(repository, store)
+    application.inventory = CopyInventoryProvider("OTHER-ACCOUNT-H2D")
+
+    with pytest.raises(ConflictError, match="unavailable under the connected account"):
+        await application.copy_workflow(
+            source.id,
+            target_printer_name="bambu-h2d",
+        )
 
 
 async def test_fabrication_copy_upgrades_legacy_artifact_without_approval(
