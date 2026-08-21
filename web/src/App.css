@@ -1512,6 +1512,20 @@ select:focus {
   color: var(--muted);
 }
 
+.observed-tray-material {
+  align-items: center;
+  display: flex;
+  gap: 5px;
+}
+
+.observed-tray-color {
+  border: 1px solid rgba(42, 47, 44, 0.3);
+  border-radius: 50%;
+  flex: 0 0 auto;
+  height: 10px;
+  width: 10px;
+}
+
 .slice-material-table {
   display: grid;
   gap: 1px;

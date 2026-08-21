@@ -1670,7 +1670,17 @@ function SlicingWorkspace({
                   {cloudTrays.map((tray) => (
                     <div key={tray.slot_id}>
                       <strong>{tray.slot_id}</strong>
-                      <span>{tray.material ?? 'Empty'}</span>
+                      <span className="observed-tray-material">
+                        {tray.color && (
+                          <span
+                            aria-label={`Filament color ${tray.color}`}
+                            className="observed-tray-color"
+                            style={{ background: tray.color }}
+                          />
+                        )}
+                        {tray.material ?? 'Empty'}
+                        {tray.color ? ` · ${tray.color}` : ''}
+                      </span>
                       {tray.material && tray.estimated_remaining_g !== null ? (
                         <small>
                           {tray.remain_percentage}% · ~{tray.estimated_remaining_g} g
