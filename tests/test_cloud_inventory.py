@@ -518,6 +518,26 @@ def test_loaded_tray_without_quantity_is_unavailable_not_global_failure() -> Non
     assert "no usable quantity estimate" in snapshot.warnings[0]
 
 
+def test_negative_remaining_sentinel_is_unknown_not_global_failure() -> None:
+    report = _h2d_report()
+    report["print"]["ams"]["ams"][0]["tray"][0]["remain"] = -1  # type: ignore[index]
+    snapshot = parse_h2d_snapshot(
+        report,
+        DeviceSummary(
+            device_id="01P00REDACTED1234",
+            name="Workshop H2D",
+            model="H2D",
+            online=True,
+        ),
+    )
+
+    tray = snapshot.ams_units[0].trays[0]
+    assert tray.material == "PLA"
+    assert tray.remain_percentage is None
+    assert tray.estimated_remaining_g is None
+    assert "no usable quantity estimate" in snapshot.warnings[0]
+
+
 @pytest.mark.parametrize("command", ["project_file", "print", "control"])
 def test_mqtt_allowlist_rejects_non_inventory_commands(command: str) -> None:
     with pytest.raises(CloudInventoryError, match="not permitted"):

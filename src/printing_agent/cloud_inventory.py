@@ -263,6 +263,15 @@ def _optional_number(value: Any, field: str) -> float | None:
     return _number(value, field)
 
 
+def _optional_percentage(value: Any, field: str) -> float | None:
+    parsed = _optional_number(value, field)
+    if parsed is None or parsed < 0:
+        return None
+    if parsed > 100:
+        raise CloudInventoryIncompleteError(f"Inventory field {field} is invalid")
+    return parsed
+
+
 def _string(value: Any, field: str) -> str:
     if not isinstance(value, (str, int)) or not str(value).strip():
         raise CloudInventoryIncompleteError(f"Inventory field {field} is missing")
@@ -395,7 +404,7 @@ def _parse_tray(
         "nominal_tray_weight_g",
         value.get("tray_weight", value.get("weight")),
     )
-    remain_value = _optional_number(
+    remain_value = _optional_percentage(
         remain,
         f"tray {resolved_slot_id} remaining percentage",
     )
