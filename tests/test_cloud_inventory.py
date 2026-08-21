@@ -21,6 +21,8 @@ from printing_agent.cloud_inventory import (
     CloudAuthenticationError,
     CloudInventoryError,
     DeviceSummary,
+    _jwt_username,
+    _normalize_mqtt_username,
     build_read_only_status_request,
     endpoints_for_region,
     parse_h2d_snapshot,
@@ -274,6 +276,17 @@ def test_global_and_china_endpoints_are_explicit() -> None:
     assert endpoints_for_region("china") == CHINA_ENDPOINTS
     assert CHINA_ENDPOINTS.api_base_url == "https://api.bambulab.cn"
     assert CHINA_ENDPOINTS.mqtt_host == "cn.mqtt.bambulab.com"
+
+
+def test_cloud_mqtt_username_is_prefixed_exactly_once() -> None:
+    claims = base64.urlsafe_b64encode(
+        json.dumps({"username": "216711365"}).encode()
+    ).decode().rstrip("=")
+
+    assert _jwt_username(f"header.{claims}.signature") == "u_216711365"
+    assert _normalize_mqtt_username("216711365") == "u_216711365"
+    assert _normalize_mqtt_username("u_216711365") == "u_216711365"
+    assert _normalize_mqtt_username("invalid user") is None
 
 
 async def test_provider_reports_missing_credentials_as_cloud_authentication(

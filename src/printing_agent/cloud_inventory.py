@@ -651,7 +651,20 @@ def _jwt_username(token: str) -> str | None:
     except (ValueError, TypeError, json.JSONDecodeError):
         return None
     username = claims.get("username") if isinstance(claims, Mapping) else None
-    return str(username).strip() if username else None
+    return _normalize_mqtt_username(username)
+
+
+def _normalize_mqtt_username(value: object) -> str | None:
+    if not isinstance(value, (str, int)):
+        return None
+    username = str(value).strip()
+    if not username:
+        return None
+    if not username.startswith("u_"):
+        username = f"u_{username}"
+    if not re.fullmatch(r"u_[A-Za-z0-9_-]{1,126}", username):
+        return None
+    return username
 
 
 def _deep_merge(target: dict[str, Any], source: Mapping[str, Any]) -> None:
@@ -801,11 +814,12 @@ class BambuCloudInventoryProvider:
             raise CloudInventoryIncompleteError(
                 "Bambu Cloud account preference is invalid"
             ) from exc
-        if not isinstance(username, (str, int)) or not str(username).strip():
+        normalized = _normalize_mqtt_username(username)
+        if normalized is None:
             raise CloudInventoryIncompleteError(
                 "Bambu Cloud account preference has no MQTT username"
             )
-        return str(username).strip()
+        return normalized
 
     async def _get(
         self,
