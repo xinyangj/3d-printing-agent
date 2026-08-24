@@ -74,6 +74,8 @@ type MaterialDefinition = {
     measured_color: string | null
     slicer_filament_profile_id: string
     cloud_filament_ids: string[]
+    mapping_origin: 'manual' | 'studio_exact' | 'generic_confirmed'
+    source_profile_id: string | null
   }
 }
 
@@ -402,6 +404,11 @@ export function FabricationSettings() {
                   {material.spec.family} · cloud{' '}
                   {material.spec.cloud_filament_ids.join(', ') || 'unmapped'} · revision{' '}
                   {material.revision}
+                </small>
+                <small>
+                  {material.spec.mapping_origin.replaceAll('_', ' ')} ·{' '}
+                  {material.spec.source_profile_id ??
+                    material.spec.slicer_filament_profile_id}
                 </small>
               </div>
             ))}

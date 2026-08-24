@@ -75,6 +75,12 @@ from printing_agent.fabrication_profiles import (
     built_in_simulator_profile,
     resolve_slicer_profile_file_digests,
 )
+from printing_agent.filament_profiles import (
+    FilamentMappingStatus,
+    InstalledFilamentCatalog,
+    ResolvedFilamentProfile,
+    observed_filament_groups,
+)
 from printing_agent.material_assignment import MaterialAssignmentService
 from printing_agent.modeling import (
     ModelPipeline,
@@ -118,6 +124,7 @@ class PrintingApplication:
         self.slicers = slicers
         self.inventory = inventory
         self.material_assignment = material_assignment
+        self.filament_catalog = InstalledFilamentCatalog()
         self._cancel_locks: dict[str, asyncio.Lock] = {}
 
     async def create_workflow(
@@ -377,6 +384,7 @@ class PrintingApplication:
             expected_revision=current.revision,
         )
         self.printers.upsert(ProfilePrinterAdapter(profile))
+        await self.synchronize_material_mappings(profile, snapshot)
         return profile
 
     @staticmethod
@@ -513,10 +521,23 @@ class PrintingApplication:
             )
         except NotFoundError:
             previous_snapshot = None
+        mapping_before = await self._material_mapping_signature(
+            profile,
+            snapshot,
+        )
         await self.repository.save_cloud_device_snapshot(
             workflow_id,
             profile.profile_id,
             snapshot,
+        )
+        await self.synchronize_material_mappings(profile, snapshot)
+        mapping_after = await self._material_mapping_signature(
+            profile,
+            snapshot,
+        )
+        mapping_changed = mapping_before != mapping_after
+        assignment_stale = await self._workflow_material_assignment_stale(
+            workflow_id
         )
         inventory_changed = (
             previous_snapshot is not None
@@ -524,7 +545,7 @@ class PrintingApplication:
         )
         if workflow.state == WorkflowState.APPROVED or (
             workflow.state != WorkflowState.SLICE_SETUP
-            and inventory_changed
+            and (inventory_changed or mapping_changed or assignment_stale)
         ):
             await self.repository.transition(
                 workflow_id,
@@ -534,6 +555,8 @@ class PrintingApplication:
                     "cloud_snapshot_id": snapshot.id,
                     "cloud_snapshot_digest": snapshot.digest,
                     "inventory_changed": inventory_changed,
+                    "material_mapping_changed": mapping_changed,
+                    "material_assignment_stale": assignment_stale,
                 },
             )
         else:
@@ -543,9 +566,474 @@ class PrintingApplication:
                 {
                     "cloud_snapshot_id": snapshot.id,
                     "cloud_snapshot_digest": snapshot.digest,
+                    "material_mapping_changed": mapping_changed,
+                    "material_assignment_stale": assignment_stale,
                 },
             )
         return snapshot
+
+    async def _material_mapping_signature(
+        self,
+        profile: PrinterProfileRevision,
+        snapshot: CloudDeviceSnapshot,
+    ) -> str:
+        cloud_ids = set(observed_filament_groups(snapshot))
+        definitions = await self.repository.list_material_definitions()
+        values = [
+            {
+                "material_id": item.material_id,
+                "revision": item.revision,
+                "digest": item.digest,
+            }
+            for item in definitions
+            if item.spec.cloud_filament_ids & cloud_ids
+            and (
+                item.spec.mapping_origin == "manual"
+                or self._get_filament_catalog().profile_is_compatible(
+                    item.spec.source_profile_id,
+                    profile,
+                )
+            )
+        ]
+        return canonical_digest(sorted(values, key=lambda item: item["material_id"]))
+
+    async def synchronize_material_mappings(
+        self,
+        profile: PrinterProfileRevision,
+        snapshot: CloudDeviceSnapshot,
+    ) -> list[FilamentMappingStatus]:
+        return await self._material_mapping_statuses(
+            profile,
+            snapshot,
+            synchronize_exact=True,
+        )
+
+    async def material_mapping_statuses(
+        self,
+        profile: PrinterProfileRevision,
+        snapshot: CloudDeviceSnapshot,
+    ) -> list[FilamentMappingStatus]:
+        return await self._material_mapping_statuses(
+            profile,
+            snapshot,
+            synchronize_exact=False,
+        )
+
+    async def _material_mapping_statuses(
+        self,
+        profile: PrinterProfileRevision,
+        snapshot: CloudDeviceSnapshot,
+        *,
+        synchronize_exact: bool,
+    ) -> list[FilamentMappingStatus]:
+        definitions = await self.repository.list_material_definitions()
+        groups = observed_filament_groups(snapshot)
+        output: list[FilamentMappingStatus] = []
+        for cloud_id in sorted(groups):
+            group = groups[cloud_id]
+            observed_materials = sorted(group["materials"])  # type: ignore[arg-type]
+            matches = [
+                definition
+                for definition in definitions
+                if cloud_id in definition.spec.cloud_filament_ids
+            ]
+            manual_matches = [
+                item for item in matches if item.spec.mapping_origin == "manual"
+            ]
+            if len(manual_matches) > 1:
+                output.append(
+                    self._mapping_status(
+                        cloud_id,
+                        group,
+                        state="ambiguous",
+                        reason=(
+                            "Multiple explicit manual mappings claim this filament ID."
+                        ),
+                    )
+                )
+                continue
+            if len(manual_matches) == 1:
+                current = manual_matches[0]
+                if synchronize_exact:
+                    competing = {
+                        item.material_id
+                        for item in matches
+                        if item.material_id != current.material_id
+                    }
+                    await self.repository.disable_material_definitions(competing)
+                    definitions = [
+                        item
+                        for item in definitions
+                        if item.material_id not in competing
+                    ]
+                output.append(
+                    self._mapping_status(
+                        cloud_id,
+                        group,
+                        state="manual",
+                        material=current,
+                        reason="Using the explicit user-created material mapping.",
+                    )
+                )
+                continue
+            matches = [
+                item
+                for item in matches
+                if self._get_filament_catalog().profile_is_compatible(
+                    item.spec.source_profile_id,
+                    profile,
+                )
+            ]
+            if len(matches) > 1:
+                output.append(
+                    self._mapping_status(
+                        cloud_id,
+                        group,
+                        state="ambiguous",
+                        reason="Multiple active material definitions claim this filament ID.",
+                    )
+                )
+                continue
+            catalog_error: str | None = None
+            try:
+                exact = await asyncio.to_thread(
+                    self._get_filament_catalog().resolve_exact,
+                    cloud_id,
+                    profile,
+                )
+            except PrintingAgentError as exc:
+                exact = None
+                catalog_error = str(exc)
+            if matches:
+                current = matches[0]
+                origin = current.spec.mapping_origin
+                if origin == "generic_confirmed" and exact is not None:
+                    output.append(
+                        self._mapping_status(
+                            cloud_id,
+                            group,
+                            state="upgrade_available",
+                            material=current,
+                            proposal=exact,
+                            reason=(
+                                "An exact official Studio preset is now available; "
+                                "confirmation is required to upgrade."
+                            ),
+                        )
+                    )
+                    continue
+                if origin == "studio_exact":
+                    if exact is None:
+                        if synchronize_exact:
+                            await self.repository.disable_material_definitions(
+                                {current.material_id}
+                            )
+                            definitions = [
+                                item
+                                for item in definitions
+                                if item.material_id != current.material_id
+                            ]
+                        output.append(
+                            self._mapping_status(
+                                cloud_id,
+                                group,
+                                state="missing",
+                                reason=(
+                                    catalog_error
+                                    or "The previously mapped exact Studio preset "
+                                    "is no longer available."
+                                ),
+                            )
+                        )
+                        continue
+                    if synchronize_exact and current.spec != exact.spec:
+                        current = await self._save_resolved_mapping(
+                            exact,
+                        )
+                    output.append(
+                        self._mapping_status(
+                            cloud_id,
+                            group,
+                            state=(
+                                "manual"
+                                if current.spec.mapping_origin == "manual"
+                                else "official_exact"
+                            ),
+                            material=current,
+                            reason=(
+                                "Using the explicit user-created material mapping."
+                                if current.spec.mapping_origin == "manual"
+                                else "Mapped to the exact installed Bambu Studio preset."
+                            ),
+                        )
+                    )
+                    continue
+                if origin == "generic_confirmed":
+                    try:
+                        generic = await asyncio.to_thread(
+                            self._get_filament_catalog().suggest_generic,
+                            cloud_id,
+                            (
+                                observed_materials[0]
+                                if len(observed_materials) == 1
+                                else None
+                            ),
+                            profile,
+                        )
+                    except PrintingAgentError as exc:
+                        generic = None
+                        catalog_error = str(exc)
+                    if generic is None:
+                        if synchronize_exact:
+                            await self.repository.disable_material_definitions(
+                                {current.material_id}
+                            )
+                        output.append(
+                            self._mapping_status(
+                                cloud_id,
+                                group,
+                                state="missing",
+                                reason=(
+                                    catalog_error
+                                    or "The confirmed generic Studio preset is "
+                                    "no longer available."
+                                ),
+                            )
+                        )
+                        continue
+                    if current.spec != generic.spec:
+                        if synchronize_exact:
+                            await self.repository.disable_material_definitions(
+                                {current.material_id}
+                            )
+                        output.append(
+                            self._mapping_status(
+                                cloud_id,
+                                group,
+                                state="confirmation_required",
+                                proposal=generic,
+                                reason=(
+                                    "The generic preset dependency graph changed; "
+                                    "confirmation is required again."
+                                ),
+                            )
+                        )
+                        continue
+                output.append(
+                    self._mapping_status(
+                        cloud_id,
+                        group,
+                        state="generic_confirmed",
+                        material=current,
+                        reason="Using a previously confirmed generic Studio preset.",
+                    )
+                )
+                continue
+
+            if exact is not None:
+                if synchronize_exact:
+                    material = await self._save_resolved_mapping(exact)
+                    definitions.append(material)
+                    output.append(
+                        self._mapping_status(
+                            cloud_id,
+                            group,
+                            state=(
+                                "manual"
+                                if material.spec.mapping_origin == "manual"
+                                else "official_exact"
+                            ),
+                            material=material,
+                            reason=(
+                                "Using the explicit user-created material mapping."
+                                if material.spec.mapping_origin == "manual"
+                                else "Auto-mapped to the exact installed Studio preset."
+                            ),
+                        )
+                    )
+                else:
+                    output.append(
+                        self._mapping_status(
+                            cloud_id,
+                            group,
+                            state="confirmation_required",
+                            proposal=exact,
+                            reason="Exact mapping is ready to synchronize on refresh.",
+                        )
+                    )
+                continue
+
+            try:
+                suggestion = await asyncio.to_thread(
+                    self._get_filament_catalog().suggest_generic,
+                    cloud_id,
+                    observed_materials[0] if len(observed_materials) == 1 else None,
+                    profile,
+                )
+            except PrintingAgentError as exc:
+                suggestion = None
+                catalog_error = str(exc)
+            output.append(
+                self._mapping_status(
+                    cloud_id,
+                    group,
+                    state=(
+                        "confirmation_required"
+                        if suggestion is not None
+                        else "missing"
+                    ),
+                    proposal=suggestion,
+                    reason=(
+                        "A generic Studio preset requires reusable user confirmation."
+                        if suggestion is not None
+                        else (
+                            catalog_error
+                            or "No unique installed Studio preset could be resolved."
+                        )
+                    ),
+                )
+            )
+        return output
+
+    async def confirm_material_mapping(
+        self,
+        workflow_id: str,
+        cloud_filament_id: str,
+        proposed_profile_id: str,
+        proposed_profile_digest: str,
+    ) -> MaterialDefinitionRevision:
+        workflow = await self.repository.get_workflow(workflow_id)
+        if workflow.state not in {
+            WorkflowState.APPROVED,
+            WorkflowState.SLICE_SETUP,
+            WorkflowState.AWAITING_MATERIAL_REVIEW,
+            WorkflowState.SLICE_FAILED,
+            WorkflowState.AWAITING_SLICE_REVIEW,
+        }:
+            raise ConflictError(
+                "Material mappings cannot change while slicing or after cancellation"
+            )
+        printer_snapshot = await self.repository.get_workflow_printer_snapshot(
+            workflow_id
+        )
+        profile = await self.repository.get_printer_profile(
+            printer_snapshot.profile_id,
+            printer_snapshot.profile_revision,
+        )
+        snapshot = await self.repository.get_latest_cloud_device_snapshot(workflow_id)
+        groups = observed_filament_groups(snapshot)
+        group = groups.get(cloud_filament_id)
+        if group is None:
+            raise NotFoundError("Cloud filament ID is not present in this snapshot")
+        definitions = await self.repository.list_material_definitions()
+        matches = [
+            item
+            for item in definitions
+            if cloud_filament_id in item.spec.cloud_filament_ids
+        ]
+        manual_matches = [
+            item for item in matches if item.spec.mapping_origin == "manual"
+        ]
+        if manual_matches:
+            raise ConflictError("Material mapping cannot replace an explicit or ambiguous mapping")
+        matches = [
+            item
+            for item in matches
+            if self._get_filament_catalog().profile_is_compatible(
+                item.spec.source_profile_id,
+                profile,
+            )
+        ]
+        if len(matches) > 1:
+            raise ConflictError("Material mapping is ambiguous for this printer profile")
+        exact = await asyncio.to_thread(
+            self._get_filament_catalog().resolve_exact,
+            cloud_filament_id,
+            profile,
+        )
+        observed_materials = sorted(group["materials"])  # type: ignore[arg-type]
+        proposal = exact or await asyncio.to_thread(
+            self._get_filament_catalog().suggest_generic,
+            cloud_filament_id,
+            observed_materials[0] if len(observed_materials) == 1 else None,
+            profile,
+        )
+        if proposal is None:
+            raise ValidationError("No confirmable installed filament preset is available")
+        if (
+            proposal.profile_id != proposed_profile_id
+            or proposal.profile_digest != proposed_profile_digest
+        ):
+            raise ConflictError("Filament mapping proposal is stale; review it again")
+        material = await self._save_resolved_mapping(
+            proposal,
+        )
+        if workflow.state not in {
+            WorkflowState.APPROVED,
+            WorkflowState.SLICE_SETUP,
+        }:
+            await self.repository.transition(
+                workflow_id,
+                WorkflowState.SLICE_SETUP,
+                event_kind="material.mapping_changed",
+                payload={
+                    "cloud_filament_id": cloud_filament_id,
+                    "material_id": material.material_id,
+                    "material_revision": material.revision,
+                },
+            )
+        return material
+
+    async def _save_resolved_mapping(
+        self,
+        resolved: ResolvedFilamentProfile,
+    ) -> MaterialDefinitionRevision:
+        material_id = self._get_filament_catalog().material_id(
+            resolved.cloud_filament_id,
+            resolved.profile_id,
+        )
+        return await self.repository.upsert_automatic_material_definition(
+            material_id,
+            resolved.spec,
+        )
+
+    def _get_filament_catalog(self) -> InstalledFilamentCatalog:
+        catalog = getattr(self, "filament_catalog", None)
+        if catalog is None:
+            catalog = InstalledFilamentCatalog()
+            self.filament_catalog = catalog
+        return catalog
+
+    @staticmethod
+    def _mapping_status(
+        cloud_id: str,
+        group: dict[str, object],
+        *,
+        state,
+        reason: str,
+        material: MaterialDefinitionRevision | None = None,
+        proposal: ResolvedFilamentProfile | None = None,
+    ) -> FilamentMappingStatus:
+        return FilamentMappingStatus(
+            cloud_filament_id=cloud_id,
+            slots=tuple(sorted(group["slots"])),  # type: ignore[arg-type]
+            observed_material=(
+                next(iter(group["materials"]))  # type: ignore[arg-type]
+                if len(group["materials"]) == 1  # type: ignore[arg-type]
+                else None
+            ),
+            observed_sub_brands=tuple(
+                sorted(group["sub_brands"])  # type: ignore[arg-type]
+            ),
+            state=state,
+            material_id=material.material_id if material else None,
+            selected_profile_id=(
+                material.spec.slicer_filament_profile_id if material else None
+            ),
+            proposed_profile_id=proposal.profile_id if proposal else None,
+            proposed_profile_digest=proposal.profile_digest if proposal else None,
+            reason=reason,
+        )
 
     @staticmethod
     def _validate_cloud_snapshot(
@@ -1688,6 +2176,14 @@ class PrintingApplication:
         definitions = await self.repository.list_material_definitions()
         by_cloud_id: dict[str, list] = {}
         for definition in definitions:
+            if (
+                definition.spec.mapping_origin != "manual"
+                and not self._get_filament_catalog().profile_is_compatible(
+                    definition.spec.source_profile_id,
+                    profile,
+                )
+            ):
+                continue
             for cloud_id in definition.spec.cloud_filament_ids:
                 by_cloud_id.setdefault(cloud_id, []).append(definition)
         slot_ids = {slot.id for slot in profile.spec.material_slots}
@@ -1721,11 +2217,13 @@ class PrintingApplication:
                     f"Observed slot '{tray.slot_id}' has no Bambu filament identifier"
                 )
             matches = by_cloud_id.get(tray.material_profile_id, [])
+            manual_matches = [
+                item for item in matches if item.spec.mapping_origin == "manual"
+            ]
+            if len(manual_matches) == 1:
+                matches = manual_matches
             if len(matches) != 1:
-                raise ConflictError(
-                    f"Observed filament '{tray.material_profile_id}' in "
-                    f"slot '{tray.slot_id}' has no unique local material mapping"
-                )
+                continue
             material = matches[0]
             spool_id = (
                 "cloud-"
@@ -1778,6 +2276,7 @@ class PrintingApplication:
                 assignment,
                 spool_overrides,
             )
+        await self._ensure_assignment_materials_current(workflow, assignment)
         confirmed = assignment.model_copy(
             update={
                 "confirmed_by": confirmed_by,
@@ -1809,6 +2308,7 @@ class PrintingApplication:
             snapshot.profile_revision,
         )
         assignment = await self.repository.get_latest_material_assignment(workflow_id)
+        await self._ensure_assignment_materials_current(workflow, assignment)
         if assignment.confirmed_at is None:
             raise ConflictError("Material assignment requires user confirmation")
         if (
@@ -1900,6 +2400,54 @@ class PrintingApplication:
             )
         await self.repository.enqueue_slice(job, reservations)
         return job
+
+    async def _ensure_assignment_materials_current(
+        self,
+        workflow: PrintWorkflow,
+        assignment: MaterialAssignment,
+    ) -> None:
+        if await self._assignment_materials_are_current(assignment):
+            return
+        if workflow.state != WorkflowState.SLICE_SETUP and workflow.state in {
+            WorkflowState.AWAITING_MATERIAL_REVIEW,
+            WorkflowState.SLICE_FAILED,
+            WorkflowState.AWAITING_SLICE_REVIEW,
+        }:
+            await self.repository.transition(
+                workflow.id,
+                WorkflowState.SLICE_SETUP,
+                event_kind="material.assignment_stale",
+                payload={"assignment_id": assignment.id},
+            )
+        raise ConflictError(
+            "Material mapping changed; refresh inventory and recommend materials again"
+        )
+
+    async def _assignment_materials_are_current(
+        self,
+        assignment: MaterialAssignment,
+    ) -> bool:
+        active = {
+            (item.material_id, item.revision): item.digest
+            for item in await self.repository.list_material_definitions()
+        }
+        return all(
+            active.get((item.material_id, item.material_revision))
+            == item.material_digest
+            for item in assignment.assignments
+        )
+
+    async def _workflow_material_assignment_stale(
+        self,
+        workflow_id: str,
+    ) -> bool:
+        try:
+            assignment = await self.repository.get_latest_material_assignment(
+                workflow_id
+            )
+        except NotFoundError:
+            return False
+        return not await self._assignment_materials_are_current(assignment)
 
     async def slice_workflow(self, workflow_id: str) -> None:
         job = await self.repository.get_latest_slice_job(workflow_id)

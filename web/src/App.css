@@ -1526,6 +1526,26 @@ select:focus {
   width: 10px;
 }
 
+.filament-mapping-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin-top: 12px;
+}
+
+.filament-mapping-grid > div {
+  background: #eef5ff;
+  border: 1px solid #b5c8e2;
+  display: grid;
+  font-size: 11px;
+  gap: 4px;
+  padding: 10px;
+}
+
+.filament-mapping-grid small {
+  color: var(--muted);
+}
+
 .slice-material-table {
   display: grid;
   gap: 1px;

@@ -133,9 +133,11 @@ type WorkflowResponse = {
     }
   } | null
   material_assignment: MaterialAssignmentPayload | null
+  material_assignment_stale: boolean
   slice_job: SliceJobPayload | null
   sliced_artifact: SlicedArtifactPayload | null
   cloud_snapshot: CloudDeviceSnapshotPayload | null
+  material_mappings: FilamentMappingStatus[]
 }
 
 type Printer = {
@@ -237,6 +239,26 @@ type CloudDeviceSnapshotPayload = {
     estimated_remaining_g: number | null
   }>
   warnings: string[]
+}
+
+type FilamentMappingStatus = {
+  cloud_filament_id: string
+  slots: string[]
+  observed_material: string | null
+  observed_sub_brands: string[]
+  state:
+    | 'official_exact'
+    | 'manual'
+    | 'generic_confirmed'
+    | 'confirmation_required'
+    | 'upgrade_available'
+    | 'ambiguous'
+    | 'missing'
+  material_id: string | null
+  selected_profile_id: string | null
+  proposed_profile_id: string | null
+  proposed_profile_digest: string | null
+  reason: string
 }
 
 type CloudCredentialStatusPayload = {
@@ -1515,6 +1537,23 @@ function SlicingWorkspace({
     onSuccess: () =>
       void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
   })
+  const confirmMapping = useMutation({
+    mutationFn: (mapping: FilamentMappingStatus) =>
+      api(
+        `/workflows/${workflowId}/material-mappings/${encodeURIComponent(
+          mapping.cloud_filament_id,
+        )}/confirm`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            proposed_profile_id: mapping.proposed_profile_id,
+            proposed_profile_digest: mapping.proposed_profile_digest,
+          }),
+        },
+      ),
+    onSuccess: () =>
+      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
+  })
   const proposeMaterials = useMutation({
     mutationFn: () =>
       api(`/workflows/${workflowId}/material-assignment`, { method: 'POST' }),
@@ -1562,6 +1601,9 @@ function SlicingWorkspace({
     ...(data.cloud_snapshot?.ams_units.flatMap((unit) => unit.trays) ?? []),
     ...(data.cloud_snapshot?.external_trays ?? []),
   ]
+  const materialMappings = new Map(
+    data.material_mappings.map((item) => [item.cloud_filament_id, item]),
+  )
 
   return (
     <main className="slicing-workspace">
@@ -1667,33 +1709,88 @@ function SlicingWorkspace({
                   observed {new Date(data.cloud_snapshot.observed_at).toLocaleString()}
                 </p>
                 <div className="observed-tray-grid">
-                  {cloudTrays.map((tray) => (
-                    <div key={tray.slot_id}>
-                      <strong>{tray.slot_id}</strong>
-                      <span className="observed-tray-material">
-                        {tray.color && (
-                          <span
-                            aria-label={`Filament color ${tray.color}`}
-                            className="observed-tray-color"
-                            style={{ background: tray.color }}
-                          />
+                  {cloudTrays.map((tray) => {
+                    const mapping = tray.material_profile_id
+                      ? materialMappings.get(tray.material_profile_id)
+                      : undefined
+                    return (
+                      <div key={tray.slot_id}>
+                        <strong>{tray.slot_id}</strong>
+                        <span className="observed-tray-material">
+                          {tray.color && (
+                            <span
+                              aria-label={`Filament color ${tray.color}`}
+                              className="observed-tray-color"
+                              style={{ background: tray.color }}
+                            />
+                          )}
+                          {tray.material ?? 'Empty'}
+                          {tray.color ? ` · ${tray.color}` : ''}
+                        </span>
+                        {tray.material_profile_id && (
+                          <small>
+                            {tray.material_profile_id} →{' '}
+                            {mapping?.selected_profile_id ??
+                              mapping?.proposed_profile_id ??
+                              'Unmapped'}
+                          </small>
                         )}
-                        {tray.material ?? 'Empty'}
-                        {tray.color ? ` · ${tray.color}` : ''}
+                        {tray.material && tray.estimated_remaining_g !== null ? (
+                          <small>
+                            {tray.remain_percentage}% · ~{tray.estimated_remaining_g} g
+                          </small>
+                        ) : tray.material ? (
+                          <small>Quantity unavailable · excluded from assignment</small>
+                        ) : null}
+                      </div>
+                    )
+                  })}
+                </div>
+                <div className="filament-mapping-grid">
+                  {data.material_mappings.map((mapping) => (
+                    <div key={mapping.cloud_filament_id}>
+                      <strong>
+                        {mapping.cloud_filament_id} ·{' '}
+                        {mapping.state.replaceAll('_', ' ')}
+                      </strong>
+                      <span>
+                        {mapping.selected_profile_id ??
+                          mapping.proposed_profile_id ??
+                          'No installed preset'}
                       </span>
-                      {tray.material && tray.estimated_remaining_g !== null ? (
-                        <small>
-                          {tray.remain_percentage}% · ~{tray.estimated_remaining_g} g
-                        </small>
-                      ) : tray.material ? (
-                        <small>Quantity unavailable · excluded from assignment</small>
-                      ) : null}
+                      <small>{mapping.slots.join(', ')}</small>
+                      <small>{mapping.reason}</small>
+                      {['confirmation_required', 'upgrade_available'].includes(
+                        mapping.state,
+                      ) &&
+                        [
+                          'approved',
+                          'slice_setup',
+                          'awaiting_material_review',
+                          'slice_failed',
+                          'awaiting_slice_review',
+                        ].includes(workflow.state) &&
+                        mapping.proposed_profile_id &&
+                        mapping.proposed_profile_digest && (
+                          <button
+                            className="secondary-action"
+                            disabled={confirmMapping.isPending}
+                            onClick={() => confirmMapping.mutate(mapping)}
+                          >
+                            {mapping.state === 'upgrade_available'
+                              ? 'Confirm exact-profile upgrade'
+                              : 'Confirm reusable generic mapping'}
+                          </button>
+                        )}
                     </div>
                   ))}
                 </div>
                 {data.cloud_snapshot.warnings.map((warning) => (
                   <p className="part-warning" key={warning}>{warning}</p>
                 ))}
+                {confirmMapping.error && (
+                  <p className="error-copy">{confirmMapping.error.message}</p>
+                )}
               </>
             ) : (
               <p>No immutable cloud observation has been captured.</p>
@@ -1718,17 +1815,25 @@ function SlicingWorkspace({
           <section className="slice-step-card">
             <span className="section-label">3 · Material assignment</span>
             {!data.material_assignment ? (
-              <button
-                className="primary-action"
-                disabled={
-                  workflow.state !== 'slice_setup' || proposeMaterials.isPending
-                }
-                onClick={() => proposeMaterials.mutate()}
-              >
-                {proposeMaterials.isPending
-                  ? 'Matching observed materials…'
-                  : 'Recommend compatible trays'}
-              </button>
+              <>
+                {data.material_assignment_stale && (
+                  <p className="part-warning">
+                    The previous assignment uses an outdated filament mapping. Refresh H2D &amp;
+                    AMS, then recommend materials again.
+                  </p>
+                )}
+                <button
+                  className="primary-action"
+                  disabled={
+                    workflow.state !== 'slice_setup' || proposeMaterials.isPending
+                  }
+                  onClick={() => proposeMaterials.mutate()}
+                >
+                  {proposeMaterials.isPending
+                    ? 'Matching observed materials…'
+                    : 'Recommend compatible trays'}
+                </button>
+              </>
             ) : (
               <>
                 <div className="slice-material-table">

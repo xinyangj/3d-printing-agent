@@ -241,6 +241,14 @@ class MaterialDefinitionSpec(FrozenModel):
     slicer_profile_dependency_digests: dict[str, str] = Field(
         default_factory=dict
     )
+    mapping_origin: Literal[
+        "manual",
+        "studio_exact",
+        "generic_confirmed",
+    ] = "manual"
+    source_cloud_filament_id: str | None = Field(default=None, max_length=100)
+    source_profile_id: str | None = Field(default=None, max_length=300)
+    source_profile_match: Literal["exact", "generic"] | None = None
 
     @property
     def assignment_color(self) -> str:
@@ -256,6 +264,24 @@ class MaterialDefinitionSpec(FrozenModel):
             raise ValueError(
                 "Filament profile identifier must be an installed preset name"
             )
+        if self.mapping_origin == "manual":
+            return self
+        if (
+            not self.source_cloud_filament_id
+            or not self.source_profile_id
+            or self.source_profile_match is None
+            or self.source_cloud_filament_id not in self.cloud_filament_ids
+            or self.source_profile_id != self.slicer_filament_profile_id
+        ):
+            raise ValueError("Automatic material mapping provenance is incomplete")
+        if (
+            self.mapping_origin == "studio_exact"
+            and self.source_profile_match != "exact"
+        ) or (
+            self.mapping_origin == "generic_confirmed"
+            and self.source_profile_match != "generic"
+        ):
+            raise ValueError("Automatic material mapping provenance is inconsistent")
         return self
 
 

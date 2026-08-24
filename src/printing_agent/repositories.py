@@ -35,6 +35,7 @@ from printing_agent.errors import ConflictError, NotFoundError
 from printing_agent.fabrication import (
     MaterialAssignment,
     MaterialDefinitionRevision,
+    MaterialDefinitionSpec,
     PhysicalSpool,
     PrinterProfileRevision,
     SlicedArtifact,
@@ -2949,12 +2950,50 @@ class WorkflowRepository:
         material: MaterialDefinitionRevision,
         *,
         enabled: bool = True,
+        disable_material_ids: set[str] | None = None,
+        disable_cloud_filament_ids: set[str] | None = None,
     ) -> None:
         if material.digest is None:
             raise ValueError("Material definition revision requires a digest")
         db = await self._connect()
         try:
             await db.execute("BEGIN IMMEDIATE")
+            disabled = set(disable_material_ids or set())
+            if disable_cloud_filament_ids:
+                cursor = await db.execute(
+                    """
+                    SELECT m.id, r.payload_json
+                    FROM material_definitions m
+                    JOIN material_definition_revisions r
+                      ON r.material_id = m.id AND r.revision = m.active_revision
+                    WHERE m.enabled = 1 AND m.archived_at IS NULL
+                    """
+                )
+                for row in await cursor.fetchall():
+                    definition = MaterialDefinitionRevision.model_validate_json(
+                        row["payload_json"]
+                    )
+                    if (
+                        definition.material_id != material.material_id
+                        and definition.spec.cloud_filament_ids
+                        & disable_cloud_filament_ids
+                    ):
+                        disabled.add(definition.material_id)
+            for material_id in sorted(disabled):
+                if material_id == material.material_id:
+                    continue
+                await db.execute(
+                    """
+                    UPDATE material_definitions
+                    SET enabled = 0, archived_at = ?, updated_at = ?
+                    WHERE id = ? AND enabled = 1
+                    """,
+                    (
+                        utc_now().isoformat(),
+                        utc_now().isoformat(),
+                        material_id,
+                    ),
+                )
             await db.execute(
                 """
                 INSERT INTO material_definitions (
@@ -2995,6 +3034,32 @@ class WorkflowRepository:
         finally:
             await db.close()
 
+    async def disable_material_definitions(
+        self,
+        material_ids: set[str],
+    ) -> None:
+        if not material_ids:
+            return
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            now = utc_now().isoformat()
+            for material_id in sorted(material_ids):
+                await db.execute(
+                    """
+                    UPDATE material_definitions
+                    SET enabled = 0, archived_at = ?, updated_at = ?
+                    WHERE id = ? AND enabled = 1
+                    """,
+                    (now, now, material_id),
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
     async def get_material_definition(
         self,
         material_id: str,
@@ -3028,6 +3093,137 @@ class WorkflowRepository:
             return MaterialDefinitionRevision.model_validate_json(
                 row["payload_json"]
             )
+        finally:
+            await db.close()
+
+    async def upsert_automatic_material_definition(
+        self,
+        material_id: str,
+        spec: MaterialDefinitionSpec,
+    ) -> MaterialDefinitionRevision:
+        if spec.mapping_origin == "manual":
+            raise ValueError("Automatic material upsert requires automatic provenance")
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT m.id, r.payload_json
+                FROM material_definitions m
+                JOIN material_definition_revisions r
+                  ON r.material_id = m.id AND r.revision = m.active_revision
+                WHERE m.enabled = 1 AND m.archived_at IS NULL
+                """
+            )
+            active = [
+                MaterialDefinitionRevision.model_validate_json(row["payload_json"])
+                for row in await cursor.fetchall()
+            ]
+            manual = [
+                item
+                for item in active
+                if item.spec.mapping_origin == "manual"
+                and item.spec.cloud_filament_ids & spec.cloud_filament_ids
+            ]
+            if len(manual) > 1:
+                raise ConflictError(
+                    "Multiple manual material mappings claim this cloud filament ID"
+                )
+            if manual:
+                winner = manual[0]
+                now = utc_now().isoformat()
+                for item in active:
+                    if (
+                        item.material_id != winner.material_id
+                        and item.spec.mapping_origin != "manual"
+                        and item.spec.cloud_filament_ids & spec.cloud_filament_ids
+                    ):
+                        await db.execute(
+                            """
+                            UPDATE material_definitions
+                            SET enabled = 0, archived_at = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (now, now, item.material_id),
+                        )
+                await db.commit()
+                return winner
+
+            cursor = await db.execute(
+                """
+                SELECT r.payload_json
+                FROM material_definitions m
+                JOIN material_definition_revisions r
+                  ON r.material_id = m.id AND r.revision = m.active_revision
+                WHERE m.id = ?
+                """,
+                (material_id,),
+            )
+            row = await cursor.fetchone()
+            current = (
+                MaterialDefinitionRevision.model_validate_json(row["payload_json"])
+                if row is not None
+                else None
+            )
+            if current is not None and current.spec.mapping_origin == "manual":
+                raise ConflictError(
+                    f"Material ID '{material_id}' is reserved by a manual mapping"
+                )
+            now = utc_now()
+            if current is not None and current.spec == spec:
+                await db.execute(
+                    """
+                    UPDATE material_definitions
+                    SET enabled = 1, archived_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now.isoformat(), material_id),
+                )
+                await db.commit()
+                return current
+            material = MaterialDefinitionRevision(
+                material_id=material_id,
+                revision=(current.revision + 1 if current else 1),
+                spec=spec,
+                created_at=now,
+            ).with_digest()
+            await db.execute(
+                """
+                INSERT INTO material_definitions (
+                    id, active_revision, enabled, created_at, updated_at
+                ) VALUES (?, ?, 1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    active_revision = excluded.active_revision,
+                    enabled = 1,
+                    archived_at = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    material.material_id,
+                    material.revision,
+                    material.created_at.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            await db.execute(
+                """
+                INSERT INTO material_definition_revisions (
+                    material_id, revision, digest, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    material.material_id,
+                    material.revision,
+                    material.digest,
+                    material.model_dump_json(),
+                    material.created_at.isoformat(),
+                ),
+            )
+            await db.commit()
+            return material
+        except Exception:
+            await db.rollback()
+            raise
         finally:
             await db.close()
 

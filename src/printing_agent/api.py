@@ -99,6 +99,11 @@ class BindCloudDeviceRequest(BaseModel):
     device_ref: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
+class ConfirmFilamentMappingRequest(BaseModel):
+    proposed_profile_id: str = Field(min_length=1, max_length=300)
+    proposed_profile_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
 class ApproveArtifactRequest(BaseModel):
     artifact_version: int = Field(ge=1)
     manifest_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -415,6 +420,34 @@ def create_app(container: Container | None = None) -> FastAPI:
             != cloud_snapshot.digest
         ):
             material_assignment = None
+        material_assignment_stale = False
+        if material_assignment is not None:
+            active_materials = {
+                (item.material_id, item.revision): item.digest
+                for item in await container.repository.list_material_definitions()
+            }
+            if any(
+                active_materials.get(
+                    (assignment.material_id, assignment.material_revision)
+                )
+                != assignment.material_digest
+                for assignment in material_assignment.assignments
+            ):
+                material_assignment_stale = True
+                material_assignment = None
+        material_mappings = []
+        if cloud_snapshot is not None and printer_snapshot is not None:
+            profile = await container.repository.get_printer_profile(
+                printer_snapshot.profile_id,
+                printer_snapshot.profile_revision,
+            )
+            material_mappings = [
+                item.model_dump(mode="json")
+                for item in await container.application.material_mapping_statuses(
+                    profile,
+                    cloud_snapshot,
+                )
+            ]
         if slice_job is not None and slice_job.status.value == "ready":
             try:
                 sliced_artifact = await container.repository.get_sliced_artifact(
@@ -488,6 +521,7 @@ def create_app(container: Container | None = None) -> FastAPI:
                 if material_assignment is not None
                 else None
             ),
+            "material_assignment_stale": material_assignment_stale,
             "slice_job": (
                 slice_job.model_dump(mode="json")
                 if slice_job is not None
@@ -511,6 +545,7 @@ def create_app(container: Container | None = None) -> FastAPI:
                 if cloud_snapshot is not None
                 else None
             ),
+            "material_mappings": material_mappings,
         }
 
     @app.get("/api/v1/health")
@@ -976,6 +1011,55 @@ def create_app(container: Container | None = None) -> FastAPI:
         values = await get_container(request).repository.list_material_definitions()
         return [item.model_dump(mode="json") for item in values]
 
+    @app.get("/api/v1/material-mappings")
+    async def list_material_mappings(request: Request) -> list[dict[str, object]]:
+        values = await get_container(request).repository.list_material_definitions()
+        return [item.model_dump(mode="json") for item in values]
+
+    @app.get(
+        "/api/v1/workflows/{workflow_id}/material-mappings"
+    )
+    async def workflow_material_mappings(
+        workflow_id: str,
+        request: Request,
+    ) -> list[dict[str, object]]:
+        container = get_container(request)
+        printer_snapshot = await container.repository.get_workflow_printer_snapshot(
+            workflow_id
+        )
+        profile = await container.repository.get_printer_profile(
+            printer_snapshot.profile_id,
+            printer_snapshot.profile_revision,
+        )
+        snapshot = await container.repository.get_latest_cloud_device_snapshot(
+            workflow_id
+        )
+        return [
+            item.model_dump(mode="json")
+            for item in await container.application.material_mapping_statuses(
+                profile,
+                snapshot,
+            )
+        ]
+
+    @app.post(
+        "/api/v1/workflows/{workflow_id}/material-mappings/{cloud_filament_id}/confirm",
+        status_code=201,
+    )
+    async def confirm_material_mapping(
+        workflow_id: str,
+        cloud_filament_id: str,
+        body: ConfirmFilamentMappingRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        material = await get_container(request).application.confirm_material_mapping(
+            workflow_id,
+            cloud_filament_id,
+            body.proposed_profile_id,
+            body.proposed_profile_digest,
+        )
+        return material.model_dump(mode="json")
+
     @app.post("/api/v1/materials/{material_id}", status_code=201)
     async def save_material(
         material_id: str,
@@ -1020,7 +1104,10 @@ def create_app(container: Container | None = None) -> FastAPI:
             revision=revision,
             spec=body,
         ).with_digest()
-        await repository.save_material_definition(material)
+        await repository.save_material_definition(
+            material,
+            disable_cloud_filament_ids=body.cloud_filament_ids,
+        )
         return material.model_dump(mode="json")
 
     @app.post(
