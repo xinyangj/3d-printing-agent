@@ -1552,18 +1552,48 @@ select:focus {
 }
 
 .slice-material-table > div {
-  align-items: center;
+  align-items: start;
   background: var(--canvas);
   display: grid;
   font-size: 11px;
   gap: 6px 10px;
-  grid-template-columns: 16px minmax(100px, 0.7fr) 1fr;
+  grid-template-columns: 16px minmax(0, 1fr);
   padding: 10px;
+}
+
+.slice-material-table .part-color {
+  align-self: start;
+  grid-column: 1;
+  grid-row: 1 / span 4;
+  margin-top: 2px;
+}
+
+.slice-material-table > div > strong,
+.slice-material-table > div > span:not(.part-color),
+.slice-material-table > div > select,
+.slice-material-table > div > small {
+  grid-column: 2;
+  min-width: 0;
+}
+
+.slice-material-table > div > span:not(.part-color),
+.slice-material-table > div > small {
+  overflow-wrap: anywhere;
+}
+
+.slice-material-table > div > select {
+  box-sizing: border-box;
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  padding-right: 38px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
 }
 
 .slice-material-table small {
   color: var(--muted);
-  grid-column: 2 / -1;
 }
 
 .slice-review-preview {
