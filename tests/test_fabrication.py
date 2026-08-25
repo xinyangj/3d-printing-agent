@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+from datetime import timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -113,6 +114,7 @@ class ReadySlicer:
 class StaticInventoryProvider:
     def __init__(self, snapshot: CloudDeviceSnapshot) -> None:
         self.value = snapshot
+        self.snapshot_calls = 0
 
     async def validate_token(self, access_token: str, region: str):
         del access_token, region
@@ -123,6 +125,7 @@ class StaticInventoryProvider:
 
     async def snapshot(self, device_id: str):
         assert device_id == self.value.device.device_id
+        self.snapshot_calls += 1
         return self.value.model_copy(update={"id": new_id()})
 
 
@@ -474,17 +477,28 @@ async def test_cloud_snapshot_drives_material_review(
     )
     application = object.__new__(PrintingApplication)
     application.repository = repository
-    application.inventory = StaticInventoryProvider(cloud_snapshot)
+    expired_source = cloud_snapshot.model_copy(
+        update={
+            "observed_at": cloud_snapshot.observed_at - timedelta(minutes=2),
+            "expires_at": cloud_snapshot.observed_at - timedelta(minutes=1),
+        }
+    )
+    inventory = StaticInventoryProvider(expired_source)
+    application.inventory = inventory
     application.material_assignment = MaterialAssignmentService(
         DeterministicAssignmentAgent()  # type: ignore[arg-type]
     )
 
     observed = await application.refresh_cloud_snapshot(workflow.id)
+    inventory.value = cloud_snapshot
     assignment = await application.propose_material_assignment(workflow.id)
+    calls_after_assignment = inventory.snapshot_calls
     refreshed = await application.refresh_cloud_snapshot(workflow.id)
 
     assert observed.digest == cloud_snapshot.digest
     assert assignment.cloud_snapshot_digest == cloud_snapshot.digest
+    assert assignment.cloud_snapshot_id != observed.id
+    assert calls_after_assignment == 2
     assert assignment.requires_confirmation is True
     assert assignment.assignments[0].slot_id == "ams1_1"
     assert assignment.candidate_options["body"][0].remaining_weight_g == 800

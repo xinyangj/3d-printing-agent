@@ -2128,8 +2128,8 @@ class PrintingApplication:
             await self.repository.get_latest_cloud_device_snapshot(workflow_id)
         )
         if fabrication_utc_now() >= cloud_snapshot.expires_at:
-            raise ConflictError(
-                "Cloud inventory snapshot expired; refresh it before assigning materials"
+            cloud_snapshot = await self.refresh_cloud_snapshot(
+                workflow_id,
             )
         spools, materials = await self._observed_cloud_spools(
             profile,

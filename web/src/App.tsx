@@ -1528,15 +1528,6 @@ function SlicingWorkspace({
     onSuccess: () =>
       void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
   })
-  const refreshCloud = useMutation({
-    mutationFn: () =>
-      api(`/workflows/${workflowId}/cloud-snapshot`, {
-        method: 'POST',
-        body: JSON.stringify({ device_id: null }),
-      }),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
-  })
   const confirmMapping = useMutation({
     mutationFn: (mapping: FilamentMappingStatus) =>
       api(
@@ -1551,14 +1542,18 @@ function SlicingWorkspace({
           }),
         },
       ),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
+    onSuccess: () => {
+      setMaterialOverrides({})
+      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
+    },
   })
   const proposeMaterials = useMutation({
     mutationFn: () =>
       api(`/workflows/${workflowId}/material-assignment`, { method: 'POST' }),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
+    onSuccess: () => {
+      setMaterialOverrides({})
+      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
+    },
   })
   const confirmMaterials = useMutation({
     mutationFn: () =>
@@ -1585,6 +1580,26 @@ function SlicingWorkspace({
       void queryClient.invalidateQueries({ queryKey: ['workflows'] })
     },
   })
+  const refreshCloud = useMutation({
+    mutationFn: () =>
+      api(`/workflows/${workflowId}/cloud-snapshot`, {
+        method: 'POST',
+        body: JSON.stringify({ device_id: null }),
+      }),
+    onSuccess: () => {
+      setMaterialOverrides({})
+      confirmMapping.reset()
+      proposeMaterials.reset()
+      confirmMaterials.reset()
+      slice.reset()
+      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
+    },
+  })
+  const materialOperationPending =
+    confirmMapping.isPending ||
+    proposeMaterials.isPending ||
+    confirmMaterials.isPending ||
+    slice.isPending
 
   if (workflowQuery.isLoading) {
     return <div className="center-message">Loading slicing workspace…</div>
@@ -1774,7 +1789,7 @@ function SlicingWorkspace({
                         mapping.proposed_profile_digest && (
                           <button
                             className="secondary-action"
-                            disabled={confirmMapping.isPending}
+                            disabled={confirmMapping.isPending || refreshCloud.isPending}
                             onClick={() => confirmMapping.mutate(mapping)}
                           >
                             {mapping.state === 'upgrade_available'
@@ -1804,7 +1819,7 @@ function SlicingWorkspace({
             ].includes(workflow.state) && (
               <button
                 className="primary-action"
-                disabled={refreshCloud.isPending}
+                disabled={refreshCloud.isPending || materialOperationPending}
                 onClick={() => refreshCloud.mutate()}
               >
                 {refreshCloud.isPending ? 'Refreshing cloud state…' : 'Refresh H2D & AMS'}
@@ -1825,7 +1840,9 @@ function SlicingWorkspace({
                 <button
                   className="primary-action"
                   disabled={
-                    workflow.state !== 'slice_setup' || proposeMaterials.isPending
+                    workflow.state !== 'slice_setup' ||
+                    proposeMaterials.isPending ||
+                    refreshCloud.isPending
                   }
                   onClick={() => proposeMaterials.mutate()}
                 >
@@ -1833,6 +1850,9 @@ function SlicingWorkspace({
                     ? 'Matching observed materials…'
                     : 'Recommend compatible trays'}
                 </button>
+                <small>
+                  Expired H2D and AMS inventory is refreshed automatically before matching.
+                </small>
               </>
             ) : (
               <>
@@ -1898,7 +1918,7 @@ function SlicingWorkspace({
                 ) : (
                   <button
                     className="primary-action"
-                    disabled={confirmMaterials.isPending}
+                    disabled={confirmMaterials.isPending || refreshCloud.isPending}
                     onClick={() => confirmMaterials.mutate()}
                   >
                     Confirm materials &amp; 15% margin
@@ -1930,7 +1950,7 @@ function SlicingWorkspace({
               ) && (
                 <button
                   className="primary-action"
-                  disabled={slice.isPending}
+                  disabled={slice.isPending || refreshCloud.isPending}
                   onClick={() => slice.mutate()}
                 >
                   {slice.isPending ? 'Requesting slice…' : 'Slice in Bambu Studio'}
