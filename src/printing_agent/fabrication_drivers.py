@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import re
 import shutil
 import zipfile
@@ -228,9 +229,17 @@ class BambuStudioCliDriver:
                 raise ExternalServiceError("Bambu Studio slicing timed out") from exc
             log_path.write_bytes(output[-2_000_000:])
             if process.returncode != 0:
+                returncode = self._normalized_returncode(process.returncode)
+                detail = output.decode(errors="replace")[-4_000:].strip()
+                if not detail:
+                    detail = f"process exited with code {returncode}"
+                    if returncode == -2:
+                        detail += (
+                            "; Bambu Studio single-instance handling may have "
+                            "blocked the CLI process"
+                        )
                 raise ValidationError(
-                    "Bambu Studio slicing failed: "
-                    + output.decode(errors="replace")[-4_000:]
+                    "Bambu Studio slicing failed: " + detail
                 )
             self._raise_if_cancelled(request.job.id)
             output_size = await asyncio.to_thread(
@@ -344,6 +353,12 @@ class BambuStudioCliDriver:
             if not (workspace / "slice-manifest.json").is_file():
                 shutil.rmtree(workspace, ignore_errors=True)
 
+    @staticmethod
+    def _normalized_returncode(returncode: int) -> int:
+        if os.name == "nt" and returncode >= 2**31:
+                return returncode - 2**32
+        return returncode
+
     async def cancel(self, slice_job_id: str) -> None:
         self._cancelled.add(slice_job_id)
         process = self._processes.get(slice_job_id)
@@ -369,6 +384,7 @@ class BambuStudioCliDriver:
         filament_paths: list[Path],
     ) -> list[str]:
         return [
+            "--no-single-instance",
             "--slice",
             "0",
             "--load-settings",

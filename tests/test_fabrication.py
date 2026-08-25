@@ -892,10 +892,18 @@ def test_bambu_cli_arguments_preserve_untrusted_paths_as_single_arguments(
         filament_paths=[filament],
     )
 
+    assert args[0] == "--no-single-instance"
     assert args[-1] == str(input_path)
     assert str(output_path) in args
     assert str(filament) in args
     assert "&" not in args
+
+
+def test_bambu_windows_returncode_normalization(monkeypatch) -> None:
+    monkeypatch.setattr("printing_agent.fabrication_drivers.os.name", "nt")
+
+    assert BambuStudioCliDriver._normalized_returncode(4294967294) == -2
+    assert BambuStudioCliDriver._normalized_returncode(1) == 1
 
 
 def test_sliced_3mf_requires_gcode_payload(tmp_path: Path) -> None:
