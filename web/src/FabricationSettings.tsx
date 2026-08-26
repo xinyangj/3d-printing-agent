@@ -492,13 +492,9 @@ export function FabricationSettings() {
                                 : 'No loaded filament'}
                           </small>
                         </>
-                      ) : (
-                        <small>
-                          {slotObservation.isFetching
-                            ? 'Reading live slot…'
-                            : 'Not observed in the latest snapshot'}
-                        </small>
-                      )}
+                      ) : !slotObservation.isFetching ? (
+                        <small>Not observed in the latest snapshot</small>
+                      ) : null}
                       <span className="slot-card-eligibility">{eligibility}</span>
                     </button>
                   )
