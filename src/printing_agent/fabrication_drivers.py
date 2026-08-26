@@ -75,6 +75,10 @@ class SlicerRegistry:
             ) from exc
 class BambuStudioCliDriver:
     id = "bambu_studio_cli"
+    _cli_error_messages = {
+        -2: "invalid command-line parameters",
+        -102: "G-code path entered an unprintable area",
+    }
 
     def __init__(
         self,
@@ -232,12 +236,10 @@ class BambuStudioCliDriver:
                 returncode = self._normalized_returncode(process.returncode)
                 detail = output.decode(errors="replace")[-4_000:].strip()
                 if not detail:
+                    reason = self._cli_error_messages.get(returncode)
                     detail = f"process exited with code {returncode}"
-                    if returncode == -2:
-                        detail += (
-                            "; Bambu Studio single-instance handling may have "
-                            "blocked the CLI process"
-                        )
+                    if reason:
+                        detail += f" ({reason})"
                 raise ValidationError(
                     "Bambu Studio slicing failed: " + detail
                 )
@@ -384,9 +386,8 @@ class BambuStudioCliDriver:
         filament_paths: list[Path],
     ) -> list[str]:
         return [
-            "--no-single-instance",
-            "--slice",
-            "0",
+            "--slice=0",
+            "--arrange=1",
             "--load-settings",
             f"{machine_path};{process_path}",
             "--load-filaments",
@@ -439,6 +440,15 @@ class BambuStudioCliDriver:
                 for item in filament_assignments
             ],
         }
+        if len(filament_assignments) <= 1:
+            settings["enable_prime_tower"] = "0"
+        else:
+            build_volume = request.printer.profile.build_volume
+            settings["enable_prime_tower"] = "1"
+            settings["wipe_tower_x"] = [
+                f"{max(15.0, build_volume.width_mm - 70.0):g}"
+            ]
+            settings["wipe_tower_y"] = ["20"]
         if overrides.layer_height_mm is not None:
             settings["layer_height"] = f"{overrides.layer_height_mm:g}"
         if overrides.infill_percent is not None:

@@ -892,7 +892,7 @@ def test_bambu_cli_arguments_preserve_untrusted_paths_as_single_arguments(
         filament_paths=[filament],
     )
 
-    assert args[0] == "--no-single-instance"
+    assert args[:2] == ["--slice=0", "--arrange=1"]
     assert args[-1] == str(input_path)
     assert str(output_path) in args
     assert str(filament) in args
@@ -1114,8 +1114,42 @@ async def test_bambu_native_settings_bind_single_right_tool_and_usage(
 
     assert settings["filament_map"] == ["2"]
     assert settings["filament_map_mode"] == "Manual"
+    assert settings["enable_prime_tower"] == "0"
     assert settings["curr_bed_type"] == "High Temp Plate"
     assert settings["nozzle_diameter"] == ["0.4", "0.4"]
+    cap_assignment = part_assignment.model_copy(
+        update={
+            "part_id": "cap",
+            "spool_id": "spool-blue",
+            "slot_id": "ams1_2",
+        }
+    )
+    multi_assignment = assignment.model_copy(
+        update={
+            "requests": [
+                *assignment.requests,
+                PartMaterialRequest(
+                    part_id="cap",
+                    part_name="Cap",
+                    requested_color="#0000FF",
+                ),
+            ],
+            "assignments": [part_assignment, cap_assignment],
+            "digest": None,
+        }
+    ).with_digest()
+    multi_settings = BambuStudioCliDriver._resolved_job_settings(
+        SliceRequest(
+            job=job,
+            artifact=artifact,
+            printer=snapshot,
+            material_assignment=multi_assignment,
+            workspace=tmp_path / "multi-slice",
+        )
+    )
+    assert multi_settings["enable_prime_tower"] == "1"
+    assert multi_settings["wipe_tower_x"] == ["280"]
+    assert multi_settings["wipe_tower_y"] == ["20"]
     assert BambuStudioCliDriver._filament_usage_by_spool(
         sliced_path,
         request,
