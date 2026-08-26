@@ -871,6 +871,10 @@ select:focus {
   gap: 7px;
 }
 
+.slot-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
 .slot-card {
   background: #f5f5ef;
   border: 1px solid var(--line);
@@ -879,6 +883,43 @@ select:focus {
   gap: 3px;
   padding: 10px;
   text-align: left;
+}
+
+.slot-card-material {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  overflow-wrap: anywhere;
+}
+
+.slot-card-material i {
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  flex: 0 0 auto;
+  height: 12px;
+  width: 12px;
+}
+
+.slot-card-eligibility {
+  font-weight: 700;
+  margin-top: 4px;
+}
+
+.slot-observation-actions {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.slot-observation-actions > div {
+  display: grid;
+  gap: 3px;
+}
+
+.slot-observation-actions small {
+  color: var(--muted);
 }
 
 .slot-card.forbidden {
@@ -1521,6 +1562,21 @@ select:focus {
   font-size: 11px;
   gap: 3px;
   padding: 9px;
+}
+
+.observed-tray-card.masked {
+  background: #fff0ec;
+  border: 1px solid #c85d4e;
+}
+
+.observed-tray-card.restricted:not(.masked) {
+  border: 1px solid #d39a45;
+}
+
+.tray-policy-badge {
+  color: #872e25 !important;
+  font-weight: 700;
+  margin-top: 4px;
 }
 
 .observed-tray-grid span,

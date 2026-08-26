@@ -397,6 +397,26 @@ class PrintingApplication:
         await self.synchronize_material_mappings(profile, snapshot)
         return profile
 
+    async def observe_slicing_profile_slots(
+        self,
+        profile_id: str,
+    ) -> tuple[
+        PrinterProfileRevision,
+        CloudDeviceSnapshot,
+        list[FilamentMappingStatus],
+    ]:
+        profile = await self.repository.get_printer_profile(profile_id)
+        device_id = profile.spec.cloud_device_serial
+        if not device_id:
+            raise ConflictError("Slicing profile has no bound cloud printer")
+        try:
+            snapshot = await self.inventory.snapshot(device_id)
+        except CloudInventoryError as exc:
+            raise ExternalServiceError(str(exc)) from exc
+        self._validate_cloud_snapshot(profile, snapshot)
+        mappings = await self.synchronize_material_mappings(profile, snapshot)
+        return profile, snapshot, mappings
+
     @staticmethod
     def _observed_material_slots(
         profile: PrinterProfileRevision,

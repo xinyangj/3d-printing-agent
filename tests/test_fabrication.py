@@ -707,6 +707,81 @@ def test_observed_topology_adds_second_ams_and_preserves_external_slots() -> Non
     assert restricted.part_forbidden_slot_ids == {}
 
 
+async def test_profile_slot_observation_is_ephemeral(
+    repository: WorkflowRepository,
+) -> None:
+    base = built_in_h2d_profile()
+    profile = base.model_copy(
+        update={
+            "spec": base.spec.model_copy(
+                update={
+                    "cloud_region": "global",
+                    "cloud_device_name": "Workshop H2D",
+                    "cloud_device_serial": "H2D-PRIVATE-SERIAL",
+                }
+            ),
+            "digest": None,
+        }
+    ).with_digest()
+    await repository.save_printer_profile(profile)
+    snapshot = parse_h2d_snapshot(
+        {
+            "print": {
+                "nozzles": [
+                    {"position": "left", "diameter": 0.4, "type": "HS01"},
+                    {"position": "right", "diameter": 0.4, "type": "HS01"},
+                ],
+                "ams": {
+                    "ams": [
+                        {
+                            "id": "0",
+                            "tray": [
+                                {
+                                    "id": "0",
+                                    "state": 11,
+                                    "tray_type": "PLA",
+                                    "tray_info_idx": "GFA00",
+                                    "tray_color": "307FE2FF",
+                                    "remain": 50,
+                                    "tray_weight": 1000,
+                                },
+                                *[
+                                    {"id": str(index), "state": 0}
+                                    for index in range(1, 4)
+                                ],
+                            ],
+                        }
+                    ],
+                    "vt_tray": [
+                        {"id": "254", "state": 0},
+                        {"id": "255", "state": 0},
+                    ],
+                },
+            }
+        },
+        DeviceSummary(
+            device_id="H2D-PRIVATE-SERIAL",
+            name="Workshop H2D",
+            model="H2D",
+            online=True,
+        ),
+    )
+    application = object.__new__(PrintingApplication)
+    application.repository = repository
+    application.inventory = StaticInventoryProvider(snapshot)
+
+    observed_profile, observed, mappings = (
+        await application.observe_slicing_profile_slots(profile.profile_id)
+    )
+
+    assert observed_profile.digest == profile.digest
+    assert observed.digest == snapshot.digest
+    assert mappings[0].cloud_filament_id == "GFA00"
+    async with aiosqlite.connect(repository.database_path) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM cloud_device_snapshots")
+        assert (await cursor.fetchone())[0] == 0
+
+
 async def test_fabrication_copy_upgrades_legacy_artifact_without_approval(
     repository: WorkflowRepository,
     tmp_path: Path,

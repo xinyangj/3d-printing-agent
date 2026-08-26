@@ -1006,6 +1006,26 @@ def create_app(container: Container | None = None) -> FastAPI:
         )
         return _masked_profile(profile)
 
+    @app.post(
+        "/api/v1/slicing-profiles/{profile_id}/cloud-observation"
+    )
+    async def observe_slicing_profile_slots(
+        profile_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        profile, snapshot, mappings = await get_container(
+            request
+        ).application.observe_slicing_profile_slots(profile_id)
+        return {
+            "profile_id": profile.profile_id,
+            "profile_revision": profile.revision,
+            "profile_digest": profile.digest,
+            "snapshot": snapshot.masked_dump(),
+            "material_mappings": [
+                item.model_dump(mode="json") for item in mappings
+            ],
+        }
+
     @app.get("/api/v1/materials")
     async def list_materials(request: Request) -> list[dict[str, object]]:
         values = await get_container(request).repository.list_material_definitions()

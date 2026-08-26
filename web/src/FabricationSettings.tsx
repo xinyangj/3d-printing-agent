@@ -49,7 +49,10 @@ type SlicingProfile = {
     }>
     plates: Array<{ id: string; name: string }>
     material_slots: Slot[]
-    default_slot_policy: { forbidden_slot_ids: string[] }
+    default_slot_policy: {
+      forbidden_slot_ids: string[]
+      allowed_slot_ids: string[] | null
+    }
     slicer: {
       driver_id: string
       machine_profile_id: string
@@ -77,6 +80,45 @@ type MaterialDefinition = {
     mapping_origin: 'manual' | 'studio_exact' | 'generic_confirmed'
     source_profile_id: string | null
   }
+}
+
+type ObservedTray = {
+  slot_id: string
+  material: string | null
+  material_profile_id: string | null
+  material_sub_brand: string | null
+  color: string | null
+  remain_percentage: number | null
+  estimated_remaining_g: number | null
+}
+
+type FilamentMappingStatus = {
+  cloud_filament_id: string
+  state:
+    | 'official_exact'
+    | 'manual'
+    | 'generic_confirmed'
+    | 'confirmation_required'
+    | 'upgrade_available'
+    | 'ambiguous'
+    | 'missing'
+  selected_profile_id: string | null
+  proposed_profile_id: string | null
+  reason: string
+}
+
+type ProfileSlotObservation = {
+  profile_id: string
+  profile_revision: number
+  profile_digest: string
+  snapshot: {
+    observed_at: string
+    expires_at: string
+    ams_units: Array<{ trays: ObservedTray[] }>
+    external_trays: ObservedTray[]
+    warnings: string[]
+  }
+  material_mappings: FilamentMappingStatus[]
 }
 
 export function FabricationSettings() {
@@ -123,6 +165,48 @@ export function FabricationSettings() {
     !(devices.data ?? []).some(
       (device) => device.device_ref === selectedProfile?.cloud_device_ref,
     )
+  const slotObservation = useQuery({
+    queryKey: [
+      'profile-slot-observation',
+      selectedProfile?.profile_id,
+      selectedProfile?.revision,
+      selectedProfile?.cloud_device_ref,
+    ],
+    queryFn: () =>
+      request<ProfileSlotObservation>(
+        `/slicing-profiles/${selectedProfile!.profile_id}/cloud-observation`,
+        { method: 'POST' },
+      ),
+    enabled:
+      credentials.data?.configured === true &&
+      Boolean(selectedProfile?.spec.cloud_device_serial) &&
+      !boundDeviceUnavailable,
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
+    retry: false,
+  })
+  const observedSlots = useMemo(
+    () =>
+      new Map(
+        [
+          ...(slotObservation.data?.snapshot.ams_units.flatMap(
+            (unit) => unit.trays,
+          ) ?? []),
+          ...(slotObservation.data?.snapshot.external_trays ?? []),
+        ].map((tray) => [tray.slot_id, tray]),
+      ),
+    [slotObservation.data],
+  )
+  const observedMappings = useMemo(
+    () =>
+      new Map(
+        (slotObservation.data?.material_mappings ?? []).map((mapping) => [
+          mapping.cloud_filament_id,
+          mapping,
+        ]),
+      ),
+    [slotObservation.data],
+  )
   const [profileJson, setProfileJson] = useState('')
 
   useEffect(() => {
@@ -138,6 +222,9 @@ export function FabricationSettings() {
       }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['slicing-profiles'] })
+      await queryClient.invalidateQueries({
+        queryKey: ['profile-slot-observation'],
+      })
     },
   })
   const bindDevice = useMutation({
@@ -148,6 +235,9 @@ export function FabricationSettings() {
       }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['slicing-profiles'] })
+      await queryClient.invalidateQueries({
+        queryKey: ['profile-slot-observation'],
+      })
     },
   })
   const saveMaterial = useMutation({
@@ -190,8 +280,16 @@ export function FabricationSettings() {
   const toggleForbidden = (slotId: string) => {
     if (!selectedProfile) return
     const forbidden = new Set(selectedProfile.spec.default_slot_policy.forbidden_slot_ids)
-    if (forbidden.has(slotId)) forbidden.delete(slotId)
-    else forbidden.add(slotId)
+    const allowedValue = selectedProfile.spec.default_slot_policy.allowed_slot_ids
+    const allowed = allowedValue === null ? null : new Set(allowedValue)
+    const masked = forbidden.has(slotId) || (allowed !== null && !allowed.has(slotId))
+    if (masked) {
+      forbidden.delete(slotId)
+      allowed?.add(slotId)
+    } else {
+      forbidden.add(slotId)
+      allowed?.delete(slotId)
+    }
     saveProfile.mutate({
       ...selectedProfile,
       spec: {
@@ -199,6 +297,7 @@ export function FabricationSettings() {
         default_slot_policy: {
           ...selectedProfile.spec.default_slot_policy,
           forbidden_slot_ids: [...forbidden],
+          allowed_slot_ids: allowed === null ? null : [...allowed],
         },
       },
     })
@@ -283,22 +382,121 @@ export function FabricationSettings() {
               >
                 Bind selected device in a new profile revision
               </button>
+              <div className="slot-observation-actions">
+                <div>
+                  <strong>Live slot observation</strong>
+                  <small>
+                    {slotObservation.data
+                      ? `Observed ${new Date(
+                          slotObservation.data.snapshot.observed_at,
+                        ).toLocaleString()}`
+                      : slotObservation.isFetching
+                        ? 'Reading H2D and AMS slots…'
+                        : 'No live observation loaded.'}
+                  </small>
+                </div>
+                <button
+                  className="secondary-action"
+                  disabled={
+                    !selectedProfile.spec.cloud_device_serial ||
+                    boundDeviceUnavailable ||
+                    slotObservation.isFetching
+                  }
+                  onClick={() => void slotObservation.refetch()}
+                >
+                  {slotObservation.isFetching ? 'Refreshing slots…' : 'Refresh slots'}
+                </button>
+              </div>
+              {slotObservation.error && (
+                <p className="part-warning">{slotObservation.error.message}</p>
+              )}
               <div className="slot-grid">
                 {selectedProfile.spec.material_slots.map((slot) => {
                   const forbidden =
                     selectedProfile.spec.default_slot_policy.forbidden_slot_ids.includes(
                       slot.id,
-                    )
+                    ) ||
+                    (selectedProfile.spec.default_slot_policy.allowed_slot_ids !==
+                      null &&
+                      !selectedProfile.spec.default_slot_policy.allowed_slot_ids.includes(
+                        slot.id,
+                      ))
+                  const observed = observedSlots.get(slot.id)
+                  const mapping = observed?.material_profile_id
+                    ? observedMappings.get(observed.material_profile_id)
+                    : undefined
+                  const mappingUsable = [
+                    'official_exact',
+                    'manual',
+                    'generic_confirmed',
+                  ].includes(mapping?.state ?? '') ||
+                    (mapping?.state === 'upgrade_available' &&
+                      Boolean(mapping.selected_profile_id))
+                  const eligibility = forbidden
+                    ? 'Forbidden by profile'
+                    : !observed
+                      ? 'Not observed'
+                      : !observed.material
+                        ? 'Empty'
+                        : !mappingUsable
+                          ? 'Excluded · filament profile unmapped'
+                          : !observed.estimated_remaining_g ||
+                              observed.estimated_remaining_g <= 0
+                            ? 'Excluded · quantity unavailable'
+                            : 'Allowed · available for assignment'
                   return (
                     <button
                       key={slot.id}
                       className={`slot-card ${forbidden ? 'forbidden' : ''}`}
                       disabled={saveProfile.isPending}
                       onClick={() => toggleForbidden(slot.id)}
+                      aria-label={`${slot.name}. ${eligibility}. Click to ${
+                        forbidden ? 'allow' : 'forbid'
+                      } this slot.`}
                     >
                       <strong>{slot.name}</strong>
-                      <small>Observed state appears in the slicing workspace</small>
-                      <span>{forbidden ? 'Forbidden for assignment' : 'Allowed for assignment'}</span>
+                      <small>
+                        {slot.id} · {slot.system.toUpperCase()}
+                      </small>
+                      {observed ? (
+                        <>
+                          <span className="slot-card-material">
+                            {observed.color && (
+                              <i
+                                aria-label={`Filament color ${observed.color}`}
+                                style={{ background: observed.color }}
+                              />
+                            )}
+                            {observed.material ?? 'Empty'}
+                            {observed.material_sub_brand
+                              ? ` · ${observed.material_sub_brand}`
+                              : ''}
+                            {observed.color ? ` · ${observed.color}` : ''}
+                          </span>
+                          {observed.material_profile_id && (
+                            <small>
+                              {observed.material_profile_id} →{' '}
+                              {mapping?.selected_profile_id ??
+                                mapping?.proposed_profile_id ??
+                                'Unmapped'}
+                            </small>
+                          )}
+                          <small>
+                            {observed.estimated_remaining_g !== null
+                              ? `${observed.remain_percentage}% · ~${observed.estimated_remaining_g} g`
+                              : observed.material
+                                ? 'Quantity unavailable'
+                                : 'No loaded filament'}
+                          </small>
+                        </>
+                      ) : (
+                        <small>
+                          {slotObservation.isFetching
+                            ? 'Reading live slot…'
+                            : 'Not observed in the latest snapshot'}
+                        </small>
+                      )}
+                      <span className="slot-card-eligibility">{eligibility}</span>
                     </button>
                   )
                 })}

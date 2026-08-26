@@ -130,6 +130,8 @@ type WorkflowResponse = {
     resolved_slot_policy: {
       forbidden_slot_ids: string[]
       allowed_slot_ids: string[] | null
+      part_allowed_slot_ids: Record<string, string[]>
+      part_forbidden_slot_ids: Record<string, string[]>
     }
   } | null
   material_assignment: MaterialAssignmentPayload | null
@@ -1786,8 +1788,31 @@ function SlicingWorkspace({
                     const mapping = tray.material_profile_id
                       ? materialMappings.get(tray.material_profile_id)
                       : undefined
+                    const policy = data.printer_snapshot?.resolved_slot_policy
+                    const globallyMasked = Boolean(
+                      policy &&
+                        (policy.forbidden_slot_ids.includes(tray.slot_id) ||
+                          (policy.allowed_slot_ids !== null &&
+                            !policy.allowed_slot_ids.includes(tray.slot_id))),
+                    )
+                    const partRestricted =
+                      Object.values(policy?.part_forbidden_slot_ids ?? {}).some(
+                        (slots) => slots.includes(tray.slot_id),
+                      ) ||
+                      Object.values(policy?.part_allowed_slot_ids ?? {}).some(
+                        (slots) => !slots.includes(tray.slot_id),
+                      )
                     return (
-                      <div key={tray.slot_id}>
+                      <div
+                        className={[
+                          'observed-tray-card',
+                          globallyMasked ? 'masked' : '',
+                          partRestricted ? 'restricted' : '',
+                        ]
+                          .filter(Boolean)
+                          .join(' ')}
+                        key={tray.slot_id}
+                      >
                         <strong>{tray.slot_id}</strong>
                         <span className="observed-tray-material">
                           {tray.color && (
@@ -1815,6 +1840,16 @@ function SlicingWorkspace({
                         ) : tray.material ? (
                           <small>Quantity unavailable · excluded from assignment</small>
                         ) : null}
+                        {globallyMasked && (
+                          <span className="tray-policy-badge">
+                            Masked for this workflow · excluded from material assignment
+                          </span>
+                        )}
+                        {!globallyMasked && partRestricted && (
+                          <span className="tray-policy-badge">
+                            Restricted for one or more parts
+                          </span>
+                        )}
                       </div>
                     )
                   })}
