@@ -432,18 +432,21 @@ export function FabricationSettings() {
                   ].includes(mapping?.state ?? '') ||
                     (mapping?.state === 'upgrade_available' &&
                       Boolean(mapping.selected_profile_id))
-                  const eligibility = forbidden
-                    ? 'Forbidden by profile'
-                    : !observed
-                      ? 'Not observed'
-                      : !observed.material
-                        ? 'Empty'
-                        : !mappingUsable
-                          ? 'Excluded · filament profile unmapped'
-                          : !observed.estimated_remaining_g ||
-                              observed.estimated_remaining_g <= 0
-                            ? 'Excluded · quantity unavailable'
-                            : 'Allowed · available for assignment'
+                  const eligibility =
+                    slotObservation.isFetching && !slotObservation.data
+                      ? 'Reading live slot…'
+                      : forbidden
+                        ? 'Forbidden by profile'
+                        : !observed
+                          ? 'Not observed'
+                          : !observed.material
+                            ? 'Empty'
+                            : !mappingUsable
+                              ? 'Excluded · filament profile unmapped'
+                              : !observed.estimated_remaining_g ||
+                                  observed.estimated_remaining_g <= 0
+                                ? 'Excluded · quantity unavailable'
+                                : 'Allowed · available for assignment'
                   return (
                     <button
                       key={slot.id}
