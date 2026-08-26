@@ -906,6 +906,23 @@ select:focus {
   margin-top: 4px;
 }
 
+.slot-card-toggle {
+  background: transparent;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  color: inherit;
+  font-size: 10px;
+  font-weight: 750;
+  justify-self: start;
+  margin-top: 6px;
+  min-height: 28px;
+  padding: 4px 8px;
+}
+
+.slot-card-toggle:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.05);
+}
+
 .slot-observation-actions {
   align-items: center;
   display: flex;

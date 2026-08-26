@@ -121,6 +121,15 @@ type ProfileSlotObservation = {
   material_mappings: FilamentMappingStatus[]
 }
 
+function slotDisplayName(slot: Slot): string {
+  if (slot.system !== 'ams') return slot.name
+  const match = /^ams(\d+)_(\d+)$/.exec(slot.id)
+  if (!match) return slot.name
+  const unit = Number(match[1])
+  if (unit < 1 || unit > 26) return slot.name
+  return `AMS-${String.fromCharCode(64 + unit)} slot ${match[2]}`
+}
+
 export function FabricationSettings() {
   const queryClient = useQueryClient()
   const localAccountManagement = useQuery({
@@ -412,6 +421,7 @@ export function FabricationSettings() {
               )}
               <div className="slot-grid">
                 {selectedProfile.spec.material_slots.map((slot) => {
+                  const displayName = slotDisplayName(slot)
                   const forbidden =
                     selectedProfile.spec.default_slot_policy.forbidden_slot_ids.includes(
                       slot.id,
@@ -448,16 +458,12 @@ export function FabricationSettings() {
                                 ? 'Excluded · quantity unavailable'
                                 : 'Allowed · available for assignment'
                   return (
-                    <button
+                    <article
                       key={slot.id}
                       className={`slot-card ${forbidden ? 'forbidden' : ''}`}
-                      disabled={saveProfile.isPending}
-                      onClick={() => toggleForbidden(slot.id)}
-                      aria-label={`${slot.name}. ${eligibility}. Click to ${
-                        forbidden ? 'allow' : 'forbid'
-                      } this slot.`}
+                      aria-label={`${displayName}. ${eligibility}.`}
                     >
-                      <strong>{slot.name}</strong>
+                      <strong>{displayName}</strong>
                       <small>
                         {slot.id} · {slot.system.toUpperCase()}
                       </small>
@@ -496,7 +502,15 @@ export function FabricationSettings() {
                         <small>Not observed in the latest snapshot</small>
                       ) : null}
                       <span className="slot-card-eligibility">{eligibility}</span>
-                    </button>
+                      <button
+                        type="button"
+                        className="slot-card-toggle"
+                        disabled={saveProfile.isPending}
+                        onClick={() => toggleForbidden(slot.id)}
+                      >
+                        {forbidden ? 'Allow slot' : 'Mask slot'}
+                      </button>
+                    </article>
                   )
                 })}
               </div>
