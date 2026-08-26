@@ -1526,6 +1526,8 @@ function SlicingWorkspace({
 }) {
   const queryClient = useQueryClient()
   const [materialOverrides, setMaterialOverrides] = useState<Record<string, string>>({})
+  const [submissionNotice, setSubmissionNotice] = useState(false)
+  const preparationAttempted = useRef(false)
   const workflowQuery = useQuery({
     queryKey: ['workflow', workflowId],
     queryFn: () => api<WorkflowResponse>(`/workflows/${workflowId}`),
@@ -1540,6 +1542,17 @@ function SlicingWorkspace({
   const data = workflowQuery.data
   const workflow = data?.workflow
   const artifact = data?.artifact
+  const prepareMaterials = useMutation({
+    mutationFn: () =>
+      api<WorkflowResponse>(`/workflows/${workflowId}/prepare-slicing-materials`, {
+        method: 'POST',
+      }),
+    onSuccess: (prepared) => {
+      setMaterialOverrides({})
+      queryClient.setQueryData(['workflow', workflowId], prepared)
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+    },
+  })
   const approve = useMutation({
     mutationFn: () =>
       api(`/workflows/${workflowId}/approval`, {
@@ -1572,17 +1585,9 @@ function SlicingWorkspace({
       void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
     },
   })
-  const proposeMaterials = useMutation({
+  const confirmAndSlice = useMutation({
     mutationFn: () =>
-      api(`/workflows/${workflowId}/material-assignment`, { method: 'POST' }),
-    onSuccess: () => {
-      setMaterialOverrides({})
-      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
-    },
-  })
-  const confirmMaterials = useMutation({
-    mutationFn: () =>
-      api(`/workflows/${workflowId}/material-assignment/confirm`, {
+      api(`/workflows/${workflowId}/material-assignment/confirm-and-slice`, {
         method: 'POST',
         body: JSON.stringify({
           assignment_id: data!.material_assignment!.id,
@@ -1593,7 +1598,7 @@ function SlicingWorkspace({
     onSuccess: () =>
       void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
   })
-  const slice = useMutation({
+  const retrySlice = useMutation({
     mutationFn: () => api(`/workflows/${workflowId}/slice`, { method: 'POST' }),
     onSuccess: () =>
       void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] }),
@@ -1614,17 +1619,37 @@ function SlicingWorkspace({
     onSuccess: () => {
       setMaterialOverrides({})
       confirmMapping.reset()
-      proposeMaterials.reset()
-      confirmMaterials.reset()
-      slice.reset()
+      confirmAndSlice.reset()
+      retrySlice.reset()
+      preparationAttempted.current = false
       void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
     },
   })
   const materialOperationPending =
     confirmMapping.isPending ||
-    proposeMaterials.isPending ||
-    confirmMaterials.isPending ||
-    slice.isPending
+    confirmAndSlice.isPending ||
+    retrySlice.isPending ||
+    prepareMaterials.isPending
+
+  useEffect(() => {
+    if (
+      !preparationAttempted.current &&
+      !prepareMaterials.isPending &&
+      workflow &&
+      !data?.material_assignment &&
+      (!data?.slice_job?.material_assessment ||
+        data.slice_job.material_assessment.status === 'sufficient') &&
+      ['approved', 'slice_setup'].includes(workflow.state)
+    ) {
+      preparationAttempted.current = true
+      prepareMaterials.mutate()
+    }
+  }, [
+    data?.material_assignment,
+    data?.slice_job?.material_assessment,
+    prepareMaterials,
+    workflow,
+  ])
 
   if (workflowQuery.isLoading) {
     return <div className="center-message">Loading slicing workspace…</div>
@@ -1896,22 +1921,27 @@ function SlicingWorkspace({
                     AMS, then recommend materials again.
                   </p>
                 )}
-                <button
-                  className="primary-action"
-                  disabled={
-                    workflow.state !== 'slice_setup' ||
-                    proposeMaterials.isPending ||
-                    refreshCloud.isPending
-                  }
-                  onClick={() => proposeMaterials.mutate()}
-                >
-                  {proposeMaterials.isPending
-                    ? 'Matching observed materials…'
-                    : 'Recommend compatible trays'}
-                </button>
-                <small>
-                  Expired H2D and AMS inventory is refreshed automatically before matching.
-                </small>
+                {prepareMaterials.isPending ? (
+                  <div className="preparation-progress">
+                    <strong>Preparing slicing materials…</strong>
+                    <span>Reading H2D &amp; AMS</span>
+                    <span>Resolving filament profiles</span>
+                    <span>Recommending compatible slots</span>
+                  </div>
+                ) : prepareMaterials.error ? (
+                  <>
+                    <p className="error-copy">{prepareMaterials.error.message}</p>
+                    <button
+                      className="primary-action"
+                      disabled={refreshCloud.isPending}
+                      onClick={() => prepareMaterials.mutate()}
+                    >
+                      Retry preparation
+                    </button>
+                  </>
+                ) : (
+                  <small>Preparation starts automatically when this workspace opens.</small>
+                )}
               </>
             ) : (
               <>
@@ -1978,13 +2008,17 @@ function SlicingWorkspace({
                   <button
                     className="primary-action"
                     disabled={
-                      confirmMaterials.isPending ||
+                      confirmAndSlice.isPending ||
                       refreshCloud.isPending ||
                       !recoveryCanConfirm
                     }
-                    onClick={() => confirmMaterials.mutate()}
+                    onClick={() => confirmAndSlice.mutate()}
                   >
-                    Confirm materials &amp; 15% margin
+                    {confirmAndSlice.isPending
+                      ? 'Confirming & starting slice…'
+                      : materialRecovery
+                        ? 'Confirm replacement & re-slice'
+                        : 'Confirm materials & start slicing'}
                   </button>
                 )}
               </>
@@ -2008,15 +2042,14 @@ function SlicingWorkspace({
               <pre>{JSON.stringify(data.printer_snapshot?.overrides, null, 2)}</pre>
             </details>
             {data.material_assignment?.confirmed_at &&
-              ['awaiting_material_review', 'slice_failed', 'awaiting_slice_review'].includes(
-                workflow.state,
-              ) && (
+              ['slice_failed', 'awaiting_material_review'].includes(workflow.state) &&
+              !materialRecovery && (
                 <button
                   className="primary-action"
-                  disabled={slice.isPending || refreshCloud.isPending}
-                  onClick={() => slice.mutate()}
+                  disabled={retrySlice.isPending || refreshCloud.isPending}
+                  onClick={() => retrySlice.mutate()}
                 >
-                  {slice.isPending ? 'Requesting slice…' : 'Slice in Bambu Studio'}
+                  {retrySlice.isPending ? 'Requesting retry…' : 'Retry slicing'}
                 </button>
               )}
             {data.slice_job && (
@@ -2027,7 +2060,7 @@ function SlicingWorkspace({
             )}
           </section>
 
-          {data.sliced_artifact && data.slice_job && (
+          {data.sliced_artifact && data.slice_job?.status === 'ready' && (
             <section className="slice-step-card slice-final-review">
               <span className="section-label">5 · Review &amp; download</span>
               <div className="slice-review-preview">
@@ -2065,7 +2098,19 @@ function SlicingWorkspace({
                 >
                   Download slice manifest
                 </a>
+                <button
+                  className="secondary-action"
+                  onClick={() => setSubmissionNotice(true)}
+                >
+                  Submit to printer
+                </button>
               </div>
+              {submissionNotice && (
+                <div className="part-warning">
+                  Printer submission is a future feature. No file was uploaded and no printer
+                  command was sent. Download the validated .gcode.3mf for manual handoff.
+                </div>
+              )}
               <div className="boundary-note">
                 Printer-ready artifact created. No file was uploaded and no job was submitted
                 to a printer.
@@ -2075,16 +2120,14 @@ function SlicingWorkspace({
 
           {(approve.error ||
             refreshCloud.error ||
-            proposeMaterials.error ||
-            confirmMaterials.error ||
-            slice.error ||
+            confirmAndSlice.error ||
+            retrySlice.error ||
             cancel.error) && (
             <p className="error-copy">
               {approve.error?.message ??
                 refreshCloud.error?.message ??
-                proposeMaterials.error?.message ??
-                confirmMaterials.error?.message ??
-                slice.error?.message ??
+                confirmAndSlice.error?.message ??
+                retrySlice.error?.message ??
                 cancel.error?.message}
             </p>
           )}

@@ -1615,6 +1615,19 @@ select:focus {
   margin: 0;
 }
 
+.preparation-progress {
+  background: #eef5ff;
+  border: 1px solid #b5c8e2;
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+}
+
+.preparation-progress span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .slice-review-preview {
   display: grid;
   gap: 14px;

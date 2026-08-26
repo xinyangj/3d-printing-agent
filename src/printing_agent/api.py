@@ -1124,6 +1124,19 @@ def create_app(container: Container | None = None) -> FastAPI:
         return value.model_dump(mode="json")
 
     @app.post(
+        "/api/v1/workflows/{workflow_id}/prepare-slicing-materials",
+        status_code=201,
+    )
+    async def prepare_slicing_materials(
+        workflow_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        container = get_container(request)
+        await container.application.prepare_slicing_materials(workflow_id)
+        workflow = await container.repository.get_workflow(workflow_id)
+        return await serialize_workflow(container, workflow)
+
+    @app.post(
         "/api/v1/workflows/{workflow_id}/material-assignment/confirm"
     )
     async def confirm_material_assignment(
@@ -1134,6 +1147,25 @@ def create_app(container: Container | None = None) -> FastAPI:
         value = await get_container(
             request
         ).application.confirm_material_assignment(
+            workflow_id,
+            body.assignment_id,
+            body.confirmed_by,
+            body.spool_overrides,
+        )
+        return value.model_dump(mode="json")
+
+    @app.post(
+        "/api/v1/workflows/{workflow_id}/material-assignment/confirm-and-slice",
+        status_code=202,
+    )
+    async def confirm_materials_and_slice(
+        workflow_id: str,
+        body: ConfirmMaterialAssignmentRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        value = await get_container(
+            request
+        ).application.confirm_materials_and_request_slice(
             workflow_id,
             body.assignment_id,
             body.confirmed_by,

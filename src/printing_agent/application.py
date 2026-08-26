@@ -6,6 +6,7 @@ import json
 import math
 import re
 import shutil
+import weakref
 from typing import cast
 
 from printing_agent.artifact_store import ArtifactStore, sha256_file
@@ -131,6 +132,9 @@ class PrintingApplication:
         self.inventory = inventory
         self.material_assignment = material_assignment
         self.filament_catalog = InstalledFilamentCatalog()
+        self._slicing_operation_locks: weakref.WeakValueDictionary[
+            str, asyncio.Lock
+        ] = weakref.WeakValueDictionary()
         self._cancel_locks: dict[str, asyncio.Lock] = {}
 
     async def create_workflow(
@@ -2202,6 +2206,14 @@ class PrintingApplication:
         self,
         workflow_id: str,
     ) -> MaterialAssignment:
+        await self.repository.get_workflow(workflow_id)
+        async with self._slicing_operation_lock(workflow_id):
+            return await self._propose_material_assignment_unlocked(workflow_id)
+
+    async def _propose_material_assignment_unlocked(
+        self,
+        workflow_id: str,
+    ) -> MaterialAssignment:
         workflow = await self.repository.get_workflow(workflow_id)
         PrintingApplication._ensure_not_archived(workflow)
         if workflow.state != WorkflowState.SLICE_SETUP:
@@ -2272,6 +2284,49 @@ class PrintingApplication:
             },
         )
         return assignment
+
+    def _slicing_operation_lock(self, workflow_id: str) -> asyncio.Lock:
+        locks = getattr(self, "_slicing_operation_locks", None)
+        if locks is None:
+            locks = weakref.WeakValueDictionary()
+            self._slicing_operation_locks = locks
+        return locks.setdefault(workflow_id, asyncio.Lock())
+
+    async def prepare_slicing_materials(
+        self,
+        workflow_id: str,
+    ) -> MaterialAssignment:
+        await self.repository.get_workflow(workflow_id)
+        async with self._slicing_operation_lock(workflow_id):
+            workflow = await self.repository.get_workflow(workflow_id)
+            PrintingApplication._ensure_not_archived(workflow)
+            if workflow.state == WorkflowState.AWAITING_MATERIAL_REVIEW:
+                return await self.repository.get_latest_material_assignment(workflow_id)
+            if workflow.state == WorkflowState.APPROVED:
+                await self.refresh_cloud_snapshot(workflow_id)
+                workflow = await self.repository.get_workflow(workflow_id)
+            if workflow.state != WorkflowState.SLICE_SETUP:
+                raise ConflictError(
+                    "Slicing material preparation is unavailable in the current state"
+                )
+            return await self._propose_material_assignment_unlocked(workflow_id)
+
+    async def confirm_materials_and_request_slice(
+        self,
+        workflow_id: str,
+        assignment_id: str,
+        confirmed_by: str,
+        spool_overrides: dict[str, str] | None = None,
+    ) -> SliceJob:
+        await self.repository.get_workflow(workflow_id)
+        async with self._slicing_operation_lock(workflow_id):
+            await self._confirm_material_assignment_unlocked(
+                workflow_id,
+                assignment_id,
+                confirmed_by,
+                spool_overrides,
+            )
+            return await self._request_slice_unlocked(workflow_id)
 
     async def _observed_cloud_spools(
         self,
@@ -2367,6 +2422,22 @@ class PrintingApplication:
         return spools, materials
 
     async def confirm_material_assignment(
+        self,
+        workflow_id: str,
+        assignment_id: str,
+        confirmed_by: str,
+        spool_overrides: dict[str, str] | None = None,
+    ) -> MaterialAssignment:
+        await self.repository.get_workflow(workflow_id)
+        async with self._slicing_operation_lock(workflow_id):
+            return await self._confirm_material_assignment_unlocked(
+                workflow_id,
+                assignment_id,
+                confirmed_by,
+                spool_overrides,
+            )
+
+    async def _confirm_material_assignment_unlocked(
         self,
         workflow_id: str,
         assignment_id: str,
@@ -2523,6 +2594,11 @@ class PrintingApplication:
             )
 
     async def request_slice(self, workflow_id: str) -> SliceJob:
+        await self.repository.get_workflow(workflow_id)
+        async with self._slicing_operation_lock(workflow_id):
+            return await self._request_slice_unlocked(workflow_id)
+
+    async def _request_slice_unlocked(self, workflow_id: str) -> SliceJob:
         workflow = await self.repository.get_workflow(workflow_id)
         PrintingApplication._ensure_not_archived(workflow)
         if workflow.state not in {
