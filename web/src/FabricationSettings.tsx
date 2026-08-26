@@ -5,6 +5,7 @@ import {
   type CloudDevice,
   type CredentialStatus,
 } from './BambuAccountConnection'
+import { UnknownQuantityAuthorizationDialog } from './UnknownQuantityAuthorizationDialog'
 
 const API = '/api/v1'
 
@@ -112,6 +113,7 @@ type ProfileSlotObservation = {
   profile_revision: number
   profile_digest: string
   snapshot: {
+    digest: string
     observed_at: string
     expires_at: string
     ams_units: Array<{ trays: ObservedTray[] }>
@@ -119,6 +121,14 @@ type ProfileSlotObservation = {
     warnings: string[]
   }
   material_mappings: FilamentMappingStatus[]
+  quantity_authorizations: QuantityAuthorizationState[]
+}
+
+type QuantityAuthorizationState = {
+  slot_id: string
+  tray_identity_digest: string
+  status: 'authorization_required' | 'authorized_unknown'
+  authorized_at: string | null
 }
 
 function slotDisplayName(slot: Slot): string {
@@ -216,6 +226,21 @@ export function FabricationSettings() {
       ),
     [slotObservation.data],
   )
+  const quantityAuthorizations = useMemo(
+    () =>
+      new Map(
+        (slotObservation.data?.quantity_authorizations ?? []).map((item) => [
+          item.slot_id,
+          item,
+        ]),
+      ),
+    [slotObservation.data],
+  )
+  const [quantityReview, setQuantityReview] = useState<{
+    slot: Slot
+    tray: ObservedTray
+    mapping: FilamentMappingStatus | undefined
+  } | null>(null)
   const [profileJson, setProfileJson] = useState('')
 
   useEffect(() => {
@@ -231,6 +256,52 @@ export function FabricationSettings() {
       }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['slicing-profiles'] })
+      await queryClient.invalidateQueries({
+        queryKey: ['profile-slot-observation'],
+      })
+    },
+  })
+  const authorizeUnknownQuantity = useMutation({
+    mutationFn: (value: {
+      slot: Slot
+      tray: ObservedTray
+      mapping: FilamentMappingStatus | undefined
+    }) => {
+      const authorization = quantityAuthorizations.get(value.slot.id)
+      if (!authorization || !slotObservation.data) {
+        throw new Error('Refresh the live slot observation before authorizing')
+      }
+      return request(
+        `/slicing-profiles/${selectedProfileId}/unknown-quantity-slots/${encodeURIComponent(
+          value.slot.id,
+        )}/authorize`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            cloud_snapshot_digest: slotObservation.data.snapshot.digest,
+            tray_identity_digest: authorization.tray_identity_digest,
+            acknowledged: true,
+            authorized_by: 'local-web',
+          }),
+        },
+      )
+    },
+    onSuccess: async () => {
+      setQuantityReview(null)
+      await queryClient.invalidateQueries({
+        queryKey: ['profile-slot-observation'],
+      })
+    },
+  })
+  const revokeUnknownQuantity = useMutation({
+    mutationFn: (slotId: string) =>
+      request(
+        `/slicing-profiles/${selectedProfileId}/unknown-quantity-slots/${encodeURIComponent(
+          slotId,
+        )}/authorize`,
+        { method: 'DELETE' },
+      ),
+    onSuccess: async () => {
       await queryClient.invalidateQueries({
         queryKey: ['profile-slot-observation'],
       })
@@ -442,6 +513,12 @@ export function FabricationSettings() {
                   ].includes(mapping?.state ?? '') ||
                     (mapping?.state === 'upgrade_available' &&
                       Boolean(mapping.selected_profile_id))
+                  const quantityAuthorization = quantityAuthorizations.get(slot.id)
+                  const quantityUnknown =
+                    Boolean(observed?.material) &&
+                    observed?.estimated_remaining_g === null
+                  const quantityAuthorized =
+                    quantityAuthorization?.status === 'authorized_unknown'
                   const eligibility =
                     slotObservation.isFetching && !slotObservation.data
                       ? 'Reading live slot…'
@@ -453,9 +530,10 @@ export function FabricationSettings() {
                             ? 'Empty'
                             : !mappingUsable
                               ? 'Excluded · filament profile unmapped'
-                              : !observed.estimated_remaining_g ||
-                                  observed.estimated_remaining_g <= 0
-                                ? 'Excluded · quantity unavailable'
+                              : quantityUnknown
+                                ? quantityAuthorized
+                                  ? '✓ Usable · quantity user-confirmed'
+                                  : 'Quantity unknown · confirmation required'
                                 : 'Allowed · available for assignment'
                   return (
                     <article
@@ -494,14 +572,50 @@ export function FabricationSettings() {
                             {observed.estimated_remaining_g !== null
                               ? `${observed.remain_percentage}% · ~${observed.estimated_remaining_g} g`
                               : observed.material
-                                ? 'Quantity unavailable'
+                               ? 'Quantity unknown'
                                 : 'No loaded filament'}
                           </small>
                         </>
                       ) : !slotObservation.isFetching ? (
                         <small>Not observed in the latest snapshot</small>
                       ) : null}
-                      <span className="slot-card-eligibility">{eligibility}</span>
+                      <span
+                        className={`slot-card-eligibility ${
+                          quantityUnknown
+                            ? `quantity-status ${quantityAuthorized ? 'authorized' : ''}`
+                            : ''
+                        }`}
+                      >
+                        {eligibility}
+                      </span>
+                      {quantityUnknown &&
+                        mappingUsable &&
+                        quantityAuthorization &&
+                        (quantityAuthorized ? (
+                          <button
+                            type="button"
+                            className="slot-card-toggle"
+                            disabled={revokeUnknownQuantity.isPending}
+                            onClick={() => revokeUnknownQuantity.mutate(slot.id)}
+                          >
+                            Revoke quantity confirmation
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            className="slot-card-toggle"
+                            disabled={authorizeUnknownQuantity.isPending}
+                            onClick={() =>
+                              setQuantityReview({
+                                slot,
+                                tray: observed!,
+                                mapping,
+                              })
+                            }
+                          >
+                            Mark usable without quantity estimate
+                          </button>
+                        ))}
                       <button
                         type="button"
                         className="slot-card-toggle"
@@ -626,6 +740,32 @@ export function FabricationSettings() {
           </div>
         </section>
       </section>
+      {quantityReview && (
+        <UnknownQuantityAuthorizationDialog
+          color={quantityReview.tray.color}
+          error={authorizeUnknownQuantity.error?.message}
+          material={
+            quantityReview.tray.material_sub_brand ??
+            quantityReview.tray.material ??
+            'Loaded filament'
+          }
+          onClose={() => {
+            if (!authorizeUnknownQuantity.isPending) {
+              authorizeUnknownQuantity.reset()
+              setQuantityReview(null)
+            }
+          }}
+          onConfirm={() => authorizeUnknownQuantity.mutate(quantityReview)}
+          pending={authorizeUnknownQuantity.isPending}
+          preset={
+            quantityReview.mapping?.selected_profile_id ??
+            quantityReview.mapping?.proposed_profile_id ??
+            null
+          }
+          slotId={quantityReview.slot.id}
+          slotLabel={slotDisplayName(quantityReview.slot)}
+        />
+      )}
     </main>
   )
 }

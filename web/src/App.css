@@ -923,6 +923,56 @@ select:focus {
   background: rgba(0, 0, 0, 0.05);
 }
 
+.quantity-status {
+  background: #fff2ce;
+  border: 1px solid #c8922e;
+  color: #77510b;
+  display: inline-flex;
+  font-size: 10px;
+  font-weight: 750;
+  padding: 4px 6px;
+}
+
+.quantity-status.authorized {
+  border-color: #8b722a;
+}
+
+.quantity-authorization-dialog {
+  max-width: 720px;
+}
+
+.quantity-authorization-summary {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  margin: 22px 0;
+}
+
+.quantity-authorization-summary > div {
+  background: #f5f5ef;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+}
+
+.quantity-authorization-check {
+  margin-top: 18px;
+}
+
+.unknown-quantity-recovery {
+  background: #fff8e6;
+  border: 1px solid #c8922e;
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+}
+
+.unknown-quantity-recovery .primary-action {
+  justify-self: start;
+  margin-top: 6px;
+}
+
 .slot-observation-actions {
   align-items: center;
   display: flex;
@@ -949,6 +999,10 @@ select:focus {
 .slot-card span {
   color: var(--ink-soft);
   font-size: 10px;
+}
+
+.slot-card .quantity-status {
+  color: #77510b;
 }
 
 .material-list > div {

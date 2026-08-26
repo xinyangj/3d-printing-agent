@@ -45,6 +45,19 @@ class ValidationError(PrintingAgentError):
     code = "validation_error"
 
 
+class MaterialEligibilityError(ValidationError):
+    code = "material_eligibility"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: dict[str, object],
+    ) -> None:
+        super().__init__(message)
+        self.details = details
+
+
 class CandidateRejectedError(ValidationError):
     code = "candidate_rejected"
 

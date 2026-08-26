@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from printing_agent.config import Settings
 from printing_agent.domain import ModelArtifact
 from printing_agent.errors import (
+    MaterialEligibilityError,
     ToolCorrectionExhaustedError,
     ValidationError,
 )
@@ -26,6 +27,7 @@ from printing_agent.fabrication import (
     PhysicalSpool,
     PrinterProfileRevision,
     SlotPolicy,
+    SpoolQuantityStatus,
     SpoolStatus,
     ciede2000,
     srgb_to_lab,
@@ -269,41 +271,117 @@ class MaterialAssignmentService:
         candidates: dict[str, list[MaterialCandidate]] = {}
         for request in requests:
             values: list[MaterialCandidate] = []
+            rejections: list[dict[str, object]] = []
+            required_weight = (
+                request.estimated_weight_g
+                * (1 + overrides.material_safety_margin_percent / 100)
+                if request.estimated_weight_g is not None
+                else None
+            )
+
+            def reject(
+                spool: PhysicalSpool,
+                reason_code: str,
+                message: str,
+                *,
+                authorizable: bool = False,
+                output: list[dict[str, object]] = rejections,
+            ) -> None:
+                if spool.slot_id is None:
+                    return
+                output.append(
+                    {
+                        "slot_id": spool.slot_id,
+                        "spool_id": spool.id,
+                        "reason_code": reason_code,
+                        "message": message,
+                        "authorizable": authorizable,
+                        "tray_identity_digest": spool.tray_identity_digest,
+                        "material_id": spool.material_id,
+                        "quantity_status": spool.quantity_status.value,
+                        "remaining_weight_g": spool.remaining_weight_g,
+                    }
+                )
+
             for spool in spools:
                 if spool.status not in {SpoolStatus.AVAILABLE, SpoolStatus.LOADED}:
+                    reject(spool, "spool_unavailable", "The spool is not available")
                     continue
                 if spool.slot_id is None or spool.printer_profile_id != profile.profile_id:
                     continue
                 if spool.slot_id in policy.forbidden_slot_ids:
+                    reject(
+                        spool,
+                        "masked",
+                        "The slot is masked by this workflow",
+                    )
                     continue
                 if policy.allowed_slot_ids is not None and (
                     spool.slot_id not in policy.allowed_slot_ids
                 ):
+                    reject(
+                        spool,
+                        "not_allowed",
+                        "The slot is outside this workflow's allowlist",
+                    )
                     continue
                 if spool.slot_id in policy.part_forbidden_slot_ids.get(
                     request.part_id, set()
                 ):
+                    reject(
+                        spool,
+                        "part_masked",
+                        f"The slot is masked for '{request.part_name}'",
+                    )
                     continue
                 part_allowed = policy.part_allowed_slot_ids.get(request.part_id)
                 if part_allowed is not None and spool.slot_id not in part_allowed:
+                    reject(
+                        spool,
+                        "part_not_allowed",
+                        f"The slot is outside the allowlist for '{request.part_name}'",
+                    )
                     continue
                 slot = slots.get(spool.slot_id)
                 material = materials.get(
                     (spool.material_id, spool.material_revision)
                 )
                 if slot is None or material is None:
+                    reject(
+                        spool,
+                        "material_unconfigured",
+                        "No usable material definition is configured for this slot",
+                    )
                     continue
                 if slot.manual_swap_required and not policy.allow_manual_swaps:
+                    reject(
+                        spool,
+                        "manual_swap_disabled",
+                        "Manual spool swaps are disabled",
+                    )
                     continue
                 family = material.spec.family.casefold()
                 if request.requested_family and (
                     family != request.requested_family.casefold()
                 ):
+                    reject(
+                        spool,
+                        "material_family_mismatch",
+                        (
+                            f"Material family '{family}' does not match "
+                            f"'{request.requested_family.casefold()}'"
+                        ),
+                    )
                     continue
                 if (
                     slot.supported_material_families
                     and family not in slot.supported_material_families
                 ):
+                    reject(
+                        spool,
+                        "slot_material_incompatible",
+                        f"The slot does not support material family '{family}'",
+                    )
                     continue
                 compatible_toolheads = {
                     toolhead_id
@@ -339,6 +417,11 @@ class MaterialAssignmentService:
                 if overrides.toolhead_id is not None:
                     compatible_toolheads &= {overrides.toolhead_id}
                 if not compatible_toolheads:
+                    reject(
+                        spool,
+                        "toolhead_incompatible",
+                        "No configured toolhead is compatible with this material",
+                    )
                     continue
                 effective_plate_id = (
                     overrides.plate_id
@@ -357,24 +440,50 @@ class MaterialAssignmentService:
                     None,
                 )
                 if plate is None:
+                    reject(spool, "plate_missing", "The selected plate is unavailable")
                     continue
                 if (
                     material.spec.supported_plate_ids
                     and plate.id not in material.spec.supported_plate_ids
                 ):
+                    reject(
+                        spool,
+                        "plate_incompatible",
+                        f"The material does not support plate '{plate.id}'",
+                    )
                     continue
                 if material.spec.bed_temperature_c[1] > plate.max_temperature_c:
+                    reject(
+                        spool,
+                        "plate_temperature_incompatible",
+                        "The plate temperature limit is too low for this material",
+                    )
+                    continue
+                if spool.quantity_status == SpoolQuantityStatus.UNKNOWN:
+                    reject(
+                        spool,
+                        "quantity_authorization_required",
+                        (
+                            "Bambu reports no remaining quantity; user confirmation "
+                            "is required before assignment"
+                        ),
+                        authorizable=True,
+                    )
                     continue
                 if (
-                    request.estimated_weight_g is not None
+                    required_weight is not None
+                    and spool.remaining_weight_g is not None
                     and spool.remaining_weight_g
-                    < request.estimated_weight_g
-                    * (
-                        1
-                        + overrides.material_safety_margin_percent
-                        / 100
-                    )
+                    < required_weight
                 ):
+                    reject(
+                        spool,
+                        "insufficient_quantity",
+                        (
+                            f"About {required_weight:.2f} g is required with margin, "
+                            f"but only {spool.remaining_weight_g:.2f} g is available"
+                        ),
+                    )
                     continue
                 spool_color = spool.measured_color or material.spec.assignment_color
                 values.append(
@@ -391,6 +500,8 @@ class MaterialAssignmentService:
                             srgb_to_lab(spool_color),
                         ),
                         remaining_weight_g=spool.remaining_weight_g,
+                        quantity_status=spool.quantity_status,
+                        tray_identity_digest=spool.tray_identity_digest,
                         toolhead_ids=compatible_toolheads,
                         slicer_filament_profile_id=(
                             material.spec.slicer_filament_profile_id
@@ -401,17 +512,49 @@ class MaterialAssignmentService:
                         slicer_filament_dependency_digests=(
                             material.spec.slicer_profile_dependency_digests
                         ),
-                        warnings=(
-                            ["Manual spool swap required"]
-                            if slot.manual_swap_required
-                            else []
-                        ),
+                        warnings=[
+                            *(
+                                ["Manual spool swap required"]
+                                if slot.manual_swap_required
+                                else []
+                            ),
+                            *(
+                                ["Quantity unknown; user confirmed sufficient filament"]
+                                if spool.quantity_status
+                                == SpoolQuantityStatus.USER_ATTESTED_UNKNOWN
+                                else []
+                            ),
+                        ],
                     )
                 )
             values.sort(key=lambda item: (item.color_distance, item.spool_id))
             if not values:
-                raise ValidationError(
-                    f"No usable configured material is available for '{request.part_name}'"
+                authorizable = [
+                    item
+                    for item in rejections
+                    if item.get("reason_code")
+                    == "quantity_authorization_required"
+                ]
+                message = (
+                    f"Material quantity confirmation is required for '{request.part_name}'"
+                    if authorizable
+                    else (
+                        "No usable configured material is available for "
+                        f"'{request.part_name}'"
+                    )
+                )
+                raise MaterialEligibilityError(
+                    message,
+                    details={
+                        "part_id": request.part_id,
+                        "part_name": request.part_name,
+                        "estimated_weight_g": request.estimated_weight_g,
+                        "required_weight_g": required_weight,
+                        "safety_margin_percent": (
+                            overrides.material_safety_margin_percent
+                        ),
+                        "rejections": rejections,
+                    },
                 )
             candidates[request.part_id] = values
         return candidates
@@ -470,6 +613,7 @@ class MaterialAssignmentService:
                     material_id=candidate.material_id,
                     material_revision=candidate.material_revision,
                     material_digest=candidate.material_digest,
+                    quantity_status=candidate.quantity_status,
                     slicer_filament_profile_id=candidate.slicer_filament_profile_id,
                     slicer_filament_profile_digest=(
                         candidate.slicer_filament_profile_digest
@@ -543,6 +687,7 @@ class MaterialAssignmentService:
                     material_id=candidate.material_id,
                     material_revision=candidate.material_revision,
                     material_digest=candidate.material_digest,
+                    quantity_status=candidate.quantity_status,
                     slicer_filament_profile_id=(
                         candidate.slicer_filament_profile_id
                     ),

@@ -12,6 +12,7 @@ from typing import cast
 from printing_agent.artifact_store import ArtifactStore, sha256_file
 from printing_agent.catalogs import ThingiverseCatalog
 from printing_agent.cloud_inventory import (
+    AMSTray,
     CloudDeviceSnapshot,
     CloudInventoryError,
     DeviceSummary,
@@ -65,9 +66,11 @@ from printing_agent.fabrication import (
     SliceJobStatus,
     SliceMaterialAssessment,
     SlotPolicy,
+    SpoolQuantityStatus,
     SpoolReconciliationResult,
     SpoolReservation,
     SpoolStatus,
+    UnknownQuantitySlotAuthorization,
     WorkflowPrinterSnapshot,
     resolve_slot_policy,
 )
@@ -416,6 +419,197 @@ class PrintingApplication:
         self._validate_cloud_snapshot(profile, snapshot)
         mappings = await self.synchronize_material_mappings(profile, snapshot)
         return profile, snapshot, mappings
+
+    @staticmethod
+    def _device_ref(device_id: str) -> str:
+        return hashlib.sha256(device_id.encode()).hexdigest()
+
+    @staticmethod
+    def _tray_identity_digest(device_id: str, tray: AMSTray) -> str:
+        return canonical_digest(
+            {
+                "device_ref": PrintingApplication._device_ref(device_id),
+                "slot_id": tray.slot_id,
+                "material": tray.material,
+                "material_profile_id": tray.material_profile_id,
+                "material_sub_brand": tray.material_sub_brand,
+                "color": tray.color,
+                "rfid_uid": tray.rfid_uid,
+                "tray_uuid": tray.tray_uuid,
+            }
+        )
+
+    @staticmethod
+    def _snapshot_trays(snapshot: CloudDeviceSnapshot) -> list[AMSTray]:
+        trays = [
+            tray
+            for unit in snapshot.ams_units
+            for tray in unit.trays
+        ]
+        trays.extend(snapshot.external_trays)
+        return trays
+
+    async def unknown_quantity_authorization_states(
+        self,
+        profile: PrinterProfileRevision,
+        snapshot: CloudDeviceSnapshot,
+    ) -> list[dict[str, object]]:
+        device_ref = self._device_ref(snapshot.device.device_id)
+        authorizations = {
+            item.slot_id: item
+            for item in await self.repository.list_unknown_quantity_authorizations(
+                profile.profile_id,
+                device_ref,
+            )
+        }
+        output: list[dict[str, object]] = []
+        for tray in self._snapshot_trays(snapshot):
+            if (
+                tray.material is None
+                or tray.estimated_remaining_g is not None
+            ):
+                continue
+            identity = self._tray_identity_digest(snapshot.device.device_id, tray)
+            authorization = authorizations.get(tray.slot_id)
+            active = (
+                authorization is not None
+                and authorization.tray_identity_digest == identity
+            )
+            output.append(
+                {
+                    "slot_id": tray.slot_id,
+                    "tray_identity_digest": identity,
+                    "status": (
+                        "authorized_unknown"
+                        if active
+                        else "authorization_required"
+                    ),
+                    "authorized_at": (
+                        authorization.authorized_at.isoformat()
+                        if active and authorization is not None
+                        else None
+                    ),
+                }
+            )
+        return output
+
+    async def _authorize_unknown_quantity_slot(
+        self,
+        profile: PrinterProfileRevision,
+        snapshot: CloudDeviceSnapshot,
+        slot_id: str,
+        *,
+        expected_cloud_snapshot_digest: str,
+        expected_tray_identity_digest: str,
+        authorized_by: str,
+    ) -> UnknownQuantitySlotAuthorization:
+        if snapshot.digest != expected_cloud_snapshot_digest:
+            raise ConflictError(
+                "Cloud inventory changed; review the slot before authorizing it"
+            )
+        tray = next(
+            (
+                item
+                for item in self._snapshot_trays(snapshot)
+                if item.slot_id == slot_id
+            ),
+            None,
+        )
+        if tray is None or tray.material is None:
+            raise ConflictError("The selected slot is no longer loaded")
+        if tray.estimated_remaining_g is not None:
+            raise ConflictError("The selected slot now has a measured quantity")
+        if not tray.material_profile_id:
+            raise ConflictError("The selected slot has no Bambu filament identifier")
+        identity = self._tray_identity_digest(snapshot.device.device_id, tray)
+        if identity != expected_tray_identity_digest:
+            raise ConflictError(
+                "The loaded tray changed; review it before authorizing quantity"
+            )
+        authorization = UnknownQuantitySlotAuthorization(
+            profile_id=profile.profile_id,
+            device_ref=self._device_ref(snapshot.device.device_id),
+            slot_id=slot_id,
+            tray_identity_digest=identity,
+            cloud_snapshot_digest=snapshot.digest,
+            material_profile_id=tray.material_profile_id,
+            material=tray.material,
+            color=tray.color,
+            authorized_by=authorized_by,
+        )
+        await self.repository.save_unknown_quantity_authorization(authorization)
+        return authorization
+
+    async def authorize_profile_unknown_quantity_slot(
+        self,
+        profile_id: str,
+        slot_id: str,
+        *,
+        expected_cloud_snapshot_digest: str,
+        expected_tray_identity_digest: str,
+        authorized_by: str,
+    ) -> UnknownQuantitySlotAuthorization:
+        profile, snapshot, _ = await self.observe_slicing_profile_slots(profile_id)
+        return await self._authorize_unknown_quantity_slot(
+            profile,
+            snapshot,
+            slot_id,
+            expected_cloud_snapshot_digest=expected_cloud_snapshot_digest,
+            expected_tray_identity_digest=expected_tray_identity_digest,
+            authorized_by=authorized_by,
+        )
+
+    async def revoke_profile_unknown_quantity_slot(
+        self,
+        profile_id: str,
+        slot_id: str,
+    ) -> None:
+        profile = await self.repository.get_printer_profile(profile_id)
+        device_id = profile.spec.cloud_device_serial
+        if not device_id:
+            raise ConflictError("Slicing profile has no bound cloud printer")
+        await self.repository.revoke_unknown_quantity_authorization(
+            profile_id,
+            self._device_ref(device_id),
+            slot_id,
+        )
+
+    async def authorize_workflow_unknown_quantity_slot_and_retry(
+        self,
+        workflow_id: str,
+        slot_id: str,
+        *,
+        expected_cloud_snapshot_digest: str,
+        expected_tray_identity_digest: str,
+        authorized_by: str,
+    ) -> MaterialAssignment:
+        await self.repository.get_workflow(workflow_id)
+        async with self._slicing_operation_lock(workflow_id):
+            workflow = await self.repository.get_workflow(workflow_id)
+            PrintingApplication._ensure_not_archived(workflow)
+            if workflow.state != WorkflowState.SLICE_SETUP:
+                raise ConflictError(
+                    "Quantity authorization is unavailable in the current state"
+                )
+            printer_snapshot = (
+                await self.repository.get_workflow_printer_snapshot(workflow_id)
+            )
+            profile = await self.repository.get_printer_profile(
+                printer_snapshot.profile_id,
+                printer_snapshot.profile_revision,
+            )
+            snapshot = await self.repository.get_latest_cloud_device_snapshot(
+                workflow_id
+            )
+            await self._authorize_unknown_quantity_slot(
+                profile,
+                snapshot,
+                slot_id,
+                expected_cloud_snapshot_digest=expected_cloud_snapshot_digest,
+                expected_tray_identity_digest=expected_tray_identity_digest,
+                authorized_by=authorized_by,
+            )
+            return await self._propose_material_assignment_unlocked(workflow_id)
 
     @staticmethod
     def _observed_material_slots(
@@ -2383,22 +2577,30 @@ class PrintingApplication:
         )
         spools: list[PhysicalSpool] = []
         materials: dict[tuple[str, int], MaterialDefinitionRevision] = {}
+        device_ref = self._device_ref(cloud_snapshot.device.device_id)
+        authorizations = {
+            item.slot_id: item
+            for item in await self.repository.list_unknown_quantity_authorizations(
+                profile.profile_id,
+                device_ref,
+            )
+        }
         for tray in trays:
             if tray.slot_id not in slot_ids:
                 raise ConflictError(
                     f"Observed cloud slot '{tray.slot_id}' is not defined "
                     "by the slicing profile"
                 )
-            if (
-                tray.nominal_tray_weight_g is None
-                or tray.estimated_remaining_g is None
-                or tray.estimated_remaining_g <= 0
-            ):
-                continue
-            if not tray.material_profile_id:
+            measured_quantity = (
+                tray.nominal_tray_weight_g is not None
+                and tray.estimated_remaining_g is not None
+            )
+            if not tray.material_profile_id and measured_quantity:
                 raise ConflictError(
                     f"Observed slot '{tray.slot_id}' has no Bambu filament identifier"
                 )
+            if not tray.material_profile_id:
+                continue
             matches = by_cloud_id.get(tray.material_profile_id, [])
             manual_matches = [
                 item for item in matches if item.spec.mapping_origin == "manual"
@@ -2408,6 +2610,22 @@ class PrintingApplication:
             if len(matches) != 1:
                 continue
             material = matches[0]
+            tray_identity_digest = self._tray_identity_digest(
+                cloud_snapshot.device.device_id,
+                tray,
+            )
+            authorization = authorizations.get(tray.slot_id)
+            authorization_active = (
+                authorization is not None
+                and authorization.tray_identity_digest == tray_identity_digest
+            )
+            quantity_status = (
+                SpoolQuantityStatus.CLOUD_ESTIMATE
+                if measured_quantity
+                else SpoolQuantityStatus.USER_ATTESTED_UNKNOWN
+                if authorization_active
+                else SpoolQuantityStatus.UNKNOWN
+            )
             spool_id = (
                 "cloud-"
                 + hashlib.sha256(
@@ -2421,8 +2639,14 @@ class PrintingApplication:
                 material_id=material.material_id,
                 material_revision=material.revision,
                 material_digest=material.digest or "0" * 64,
-                initial_weight_g=tray.nominal_tray_weight_g,
-                remaining_weight_g=tray.estimated_remaining_g,
+                initial_weight_g=(
+                    tray.nominal_tray_weight_g if measured_quantity else None
+                ),
+                remaining_weight_g=(
+                    tray.estimated_remaining_g if measured_quantity else None
+                ),
+                quantity_status=quantity_status,
+                tray_identity_digest=tray_identity_digest,
                 status=SpoolStatus.LOADED,
                 location=f"cloud snapshot {cloud_snapshot.id}",
                 printer_profile_id=profile.profile_id,
@@ -2434,7 +2658,8 @@ class PrintingApplication:
                 ),
                 cloud_snapshot_digest=cloud_snapshot.digest,
             )
-            await self.repository.save_spool(spool)
+            if quantity_status != SpoolQuantityStatus.UNKNOWN:
+                await self.repository.save_spool(spool)
             spools.append(spool)
             materials[(material.material_id, material.revision)] = material
         if not spools:
@@ -2492,10 +2717,22 @@ class PrintingApplication:
             )
         assignment = self._normalize_assignment_toolheads(assignment)
         await self._ensure_assignment_materials_current(workflow, assignment)
+        printer_snapshot = (
+            await self.repository.get_workflow_printer_snapshot(workflow_id)
+        )
+        profile = await self.repository.get_printer_profile(
+            printer_snapshot.profile_id,
+            printer_snapshot.profile_revision,
+        )
+        cloud_snapshot = (
+            await self.repository.get_latest_cloud_device_snapshot(workflow_id)
+        )
+        await self._ensure_unknown_quantity_authorizations_current(
+            profile,
+            cloud_snapshot,
+            assignment,
+        )
         if assignment.usage_basis == "sliced_usage":
-            printer_snapshot = (
-                await self.repository.get_workflow_printer_snapshot(workflow_id)
-            )
             self._validate_recovery_assignment_capacity(
                 assignment,
                 printer_snapshot.overrides.material_safety_margin_percent,
@@ -2522,6 +2759,36 @@ class PrintingApplication:
                 )
             )
         return confirmed
+
+    async def _ensure_unknown_quantity_authorizations_current(
+        self,
+        profile: PrinterProfileRevision,
+        snapshot: CloudDeviceSnapshot,
+        assignment: MaterialAssignment,
+    ) -> None:
+        selected_slots = {
+            item.slot_id
+            for item in assignment.assignments
+            if item.quantity_status
+            == SpoolQuantityStatus.USER_ATTESTED_UNKNOWN
+        }
+        if not selected_slots:
+            return
+        active_slots = {
+            str(item["slot_id"])
+            for item in await self.unknown_quantity_authorization_states(
+                profile,
+                snapshot,
+            )
+            if item["status"] == "authorized_unknown"
+        }
+        invalid = sorted(selected_slots - active_slots)
+        if invalid:
+            raise ConflictError(
+                "Quantity confirmation is no longer valid for: "
+                + ", ".join(invalid)
+                + ". Review material assignment again."
+            )
 
     @staticmethod
     def _normalize_assignment_toolheads(
@@ -2586,7 +2853,7 @@ class PrintingApplication:
             for candidate in values
         }
         required_by_spool: dict[str, float] = {}
-        capacity_by_spool: dict[str, float] = {}
+        capacity_by_spool: dict[str, float | None] = {}
         margin = 1 + safety_margin_percent / 100
         for selected in assignment.assignments:
             candidate = candidate_by_spool.get(
@@ -2605,7 +2872,8 @@ class PrintingApplication:
         insufficient = [
             spool_id
             for spool_id, required in required_by_spool.items()
-            if required > capacity_by_spool[spool_id]
+            if capacity_by_spool[spool_id] is not None
+            and required > cast(float, capacity_by_spool[spool_id])
         ]
         if insufficient:
             raise ValidationError(
@@ -2684,6 +2952,11 @@ class PrintingApplication:
             raise ConflictError(
                 "Cloud printer or AMS inventory changed; review materials again"
             )
+        await self._ensure_unknown_quantity_authorizations_current(
+            profile,
+            fresh_cloud_snapshot,
+            assignment,
+        )
         idempotency_key = hashlib.sha256(
             (
                 f"{workflow_id}:{artifact.manifest_digest}:{snapshot.digest}:"
@@ -2737,6 +3010,7 @@ class PrintingApplication:
                     spool_id=spool_id,
                     reserved_weight_g=weight,
                     remaining_weight_snapshot_g=spool.remaining_weight_g,
+                    quantity_status=spool.quantity_status,
                 )
             )
         await self.repository.enqueue_slice(job, reservations)
@@ -2827,6 +3101,22 @@ class PrintingApplication:
                     workspace=workspace,
                 )
             )
+            if any(
+                item.quantity_status
+                == SpoolQuantityStatus.USER_ATTESTED_UNKNOWN
+                for item in assignment.assignments
+            ):
+                sliced = sliced.model_copy(
+                    update={
+                        "warnings": [
+                            *sliced.warnings,
+                            (
+                                "One or more selected spools have unknown quantity; "
+                                "sufficient filament was user-confirmed."
+                            ),
+                        ]
+                    }
+                )
             reconciliation = await self.repository.reconcile_spool_reservations(
                 job.id,
                 sliced.filament_usage_g,
@@ -3124,7 +3414,10 @@ class PrintingApplication:
             )
             for candidate in options:
                 total = allocated.get(candidate.spool_id, 0) + required
-                if total > candidate.remaining_weight_g:
+                if (
+                    candidate.remaining_weight_g is not None
+                    and total > candidate.remaining_weight_g
+                ):
                     continue
                 existing_toolhead = toolhead_by_spool.get(candidate.spool_id)
                 if existing_toolhead is not None:

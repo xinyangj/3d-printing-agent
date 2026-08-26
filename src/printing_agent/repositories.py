@@ -41,10 +41,12 @@ from printing_agent.fabrication import (
     SlicedArtifact,
     SliceJob,
     SliceJobStatus,
+    SpoolQuantityStatus,
     SpoolReconciliationResult,
     SpoolReservation,
     SpoolStatus,
     SpoolUsageRequirement,
+    UnknownQuantitySlotAuthorization,
     WorkflowPrinterSnapshot,
 )
 
@@ -306,6 +308,16 @@ CREATE TABLE IF NOT EXISTS physical_spools (
     payload_json TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(printer_profile_id, slot_id)
+);
+
+CREATE TABLE IF NOT EXISTS unknown_quantity_slot_authorizations (
+    profile_id TEXT NOT NULL,
+    device_ref TEXT NOT NULL,
+    slot_id TEXT NOT NULL,
+    tray_identity_digest TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    authorized_at TEXT NOT NULL,
+    PRIMARY KEY(profile_id, device_ref, slot_id)
 );
 
 CREATE TABLE IF NOT EXISTS material_assignments (
@@ -1921,11 +1933,21 @@ class WorkflowRepository:
                 )
                 reserved = float((await cursor.fetchone())["reserved"])
                 if (
-                    spool.remaining_weight_g - reserved
+                    spool.quantity_status == SpoolQuantityStatus.CLOUD_ESTIMATE
+                    and spool.remaining_weight_g is not None
+                    and spool.remaining_weight_g - reserved
                     < reservation.reserved_weight_g
                 ):
                     raise ConflictError(
                         f"Spool '{reservation.spool_id}' has insufficient material"
+                    )
+                if (
+                    spool.quantity_status != SpoolQuantityStatus.CLOUD_ESTIMATE
+                    and spool.quantity_status
+                    != SpoolQuantityStatus.USER_ATTESTED_UNKNOWN
+                ):
+                    raise ConflictError(
+                        f"Spool '{reservation.spool_id}' has unconfirmed quantity"
                     )
                 await db.execute(
                     """
@@ -2196,12 +2218,12 @@ class WorkflowRepository:
     async def available_spool_weights(
         self,
         spool_ids: set[str],
-    ) -> dict[str, float]:
+    ) -> dict[str, float | None]:
         if not spool_ids:
             return {}
         db = await self._connect()
         try:
-            output: dict[str, float] = {}
+            output: dict[str, float | None] = {}
             for spool_id in sorted(spool_ids):
                 cursor = await db.execute(
                     "SELECT payload_json FROM physical_spools WHERE id = ?",
@@ -2220,7 +2242,11 @@ class WorkflowRepository:
                     (spool_id,),
                 )
                 reserved = float((await cursor.fetchone())["reserved"])
-                output[spool_id] = max(0.0, spool.remaining_weight_g - reserved)
+                output[spool_id] = (
+                    None
+                    if spool.remaining_weight_g is None
+                    else max(0.0, spool.remaining_weight_g - reserved)
+                )
             return output
         finally:
             await db.close()
@@ -2279,7 +2305,11 @@ class WorkflowRepository:
                     (spool_id, slice_job_id),
                 )
                 other_reserved = float((await cursor.fetchone())["reserved"])
-                available = max(0.0, spool.remaining_weight_g - other_reserved)
+                available = (
+                    None
+                    if spool.remaining_weight_g is None
+                    else max(0.0, spool.remaining_weight_g - other_reserved)
+                )
                 requirements.append(
                     SpoolUsageRequirement(
                         spool_id=spool_id,
@@ -2288,8 +2318,18 @@ class WorkflowRepository:
                         safety_margin_percent=material_safety_margin_percent,
                         required_weight_g=required,
                         available_weight_g=available,
-                        other_reserved_weight_g=other_reserved,
-                        shortfall_g=max(0.0, required - available),
+                        quantity_status=spool.quantity_status,
+                        other_reserved_weight_g=(
+                            0
+                            if spool.quantity_status
+                            == SpoolQuantityStatus.USER_ATTESTED_UNKNOWN
+                            else other_reserved
+                        ),
+                        shortfall_g=(
+                            0
+                            if available is None
+                            else max(0.0, required - available)
+                        ),
                     )
                 )
             result = SpoolReconciliationResult(requirements=tuple(requirements))
@@ -3332,12 +3372,21 @@ class WorkflowRepository:
                     current.material_id != spool.material_id
                     or current.material_revision != spool.material_revision
                     or current.material_digest != spool.material_digest
-                    or current.printer_profile_id != spool.printer_profile_id
+                    or (
+                        not current.id.startswith("cloud-")
+                        and current.printer_profile_id != spool.printer_profile_id
+                    )
                     or current.slot_id != spool.slot_id
                     or current.status != spool.status
+                    or current.quantity_status != spool.quantity_status
+                    or current.tray_identity_digest != spool.tray_identity_digest
                     or current.remaining_weight_g != spool.remaining_weight_g
-                    or current.cloud_snapshot_digest
-                    != spool.cloud_snapshot_digest
+                    or (
+                        current.quantity_status
+                        == SpoolQuantityStatus.CLOUD_ESTIMATE
+                        and current.cloud_snapshot_digest
+                        != spool.cloud_snapshot_digest
+                    )
                 ):
                     raise ConflictError(
                         "Reserved spool material, slot, status, and quantity are immutable"
@@ -3375,6 +3424,80 @@ class WorkflowRepository:
         except Exception:
             await db.rollback()
             raise
+        finally:
+            await db.close()
+
+    async def save_unknown_quantity_authorization(
+        self,
+        authorization: UnknownQuantitySlotAuthorization,
+    ) -> None:
+        db = await self._connect()
+        try:
+            await db.execute(
+                """
+                INSERT INTO unknown_quantity_slot_authorizations (
+                    profile_id, device_ref, slot_id, tray_identity_digest,
+                    payload_json, authorized_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id, device_ref, slot_id) DO UPDATE SET
+                    tray_identity_digest = excluded.tray_identity_digest,
+                    payload_json = excluded.payload_json,
+                    authorized_at = excluded.authorized_at
+                """,
+                (
+                    authorization.profile_id,
+                    authorization.device_ref,
+                    authorization.slot_id,
+                    authorization.tray_identity_digest,
+                    authorization.model_dump_json(),
+                    authorization.authorized_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def list_unknown_quantity_authorizations(
+        self,
+        profile_id: str,
+        device_ref: str,
+    ) -> list[UnknownQuantitySlotAuthorization]:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT payload_json
+                FROM unknown_quantity_slot_authorizations
+                WHERE profile_id = ? AND device_ref = ?
+                ORDER BY slot_id
+                """,
+                (profile_id, device_ref),
+            )
+            return [
+                UnknownQuantitySlotAuthorization.model_validate_json(
+                    row["payload_json"]
+                )
+                for row in await cursor.fetchall()
+            ]
+        finally:
+            await db.close()
+
+    async def revoke_unknown_quantity_authorization(
+        self,
+        profile_id: str,
+        device_ref: str,
+        slot_id: str,
+    ) -> None:
+        db = await self._connect()
+        try:
+            await db.execute(
+                """
+                DELETE FROM unknown_quantity_slot_authorizations
+                WHERE profile_id = ? AND device_ref = ? AND slot_id = ?
+                """,
+                (profile_id, device_ref, slot_id),
+            )
+            await db.commit()
         finally:
             await db.close()
 

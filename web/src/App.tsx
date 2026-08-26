@@ -6,11 +6,20 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js'
 import './App.css'
 import { FabricationSettings } from './FabricationSettings'
 import { MultipartPartsViewer } from './MultipartModelViewer'
+import { UnknownQuantityAuthorizationDialog } from './UnknownQuantityAuthorizationDialog'
 
 type Dimensions = {
   width_mm: number
   depth_mm: number
   height_mm: number
+}
+
+function studioSlotLabel(slotId: string) {
+  const match = /^ams(\d+)_(\d+)$/.exec(slotId)
+  if (!match) return slotId
+  const unit = Number(match[1])
+  if (unit < 1 || unit > 26) return slotId
+  return `AMS-${String.fromCharCode(64 + unit)} slot ${match[2]}`
 }
 
 type Workflow = {
@@ -140,6 +149,7 @@ type WorkflowResponse = {
   sliced_artifact: SlicedArtifactPayload | null
   cloud_snapshot: CloudDeviceSnapshotPayload | null
   material_mappings: FilamentMappingStatus[]
+  quantity_authorizations: QuantityAuthorizationState[]
 }
 
 type Printer = {
@@ -227,6 +237,7 @@ type CloudDeviceSnapshotPayload = {
       slot_id: string
       material: string | null
       material_profile_id: string | null
+      material_sub_brand: string | null
       color: string | null
       remain_percentage: number | null
       estimated_remaining_g: number | null
@@ -236,6 +247,7 @@ type CloudDeviceSnapshotPayload = {
     slot_id: string
     material: string | null
     material_profile_id: string | null
+    material_sub_brand: string | null
     color: string | null
     remain_percentage: number | null
     estimated_remaining_g: number | null
@@ -261,6 +273,34 @@ type FilamentMappingStatus = {
   proposed_profile_id: string | null
   proposed_profile_digest: string | null
   reason: string
+}
+
+type QuantityAuthorizationState = {
+  slot_id: string
+  tray_identity_digest: string
+  status: 'authorization_required' | 'authorized_unknown'
+  authorized_at: string | null
+}
+
+type MaterialEligibilityRejection = {
+  slot_id: string
+  spool_id: string
+  reason_code: string
+  message: string
+  authorizable: boolean
+  tray_identity_digest: string | null
+  material_id: string
+  quantity_status: 'cloud_estimate' | 'unknown' | 'user_attested_unknown'
+  remaining_weight_g: number | null
+}
+
+type MaterialEligibilityDetails = {
+  part_id: string
+  part_name: string
+  estimated_weight_g: number | null
+  required_weight_g: number | null
+  safety_margin_percent: number
+  rejections: MaterialEligibilityRejection[]
 }
 
 type CloudCredentialStatusPayload = {
@@ -289,6 +329,7 @@ type MaterialAssignmentPayload = {
     slot_id: string
     toolhead_id: string
     material_id: string
+    quantity_status: 'cloud_estimate' | 'unknown' | 'user_attested_unknown'
     color_distance: number
     confidence: number
     rationale: string
@@ -302,7 +343,8 @@ type MaterialAssignmentPayload = {
       material_id: string
       color: string
       color_distance: number
-      remaining_weight_g: number
+      remaining_weight_g: number | null
+      quantity_status: 'cloud_estimate' | 'unknown' | 'user_attested_unknown'
       warnings: string[]
     }>
   >
@@ -329,7 +371,8 @@ type SliceJobPayload = {
       actual_usage_g: number
       safety_margin_percent: number
       required_weight_g: number
-      available_weight_g: number
+      available_weight_g: number | null
+      quantity_status: 'cloud_estimate' | 'unknown' | 'user_attested_unknown'
       shortfall_g: number
       affected_part_ids: string[]
     }>
@@ -446,9 +489,29 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   })
   if (!response.ok) {
     const payload = await response.json().catch(() => null)
-    throw new Error(payload?.error?.message ?? `Request failed (${response.status})`)
+    throw new ApiError(
+      payload?.error?.message ?? `Request failed (${response.status})`,
+      payload?.error?.code,
+      payload?.error?.details,
+    )
   }
   return response.json() as Promise<T>
+}
+
+class ApiError extends Error {
+  code: string | null
+  details: MaterialEligibilityDetails | null
+
+  constructor(
+    message: string,
+    code?: string,
+    details?: MaterialEligibilityDetails,
+  ) {
+    super(message)
+    this.name = 'ApiError'
+    this.code = code ?? null
+    this.details = details ?? null
+  }
 }
 
 function formatState(value: string) {
@@ -1529,6 +1592,8 @@ function SlicingWorkspace({
   const queryClient = useQueryClient()
   const [materialOverrides, setMaterialOverrides] = useState<Record<string, string>>({})
   const [submissionNotice, setSubmissionNotice] = useState(false)
+  const [quantityReview, setQuantityReview] =
+    useState<MaterialEligibilityRejection | null>(null)
   const preparationAttempted = useRef(false)
   const workflowQuery = useQuery({
     queryKey: ['workflow', workflowId],
@@ -1551,6 +1616,30 @@ function SlicingWorkspace({
       }),
     onSuccess: (prepared) => {
       setMaterialOverrides({})
+      queryClient.setQueryData(['workflow', workflowId], prepared)
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+    },
+  })
+  const authorizeUnknownQuantity = useMutation({
+    mutationFn: (rejection: MaterialEligibilityRejection) =>
+      api<WorkflowResponse>(
+        `/workflows/${workflowId}/unknown-quantity-slots/${encodeURIComponent(
+          rejection.slot_id,
+        )}/authorize`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            cloud_snapshot_digest: data!.cloud_snapshot!.digest,
+            tray_identity_digest: rejection.tray_identity_digest,
+            acknowledged: true,
+            authorized_by: 'local-web',
+          }),
+        },
+      ),
+    onSuccess: (prepared) => {
+      setQuantityReview(null)
+      setMaterialOverrides({})
+      prepareMaterials.reset()
       queryClient.setQueryData(['workflow', workflowId], prepared)
       void queryClient.invalidateQueries({ queryKey: ['workflows'] })
     },
@@ -1631,7 +1720,8 @@ function SlicingWorkspace({
     confirmMapping.isPending ||
     confirmAndSlice.isPending ||
     retrySlice.isPending ||
-    prepareMaterials.isPending
+    prepareMaterials.isPending ||
+    authorizeUnknownQuantity.isPending
 
   useEffect(() => {
     if (
@@ -1671,6 +1761,24 @@ function SlicingWorkspace({
   const materialMappings = new Map(
     data.material_mappings.map((item) => [item.cloud_filament_id, item]),
   )
+  const quantityAuthorizations = new Map(
+    data.quantity_authorizations.map((item) => [item.slot_id, item]),
+  )
+  const preparationDetails =
+    prepareMaterials.error instanceof ApiError &&
+    prepareMaterials.error.code === 'material_eligibility'
+      ? prepareMaterials.error.details
+      : null
+  const authorizableRejections =
+    preparationDetails?.rejections.filter(
+      (item) => item.authorizable && item.tray_identity_digest,
+    ) ?? []
+  const quantityReviewTray = quantityReview
+    ? cloudTrays.find((item) => item.slot_id === quantityReview.slot_id)
+    : undefined
+  const quantityReviewMapping = quantityReviewTray?.material_profile_id
+    ? materialMappings.get(quantityReviewTray.material_profile_id)
+    : undefined
   const materialRecovery =
     data.slice_job?.material_assessment?.status === 'sufficient'
       ? null
@@ -1802,6 +1910,9 @@ function SlicingWorkspace({
                       Object.values(policy?.part_allowed_slot_ids ?? {}).some(
                         (slots) => !slots.includes(tray.slot_id),
                       )
+                    const quantityAuthorization = quantityAuthorizations.get(
+                      tray.slot_id,
+                    )
                     return (
                       <div
                         className={[
@@ -1838,7 +1949,17 @@ function SlicingWorkspace({
                             {tray.remain_percentage}% · ~{tray.estimated_remaining_g} g
                           </small>
                         ) : tray.material ? (
-                          <small>Quantity unavailable · excluded from assignment</small>
+                          <span
+                            className={`quantity-status ${
+                              quantityAuthorization?.status === 'authorized_unknown'
+                                ? 'authorized'
+                                : ''
+                            }`}
+                          >
+                            {quantityAuthorization?.status === 'authorized_unknown'
+                              ? '✓ Usable · quantity user-confirmed'
+                              : 'Quantity unknown · confirmation required'}
+                          </span>
                         ) : null}
                         {globallyMasked && (
                           <span className="tray-policy-badge">
@@ -1936,7 +2057,10 @@ function SlicingWorkspace({
                       <small>
                         actual {formatNumber(item.actual_usage_g, 2)} g · required{' '}
                         {formatNumber(item.required_weight_g, 2)} g with margin · available{' '}
-                        {formatNumber(item.available_weight_g, 2)} g · short{' '}
+                        {item.available_weight_g == null
+                          ? 'quantity user-confirmed'
+                          : `${formatNumber(item.available_weight_g, 2)} g`}{' '}
+                        · short{' '}
                         {formatNumber(item.shortfall_g, 2)} g
                       </small>
                     </div>
@@ -1968,13 +2092,54 @@ function SlicingWorkspace({
                 ) : prepareMaterials.error ? (
                   <>
                     <p className="error-copy">{prepareMaterials.error.message}</p>
-                    <button
-                      className="primary-action"
-                      disabled={refreshCloud.isPending}
-                      onClick={() => prepareMaterials.mutate()}
-                    >
-                      Retry preparation
-                    </button>
+                    {authorizableRejections.map((rejection) => {
+                      const tray = cloudTrays.find(
+                        (item) => item.slot_id === rejection.slot_id,
+                      )
+                      const mapping = tray?.material_profile_id
+                        ? materialMappings.get(tray.material_profile_id)
+                        : undefined
+                      return (
+                        <div className="unknown-quantity-recovery" key={rejection.slot_id}>
+                          <strong>
+                            {studioSlotLabel(rejection.slot_id)} · Quantity unknown
+                          </strong>
+                          <span>
+                            {tray?.material ?? rejection.material_id}
+                            {tray?.color ? ` · ${tray.color}` : ''}
+                          </span>
+                          <small>
+                            {mapping?.selected_profile_id ??
+                              mapping?.proposed_profile_id ??
+                              'No installed Studio preset'}
+                          </small>
+                          <small>{rejection.message}</small>
+                          {preparationDetails?.required_weight_g != null && (
+                            <small>
+                              {preparationDetails.part_name} requires about{' '}
+                              {formatNumber(preparationDetails.required_weight_g, 2)} g,
+                              including {preparationDetails.safety_margin_percent}% margin
+                            </small>
+                          )}
+                          <button
+                            className="primary-action"
+                            disabled={authorizeUnknownQuantity.isPending}
+                            onClick={() => setQuantityReview(rejection)}
+                          >
+                            Review and mark usable
+                          </button>
+                        </div>
+                      )
+                    })}
+                    {authorizableRejections.length === 0 && (
+                      <button
+                        className="primary-action"
+                        disabled={refreshCloud.isPending}
+                        onClick={() => prepareMaterials.mutate()}
+                      >
+                        Retry preparation
+                      </button>
+                    )}
                   </>
                 ) : (
                   <small>Preparation starts automatically when this workspace opens.</small>
@@ -2021,8 +2186,18 @@ function SlicingWorkspace({
                               key={candidate.spool_id}
                               value={candidate.spool_id}
                             >
-                              {candidate.slot_id} · {candidate.material_id} · ~
-                              {formatNumber(candidate.remaining_weight_g, 0)} g · ΔE{' '}
+                              {candidate.slot_id} · {candidate.material_id} ·{' '}
+                              {candidate.remaining_weight_g == null
+                                ? `Quantity unknown · user-confirmed · expected ${formatNumber(
+                                    (request?.estimated_weight_g ?? 0) *
+                                      (1 +
+                                        (data.printer_snapshot?.overrides
+                                          .material_safety_margin_percent ?? 15) /
+                                          100),
+                                    1,
+                                  )} g`
+                                : `~${formatNumber(candidate.remaining_weight_g, 0)} g`}{' '}
+                              · ΔE{' '}
                               {candidate.color_distance.toFixed(2)}
                             </option>
                           ))}
@@ -2183,6 +2358,35 @@ function SlicingWorkspace({
           </button>
         )}
       </footer>
+      {quantityReview && quantityReviewTray && (
+        <UnknownQuantityAuthorizationDialog
+          color={quantityReviewTray.color}
+          error={authorizeUnknownQuantity.error?.message}
+          material={
+            quantityReviewTray.material_sub_brand ??
+            quantityReviewTray.material ??
+            quantityReview.material_id
+          }
+          onClose={() => {
+            if (!authorizeUnknownQuantity.isPending) {
+              authorizeUnknownQuantity.reset()
+              setQuantityReview(null)
+            }
+          }}
+          onConfirm={() => authorizeUnknownQuantity.mutate(quantityReview)}
+          partName={preparationDetails?.part_name}
+          pending={authorizeUnknownQuantity.isPending}
+          preset={
+            quantityReviewMapping?.selected_profile_id ??
+            quantityReviewMapping?.proposed_profile_id ??
+            null
+          }
+          requiredWeightG={preparationDetails?.required_weight_g}
+          safetyMarginPercent={preparationDetails?.safety_margin_percent}
+          slotId={quantityReview.slot_id}
+          slotLabel={studioSlotLabel(quantityReview.slot_id)}
+        />
+      )}
     </main>
   )
 }
@@ -2892,6 +3096,7 @@ function App() {
         <WorkflowPanel workflowId={route.workflowId} onReset={() => navigate('/models')} />
       ) : route.page === 'slice' ? (
         <SlicingWorkspace
+          key={route.workflowId}
           workflowId={route.workflowId}
           onBack={() => navigate('/models')}
         />

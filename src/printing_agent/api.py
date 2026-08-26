@@ -66,6 +66,19 @@ class ConfirmMaterialAssignmentRequest(BaseModel):
     spool_overrides: dict[str, str] = Field(default_factory=dict)
 
 
+class AuthorizeUnknownQuantityRequest(BaseModel):
+    cloud_snapshot_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    tray_identity_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    acknowledged: bool
+    authorized_by: str = Field(default="local-web", min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def require_acknowledgement(self) -> AuthorizeUnknownQuantityRequest:
+        if not self.acknowledged:
+            raise ValueError("Unknown filament quantity must be acknowledged")
+        return self
+
+
 class SaveCloudCredentialRequest(BaseModel):
     access_token: SecretStr
     region: CloudRegion
@@ -196,9 +209,15 @@ def create_app(container: Container | None = None) -> FastAPI:
             if isinstance(error, ConflictError)
             else 422
         )
+        payload: dict[str, object] = {
+            "error": {"code": error.code, "message": error.message}
+        }
+        details = getattr(error, "details", None)
+        if isinstance(details, dict):
+            payload["error"]["details"] = details
         return JSONResponse(
             status_code=status,
-            content={"error": {"code": error.code, "message": error.message}},
+            content=payload,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -436,6 +455,7 @@ def create_app(container: Container | None = None) -> FastAPI:
                 material_assignment_stale = True
                 material_assignment = None
         material_mappings = []
+        quantity_authorizations: list[dict[str, object]] = []
         if cloud_snapshot is not None and printer_snapshot is not None:
             profile = await container.repository.get_printer_profile(
                 printer_snapshot.profile_id,
@@ -448,6 +468,12 @@ def create_app(container: Container | None = None) -> FastAPI:
                     cloud_snapshot,
                 )
             ]
+            quantity_authorizations = (
+                await container.application.unknown_quantity_authorization_states(
+                    profile,
+                    cloud_snapshot,
+                )
+            )
         if slice_job is not None and slice_job.status.value == "ready":
             try:
                 sliced_artifact = await container.repository.get_sliced_artifact(
@@ -546,6 +572,7 @@ def create_app(container: Container | None = None) -> FastAPI:
                 else None
             ),
             "material_mappings": material_mappings,
+            "quantity_authorizations": quantity_authorizations,
         }
 
     @app.get("/api/v1/health")
@@ -1016,6 +1043,14 @@ def create_app(container: Container | None = None) -> FastAPI:
         profile, snapshot, mappings = await get_container(
             request
         ).application.observe_slicing_profile_slots(profile_id)
+        quantity_authorizations = (
+            await get_container(
+                request
+            ).application.unknown_quantity_authorization_states(
+                profile,
+                snapshot,
+            )
+        )
         return {
             "profile_id": profile.profile_id,
             "profile_revision": profile.revision,
@@ -1024,7 +1059,44 @@ def create_app(container: Container | None = None) -> FastAPI:
             "material_mappings": [
                 item.model_dump(mode="json") for item in mappings
             ],
+            "quantity_authorizations": quantity_authorizations,
         }
+
+    @app.post(
+        "/api/v1/slicing-profiles/{profile_id}/unknown-quantity-slots/"
+        "{slot_id}/authorize",
+        status_code=201,
+    )
+    async def authorize_profile_unknown_quantity_slot(
+        profile_id: str,
+        slot_id: str,
+        body: AuthorizeUnknownQuantityRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        authorization = await get_container(
+            request
+        ).application.authorize_profile_unknown_quantity_slot(
+            profile_id,
+            slot_id,
+            expected_cloud_snapshot_digest=body.cloud_snapshot_digest,
+            expected_tray_identity_digest=body.tray_identity_digest,
+            authorized_by=body.authorized_by,
+        )
+        return authorization.model_dump(mode="json")
+
+    @app.delete(
+        "/api/v1/slicing-profiles/{profile_id}/unknown-quantity-slots/"
+        "{slot_id}/authorize",
+    )
+    async def revoke_profile_unknown_quantity_slot(
+        profile_id: str,
+        slot_id: str,
+        request: Request,
+    ) -> dict[str, str]:
+        await get_container(
+            request
+        ).application.revoke_profile_unknown_quantity_slot(profile_id, slot_id)
+        return {"status": "revoked"}
 
     @app.get("/api/v1/materials")
     async def list_materials(request: Request) -> list[dict[str, object]]:
@@ -1153,6 +1225,28 @@ def create_app(container: Container | None = None) -> FastAPI:
     ) -> dict[str, object]:
         container = get_container(request)
         await container.application.prepare_slicing_materials(workflow_id)
+        workflow = await container.repository.get_workflow(workflow_id)
+        return await serialize_workflow(container, workflow)
+
+    @app.post(
+        "/api/v1/workflows/{workflow_id}/unknown-quantity-slots/"
+        "{slot_id}/authorize",
+        status_code=201,
+    )
+    async def authorize_workflow_unknown_quantity_slot(
+        workflow_id: str,
+        slot_id: str,
+        body: AuthorizeUnknownQuantityRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        container = get_container(request)
+        await container.application.authorize_workflow_unknown_quantity_slot_and_retry(
+            workflow_id,
+            slot_id,
+            expected_cloud_snapshot_digest=body.cloud_snapshot_digest,
+            expected_tray_identity_digest=body.tray_identity_digest,
+            authorized_by=body.authorized_by,
+        )
         workflow = await container.repository.get_workflow(workflow_id)
         return await serialize_workflow(container, workflow)
 

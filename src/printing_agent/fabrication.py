@@ -30,6 +30,12 @@ class SpoolStatus(StrEnum):
     QUARANTINED = "quarantined"
 
 
+class SpoolQuantityStatus(StrEnum):
+    CLOUD_ESTIMATE = "cloud_estimate"
+    UNKNOWN = "unknown"
+    USER_ATTESTED_UNKNOWN = "user_attested_unknown"
+
+
 class SliceJobStatus(StrEnum):
     REQUESTED = "requested"
     SLICING = "slicing"
@@ -297,13 +303,31 @@ class MaterialDefinitionRevision(FrozenModel):
         return self.model_copy(update={"digest": canonical_digest(unsigned)})
 
 
+class UnknownQuantitySlotAuthorization(FrozenModel):
+    profile_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    device_ref: str = Field(pattern=r"^[a-f0-9]{64}$")
+    slot_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    tray_identity_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    cloud_snapshot_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    material_profile_id: str = Field(min_length=1, max_length=100)
+    material: str = Field(min_length=1, max_length=100)
+    color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    authorized_by: str = Field(min_length=1, max_length=200)
+    authorized_at: datetime = Field(default_factory=utc_now)
+
+
 class PhysicalSpool(FrozenModel):
     id: str = Field(default_factory=new_id)
     material_id: str
     material_revision: int = Field(ge=1)
     material_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
-    initial_weight_g: float = Field(gt=0)
-    remaining_weight_g: float = Field(ge=0)
+    initial_weight_g: float | None = Field(default=None, gt=0)
+    remaining_weight_g: float | None = Field(default=None, ge=0)
+    quantity_status: SpoolQuantityStatus = SpoolQuantityStatus.CLOUD_ESTIMATE
+    tray_identity_digest: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
     spool_core_weight_g: float | None = Field(default=None, ge=0)
     status: SpoolStatus = SpoolStatus.AVAILABLE
     lot: str | None = Field(default=None, max_length=100)
@@ -324,7 +348,16 @@ class PhysicalSpool(FrozenModel):
     def validate_assignment(self) -> PhysicalSpool:
         if (self.printer_profile_id is None) != (self.slot_id is None):
             raise ValueError("Printer profile and slot must be assigned together")
-        if self.remaining_weight_g > self.initial_weight_g:
+        if self.quantity_status == SpoolQuantityStatus.CLOUD_ESTIMATE:
+            if self.initial_weight_g is None or self.remaining_weight_g is None:
+                raise ValueError("Cloud-estimated spool quantity must include weights")
+        elif self.initial_weight_g is not None or self.remaining_weight_g is not None:
+            raise ValueError("Unknown spool quantity cannot include measured weights")
+        if (
+            self.remaining_weight_g is not None
+            and self.initial_weight_g is not None
+            and self.remaining_weight_g > self.initial_weight_g
+        ):
             raise ValueError("Remaining weight cannot exceed initial weight")
         return self
 
@@ -347,7 +380,12 @@ class MaterialCandidate(FrozenModel):
     material_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     color: str
     color_distance: float = Field(ge=0)
-    remaining_weight_g: float = Field(ge=0)
+    remaining_weight_g: float | None = Field(default=None, ge=0)
+    quantity_status: SpoolQuantityStatus = SpoolQuantityStatus.CLOUD_ESTIMATE
+    tray_identity_digest: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
     toolhead_ids: set[str] = Field(default_factory=set)
     slicer_filament_profile_id: str
     slicer_filament_profile_digest: str | None = Field(
@@ -367,6 +405,7 @@ class PartMaterialAssignment(FrozenModel):
     material_id: str
     material_revision: int
     material_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    quantity_status: SpoolQuantityStatus = SpoolQuantityStatus.CLOUD_ESTIMATE
     slicer_filament_profile_id: str
     slicer_filament_profile_digest: str | None = Field(
         default=None, pattern=r"^[a-f0-9]{64}$"
@@ -417,7 +456,8 @@ class SpoolUsageRequirement(FrozenModel):
     actual_usage_g: float = Field(gt=0)
     safety_margin_percent: float = Field(ge=0, le=100)
     required_weight_g: float = Field(gt=0)
-    available_weight_g: float = Field(ge=0)
+    available_weight_g: float | None = Field(default=None, ge=0)
+    quantity_status: SpoolQuantityStatus = SpoolQuantityStatus.CLOUD_ESTIMATE
     other_reserved_weight_g: float = Field(default=0, ge=0)
     shortfall_g: float = Field(default=0, ge=0)
     affected_part_ids: tuple[str, ...] = ()
@@ -481,7 +521,8 @@ class SpoolReservation(FrozenModel):
     spool_id: str
     reserved_weight_g: float = Field(ge=0)
     actual_usage_g: float | None = Field(default=None, ge=0)
-    remaining_weight_snapshot_g: float = Field(ge=0)
+    remaining_weight_snapshot_g: float | None = Field(default=None, ge=0)
+    quantity_status: SpoolQuantityStatus = SpoolQuantityStatus.CLOUD_ESTIMATE
     status: Literal["reserved", "released", "insufficient"] = "reserved"
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

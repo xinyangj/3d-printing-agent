@@ -32,7 +32,12 @@ from printing_agent.domain import (
     WorkflowState,
     new_id,
 )
-from printing_agent.errors import ConflictError, NotFoundError, ValidationError
+from printing_agent.errors import (
+    ConflictError,
+    MaterialEligibilityError,
+    NotFoundError,
+    ValidationError,
+)
 from printing_agent.fabrication import (
     JobOverrides,
     MaterialAssignment,
@@ -45,8 +50,10 @@ from printing_agent.fabrication import (
     SliceJob,
     SliceJobStatus,
     SlotPolicy,
+    SpoolQuantityStatus,
     SpoolReservation,
     SpoolStatus,
+    UnknownQuantitySlotAuthorization,
     WorkflowPrinterSnapshot,
     ciede2000,
     resolve_slot_policy,
@@ -885,6 +892,275 @@ async def test_no_usable_material_blocks_assignment(tmp_path: Path) -> None:
             materials={},
             maximum_color_distance=5,
             default_material_family="pla",
+        )
+
+
+async def test_unknown_quantity_requires_authorization_and_never_fakes_grams(
+    tmp_path: Path,
+) -> None:
+    artifact = await _artifact(tmp_path)
+    profile = built_in_h2d_profile()
+    material = _material("generic-pla", "#F98C36")
+    unknown = PhysicalSpool(
+        id="unknown-generic",
+        material_id=material.material_id,
+        material_revision=material.revision,
+        material_digest=material.digest or "0" * 64,
+        quantity_status=SpoolQuantityStatus.UNKNOWN,
+        tray_identity_digest="e" * 64,
+        status=SpoolStatus.LOADED,
+        printer_profile_id=profile.profile_id,
+        slot_id="ams1_1",
+    )
+    service = MaterialAssignmentService(DeterministicAssignmentAgent())  # type: ignore[arg-type]
+    arguments = {
+        "workflow_id": "workflow",
+        "artifact": artifact,
+        "profile": profile,
+        "printer_snapshot_digest": "b" * 64,
+        "cloud_snapshot_id": "cloud-snapshot",
+        "cloud_snapshot_digest": "c" * 64,
+        "policy": SlotPolicy(),
+        "overrides": JobOverrides(),
+        "spools": [unknown],
+        "materials": {
+            (material.material_id, material.revision): material,
+        },
+        "maximum_color_distance": 5,
+        "default_material_family": "pla",
+    }
+
+    with pytest.raises(MaterialEligibilityError) as exc_info:
+        await service.propose(**arguments)
+
+    rejection = exc_info.value.details["rejections"][0]
+    assert rejection["reason_code"] == "quantity_authorization_required"
+    assert rejection["authorizable"] is True
+    assert rejection["remaining_weight_g"] is None
+
+    assignment = await service.propose(
+        **{
+            **arguments,
+            "spools": [
+                unknown.model_copy(
+                    update={
+                        "quantity_status": (
+                            SpoolQuantityStatus.USER_ATTESTED_UNKNOWN
+                        )
+                    }
+                )
+            ],
+        }
+    )
+
+    candidate = assignment.candidate_options[
+        assignment.assignments[0].part_id
+    ][0]
+    assert candidate.remaining_weight_g is None
+    assert (
+        candidate.quantity_status
+        == SpoolQuantityStatus.USER_ATTESTED_UNKNOWN
+    )
+    assert assignment.assignments[0].quantity_status == candidate.quantity_status
+
+
+async def test_unknown_quantity_authorization_persists_and_revokes(
+    repository: WorkflowRepository,
+) -> None:
+    authorization = UnknownQuantitySlotAuthorization(
+        profile_id="bambu-h2d",
+        device_ref="d" * 64,
+        slot_id="ams2_3",
+        tray_identity_digest="e" * 64,
+        cloud_snapshot_digest="c" * 64,
+        material_profile_id="GFL99",
+        material="PLA",
+        color="#F98C36",
+        authorized_by="test",
+    )
+
+    await repository.save_unknown_quantity_authorization(authorization)
+    assert await repository.list_unknown_quantity_authorizations(
+        authorization.profile_id,
+        authorization.device_ref,
+    ) == [authorization]
+
+    await repository.revoke_unknown_quantity_authorization(
+        authorization.profile_id,
+        authorization.device_ref,
+        authorization.slot_id,
+    )
+    assert (
+        await repository.list_unknown_quantity_authorizations(
+            authorization.profile_id,
+            authorization.device_ref,
+        )
+        == []
+    )
+
+
+async def test_unknown_quantity_authorization_invalidates_on_detectable_change(
+    repository: WorkflowRepository,
+) -> None:
+    base = built_in_h2d_profile()
+    profile = base.model_copy(
+        update={
+            "spec": base.spec.model_copy(
+                update={"cloud_device_serial": "H2D-PRIVATE-SERIAL"}
+            ),
+            "digest": None,
+        }
+    ).with_digest()
+    report = {
+        "print": {
+            "device": {
+                "nozzle": {
+                    "info": [
+                        {"id": 0, "diameter": 0.4, "type": "HS01"},
+                        {"id": 1, "diameter": 0.4, "type": "HS01"},
+                    ]
+                }
+            },
+            "ams": {
+                "ams": [
+                    {
+                        "id": "0",
+                        "tray": [
+                            {
+                                "id": "0",
+                                "state": 17,
+                                "tray_type": "PLA",
+                                "tray_info_idx": "GFL99",
+                                "tray_color": "F98C36FF",
+                                "remain": -1,
+                                "tag_uid": "0" * 16,
+                                "tray_uuid": "0" * 32,
+                            },
+                            *[
+                                {"id": str(index), "state": 0}
+                                for index in range(1, 4)
+                            ],
+                        ],
+                    }
+                ],
+                "vt_tray": [
+                    {"id": "254", "state": 0},
+                    {"id": "255", "state": 0},
+                ],
+            },
+        }
+    }
+    device = DeviceSummary(
+        device_id="H2D-PRIVATE-SERIAL",
+        name="Workshop H2D",
+        model="H2D",
+        online=True,
+    )
+    snapshot = parse_h2d_snapshot(report, device)
+    application = object.__new__(PrintingApplication)
+    application.repository = repository
+    tray = snapshot.ams_units[0].trays[0]
+    identity = application._tray_identity_digest(device.device_id, tray)
+
+    await application._authorize_unknown_quantity_slot(
+        profile,
+        snapshot,
+        tray.slot_id,
+        expected_cloud_snapshot_digest=snapshot.digest,
+        expected_tray_identity_digest=identity,
+        authorized_by="test",
+    )
+    active = await application.unknown_quantity_authorization_states(
+        profile,
+        snapshot,
+    )
+    assert active[0]["status"] == "authorized_unknown"
+
+    assignment = MaterialAssignment(
+        workflow_id="workflow",
+        artifact_version=1,
+        artifact_manifest_digest="a" * 64,
+        printer_snapshot_digest="b" * 64,
+        cloud_snapshot_id=snapshot.id,
+        cloud_snapshot_digest=snapshot.digest,
+        slot_policy_digest="c" * 64,
+        requests=[
+            PartMaterialRequest(
+                part_id="body",
+                part_name="Body",
+                requested_color="#F98C36",
+                estimated_weight_g=10,
+            )
+        ],
+        assignments=[
+            PartMaterialAssignment(
+                part_id="body",
+                spool_id="cloud-spool",
+                slot_id=tray.slot_id,
+                toolhead_id="left",
+                material_id="generic-pla",
+                material_revision=1,
+                material_digest="d" * 64,
+                quantity_status=SpoolQuantityStatus.USER_ATTESTED_UNKNOWN,
+                slicer_filament_profile_id="Generic PLA @BBL H2D",
+                color_distance=0,
+                confidence=1,
+                rationale="User confirmed sufficient filament.",
+            )
+        ],
+        requires_confirmation=True,
+    ).with_digest()
+    await application._ensure_unknown_quantity_authorizations_current(
+        profile,
+        snapshot,
+        assignment,
+    )
+    await repository.revoke_unknown_quantity_authorization(
+        profile.profile_id,
+        application._device_ref(device.device_id),
+        tray.slot_id,
+    )
+    with pytest.raises(ConflictError, match="no longer valid"):
+        await application._ensure_unknown_quantity_authorizations_current(
+            profile,
+            snapshot,
+            assignment,
+        )
+
+    changed_report = json.loads(json.dumps(report))
+    changed_report["print"]["ams"]["ams"][0]["tray"][0][
+        "tray_color"
+    ] = "FFFFFF00"
+    changed_snapshot = parse_h2d_snapshot(changed_report, device)
+    stale = await application.unknown_quantity_authorization_states(
+        profile,
+        changed_snapshot,
+    )
+    assert stale[0]["status"] == "authorization_required"
+
+    zero_report = json.loads(json.dumps(report))
+    zero_report["print"]["ams"]["ams"][0]["tray"][0]["remain"] = 0
+    zero_report["print"]["ams"]["ams"][0]["tray"][0]["tray_weight"] = 1000
+    zero_snapshot = parse_h2d_snapshot(zero_report, device)
+    assert (
+        await application.unknown_quantity_authorization_states(
+            profile,
+            zero_snapshot,
+        )
+        == []
+    )
+    zero_tray = zero_snapshot.ams_units[0].trays[0]
+    with pytest.raises(ConflictError, match="measured quantity"):
+        await application._authorize_unknown_quantity_slot(
+            profile,
+            zero_snapshot,
+            zero_tray.slot_id,
+            expected_cloud_snapshot_digest=zero_snapshot.digest,
+            expected_tray_identity_digest=application._tray_identity_digest(
+                device.device_id,
+                zero_tray,
+            ),
+            authorized_by="test",
         )
 
 
