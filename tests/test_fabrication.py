@@ -890,9 +890,15 @@ def test_bambu_cli_arguments_preserve_untrusted_paths_as_single_arguments(
         machine_path=machine,
         process_path=process,
         filament_paths=[filament],
+        filament_map=["2"],
     )
 
-    assert args[:2] == ["--slice=0", "--arrange=1"]
+    assert args[:4] == [
+        "--slice=1",
+        "--arrange=1",
+        "--filament-map-mode=Manual",
+        "--filament-map=2",
+    ]
     assert args[-1] == str(input_path)
     assert str(output_path) in args
     assert str(filament) in args
@@ -1150,6 +1156,113 @@ async def test_bambu_native_settings_bind_single_right_tool_and_usage(
     assert multi_settings["enable_prime_tower"] == "1"
     assert multi_settings["wipe_tower_x"] == ["280"]
     assert multi_settings["wipe_tower_y"] == ["20"]
+    rewritten_path = tmp_path / "rewritten-native-map.gcode.3mf"
+    rewritten_project_settings = {
+        **multi_settings,
+        "printer_settings_id": machine_name,
+        "print_settings_id": process_name,
+    }
+    slice_info = (
+        '<?xml version="1.0"?><config><plate>'
+        '<metadata key="filament_maps" value="2 2"/>'
+        '<object identify_id="8" name="body" skipped="false"/>'
+        '<object identify_id="12" name="cap" skipped="false"/>'
+        "</plate></config>"
+    )
+    rewritten_gcode = (
+        "; filament_map = 2,2\n"
+        "T0 H-1\n"
+        "; OBJECT_ID: 8\n"
+        "; start printing object, unique label id: 8\n"
+        "G1 X1 Y1 E1\n"
+        "; stop printing object, unique label id: 8\n"
+        "T1 H-1\n"
+        "; OBJECT_ID: 12\n"
+        "; start printing object, unique label id: 12\n"
+        "G1 X2 Y2 E1\n"
+        "; stop printing object, unique label id: 12\n"
+    )
+    with zipfile.ZipFile(rewritten_path, "w") as archive:
+        archive.writestr(
+            "Metadata/model_settings.config",
+            '<?xml version="1.0"?><config><plate/></config>',
+        )
+        archive.writestr(
+            "Metadata/project_settings.config",
+            json.dumps(rewritten_project_settings),
+        )
+        archive.writestr("Metadata/slice_info.config", slice_info)
+        archive.writestr("Metadata/plate_1.gcode", rewritten_gcode)
+    BambuStudioCliDriver._validate_sliced_assignment(
+        rewritten_path,
+        SliceRequest(
+            job=job,
+            artifact=artifact,
+            printer=snapshot,
+            material_assignment=multi_assignment,
+            workspace=tmp_path / "multi-slice",
+        ),
+    )
+    with zipfile.ZipFile(rewritten_path, "w") as archive:
+        archive.writestr(
+            "Metadata/model_settings.config",
+            '<?xml version="1.0"?><config><plate/></config>',
+        )
+        archive.writestr(
+            "Metadata/project_settings.config",
+            json.dumps(rewritten_project_settings),
+        )
+        archive.writestr("Metadata/slice_info.config", slice_info)
+        archive.writestr(
+            "Metadata/plate_1.gcode",
+            rewritten_gcode.replace("T0 H-1", "T1 H-1", 1),
+        )
+    with pytest.raises(ValidationError, match="object-to-filament"):
+        BambuStudioCliDriver._validate_sliced_assignment(
+            rewritten_path,
+            SliceRequest(
+                job=job,
+                artifact=artifact,
+                printer=snapshot,
+                material_assignment=multi_assignment,
+                workspace=tmp_path / "multi-slice",
+            ),
+        )
+    duplicate_slice_info = slice_info.replace(
+        '<object identify_id="12"',
+        '<object identify_id="9" name="body" skipped="false"/>'
+        '<object identify_id="12"',
+    )
+    duplicate_gcode = (
+        rewritten_gcode
+        + "T1 H-1\n"
+        + "; OBJECT_ID: 9\n"
+        + "; start printing object, unique label id: 9\n"
+        + "G1 X3 Y3 E1\n"
+        + "; stop printing object, unique label id: 9\n"
+    )
+    with zipfile.ZipFile(rewritten_path, "w") as archive:
+        archive.writestr(
+            "Metadata/model_settings.config",
+            '<?xml version="1.0"?><config><plate/></config>',
+        )
+        archive.writestr(
+            "Metadata/project_settings.config",
+            json.dumps(rewritten_project_settings),
+        )
+        archive.writestr("Metadata/slice_info.config", duplicate_slice_info)
+        archive.writestr("Metadata/plate_1.gcode", duplicate_gcode)
+    with pytest.raises(ValidationError, match="object-to-filament"):
+        BambuStudioCliDriver._validate_sliced_assignment(
+            rewritten_path,
+            SliceRequest(
+                job=job,
+                artifact=artifact,
+                printer=snapshot,
+                material_assignment=multi_assignment,
+                workspace=tmp_path / "multi-slice",
+            ),
+        )
     assert BambuStudioCliDriver._filament_usage_by_spool(
         sliced_path,
         request,

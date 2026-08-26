@@ -192,6 +192,9 @@ class BambuStudioCliDriver:
                 machine_path=resolved_machine_path,
                 process_path=effective_process_path,
                 filament_paths=resolved_filament_paths,
+                filament_map=[
+                    str(value) for value in override_settings["filament_map"]
+                ],
             )
         except Exception:
             self._cancelled.discard(request.job.id)
@@ -384,10 +387,13 @@ class BambuStudioCliDriver:
         machine_path: Path,
         process_path: Path,
         filament_paths: list[Path],
+        filament_map: list[str],
     ) -> list[str]:
         return [
-            "--slice=0",
+            "--slice=1",
             "--arrange=1",
+            "--filament-map-mode=Manual",
+            f"--filament-map={','.join(filament_map)}",
             "--load-settings",
             f"{machine_path};{process_path}",
             "--load-filaments",
@@ -985,9 +991,21 @@ class BambuStudioCliDriver:
                     str(metadata["extruder"])
                 )
         if actual_extruders != expected_extruders:
-            raise ValidationError(
-                "Sliced output object-to-filament mapping differs from approval"
+            if actual_extruders:
+                raise ValidationError(
+                    "Sliced output object-to-filament mapping differs from approval"
+                )
+            actual_object_filaments = (
+                BambuStudioCliDriver._sliced_object_filaments(path)
             )
+            expected_object_filaments = {
+                part_id: {filament_index}
+                for part_id, filament_index in expected_extruders.items()
+            }
+            if actual_object_filaments != expected_object_filaments:
+                raise ValidationError(
+                    "Sliced output object-to-filament mapping differs from approval"
+                )
         expected_native_settings = BambuStudioCliDriver._resolved_job_settings(request)
         for key, expected_value in expected_native_settings.items():
             if key in {"name", "from"}:
@@ -1031,6 +1049,63 @@ class BambuStudioCliDriver:
             raise ValidationError(
                 "Sliced G-code physical toolhead map differs from approval"
             )
+
+    @staticmethod
+    def _sliced_object_filaments(
+        path: Path,
+    ) -> dict[str, set[int]]:
+        with zipfile.ZipFile(path) as archive:
+            try:
+                slice_info = ElementTree.fromstring(
+                    archive.read("Metadata/slice_info.config")
+                )
+            except (KeyError, ElementTree.ParseError) as exc:
+                raise ValidationError(
+                    "Sliced output lacks object mapping metadata"
+                ) from exc
+            object_names = {
+                item.attrib["identify_id"]: item.attrib["name"]
+                for item in slice_info.findall(".//object")
+                if item.attrib.get("identify_id") and item.attrib.get("name")
+            }
+            if not object_names:
+                raise ValidationError("Sliced output contains no named objects")
+            gcode_names = [
+                name
+                for name in archive.namelist()
+                if name.casefold().endswith(".gcode")
+            ]
+            if not gcode_names:
+                raise ValidationError("Sliced output contains no G-code payload")
+            gcode = archive.read(gcode_names[0]).decode(errors="replace")
+        active_filament: int | None = None
+        pending_object: str | None = None
+        active_object: str | None = None
+        usage: dict[str, set[int]] = {}
+        for raw_line in gcode.splitlines():
+            tool = re.match(r"^T(?P<index>\d+)(?:\s|$)", raw_line)
+            if tool:
+                active_filament = int(tool.group("index")) + 1
+            object_id = re.search(r"OBJECT_ID:\s*(?P<id>\d+)", raw_line)
+            if object_id:
+                pending_object = object_id.group("id")
+            if "start printing object" in raw_line and pending_object:
+                active_object = pending_object
+            if (
+                active_object is not None
+                and active_filament is not None
+                and re.match(r"^(?:G0?1|G2|G3)\b", raw_line)
+                and re.search(r"\bE-?\d", raw_line)
+            ):
+                usage.setdefault(active_object, set()).add(active_filament)
+            if "stop printing object" in raw_line:
+                active_object = None
+        by_name: dict[str, set[int]] = {}
+        for object_id, filaments in usage.items():
+            name = object_names.get(object_id)
+            if name is not None:
+                by_name.setdefault(name, set()).update(filaments)
+        return by_name
 
     @staticmethod
     def _gcode_integer_vector(text: str, key: str) -> list[int] | None:
