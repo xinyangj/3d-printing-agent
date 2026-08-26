@@ -271,6 +271,10 @@ type MaterialAssignmentPayload = {
   requires_confirmation: boolean
   confirmed_at: string | null
   digest: string
+  recovery_round: number
+  usage_basis: 'geometry_estimate' | 'sliced_usage'
+  source_assessment_digest: string | null
+  recovery_explanation: string | null
   requests: Array<{
     part_id: string
     part_name: string
@@ -307,6 +311,27 @@ type SliceJobPayload = {
   status: string
   message: string | null
   updated_at: string
+  recovery_round: number
+  failure_category: 'insufficient_material' | 'slicing_error' | null
+  material_assessment: {
+    recovery_round: number
+    status:
+      | 'sufficient'
+      | 'replacement_proposed'
+      | 'load_required'
+      | 'manual_intervention_required'
+    digest: string
+    requirements: Array<{
+      spool_id: string
+      slot_id: string | null
+      actual_usage_g: number
+      safety_margin_percent: number
+      required_weight_g: number
+      available_weight_g: number
+      shortfall_g: number
+      affected_part_ids: string[]
+    }>
+  } | null
 }
 
 type SlicedArtifactPayload = {
@@ -1619,6 +1644,12 @@ function SlicingWorkspace({
   const materialMappings = new Map(
     data.material_mappings.map((item) => [item.cloud_filament_id, item]),
   )
+  const materialRecovery =
+    data.slice_job?.material_assessment?.status === 'sufficient'
+      ? null
+      : data.slice_job?.material_assessment
+  const recoveryCanConfirm =
+    !materialRecovery || materialRecovery.status === 'replacement_proposed'
 
   return (
     <main className="slicing-workspace">
@@ -1829,6 +1860,34 @@ function SlicingWorkspace({
 
           <section className="slice-step-card">
             <span className="section-label">3 · Material assignment</span>
+            {materialRecovery && (
+              <div className="material-recovery-panel">
+                <strong>
+                  Actual sliced usage requires material reassignment · round{' '}
+                  {materialRecovery.recovery_round} of 3
+                </strong>
+                {materialRecovery.requirements
+                  .filter((item) => item.shortfall_g > 0)
+                  .map((item) => (
+                    <div key={item.spool_id}>
+                      <span>{item.slot_id ?? 'Unknown slot'}</span>
+                      <small>
+                        actual {formatNumber(item.actual_usage_g, 2)} g · required{' '}
+                        {formatNumber(item.required_weight_g, 2)} g with margin · available{' '}
+                        {formatNumber(item.available_weight_g, 2)} g · short{' '}
+                        {formatNumber(item.shortfall_g, 2)} g
+                      </small>
+                    </div>
+                  ))}
+                <p>
+                  {materialRecovery.status === 'replacement_proposed'
+                    ? 'A sufficient compatible replacement is preselected below. Review and confirm it before re-slicing.'
+                    : materialRecovery.status === 'load_required'
+                      ? 'No loaded compatible spool is sufficient. Load or replace a spool, then refresh H2D & AMS.'
+                      : 'Three recovery rounds were exhausted. Manual material intervention is required.'}
+                </p>
+              </div>
+            )}
             {!data.material_assignment ? (
               <>
                 {data.material_assignment_stale && (
@@ -1918,7 +1977,11 @@ function SlicingWorkspace({
                 ) : (
                   <button
                     className="primary-action"
-                    disabled={confirmMaterials.isPending || refreshCloud.isPending}
+                    disabled={
+                      confirmMaterials.isPending ||
+                      refreshCloud.isPending ||
+                      !recoveryCanConfirm
+                    }
                     onClick={() => confirmMaterials.mutate()}
                   >
                     Confirm materials &amp; 15% margin

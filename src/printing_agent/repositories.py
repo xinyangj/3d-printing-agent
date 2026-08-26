@@ -41,8 +41,10 @@ from printing_agent.fabrication import (
     SlicedArtifact,
     SliceJob,
     SliceJobStatus,
+    SpoolReconciliationResult,
     SpoolReservation,
     SpoolStatus,
+    SpoolUsageRequirement,
     WorkflowPrinterSnapshot,
 )
 
@@ -2191,12 +2193,44 @@ class WorkflowRepository:
         finally:
             await db.close()
 
+    async def available_spool_weights(
+        self,
+        spool_ids: set[str],
+    ) -> dict[str, float]:
+        if not spool_ids:
+            return {}
+        db = await self._connect()
+        try:
+            output: dict[str, float] = {}
+            for spool_id in sorted(spool_ids):
+                cursor = await db.execute(
+                    "SELECT payload_json FROM physical_spools WHERE id = ?",
+                    (spool_id,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    continue
+                spool = PhysicalSpool.model_validate_json(row["payload_json"])
+                cursor = await db.execute(
+                    """
+                    SELECT COALESCE(SUM(reserved_weight_g), 0) AS reserved
+                    FROM spool_reservations
+                    WHERE spool_id = ? AND status = 'reserved'
+                    """,
+                    (spool_id,),
+                )
+                reserved = float((await cursor.fetchone())["reserved"])
+                output[spool_id] = max(0.0, spool.remaining_weight_g - reserved)
+            return output
+        finally:
+            await db.close()
+
     async def reconcile_spool_reservations(
         self,
         slice_job_id: str,
         usage_by_spool: dict[str, float],
         material_safety_margin_percent: float = 15,
-    ) -> None:
+    ) -> SpoolReconciliationResult:
         if not usage_by_spool:
             raise ConflictError("Sliced output has no reconcilable filament usage")
         db = await self._connect()
@@ -2218,6 +2252,7 @@ class WorkflowRepository:
                 raise ConflictError(
                     "Sliced filament usage does not match every reserved spool"
                 )
+            requirements: list[SpoolUsageRequirement] = []
             for spool_id, usage in usage_by_spool.items():
                 if not math.isfinite(usage) or usage <= 0:
                     raise ConflictError(
@@ -2244,14 +2279,36 @@ class WorkflowRepository:
                     (spool_id, slice_job_id),
                 )
                 other_reserved = float((await cursor.fetchone())["reserved"])
-                if spool.remaining_weight_g - other_reserved < required:
-                    raise ConflictError(
-                        f"Spool '{spool_id}' is insufficient for sliced usage"
+                available = max(0.0, spool.remaining_weight_g - other_reserved)
+                requirements.append(
+                    SpoolUsageRequirement(
+                        spool_id=spool_id,
+                        slot_id=spool.slot_id,
+                        actual_usage_g=usage,
+                        safety_margin_percent=material_safety_margin_percent,
+                        required_weight_g=required,
+                        available_weight_g=available,
+                        other_reserved_weight_g=other_reserved,
+                        shortfall_g=max(0.0, required - available),
                     )
+                )
+            result = SpoolReconciliationResult(requirements=tuple(requirements))
+            has_shortage = bool(result.shortages)
+            for requirement in requirements:
+                spool_id = requirement.spool_id
+                usage = requirement.actual_usage_g
+                required = requirement.required_weight_g
+                status = (
+                    "insufficient"
+                    if requirement.shortfall_g > 0
+                    else "released"
+                    if has_shortage
+                    else "reserved"
+                )
                 cursor = await db.execute(
                     """
                     UPDATE spool_reservations
-                    SET reserved_weight_g = ?, actual_usage_g = ?,
+                    SET reserved_weight_g = ?, actual_usage_g = ?, status = ?,
                         payload_json = ?, updated_at = ?
                     WHERE spool_id = ? AND slice_job_id = ?
                       AND status = 'reserved'
@@ -2259,12 +2316,14 @@ class WorkflowRepository:
                     (
                         required,
                         usage,
+                        status,
                         SpoolReservation.model_validate_json(
                             reservations[spool_id]["payload_json"]
                         ).model_copy(
                             update={
                                 "reserved_weight_g": required,
                                 "actual_usage_g": usage,
+                                "status": status,
                                 "updated_at": utc_now(),
                             }
                         ).model_dump_json(),
@@ -2278,6 +2337,7 @@ class WorkflowRepository:
                         f"Reservation for spool '{spool_id}' is no longer active"
                     )
             await db.commit()
+            return result
         except Exception:
             await db.rollback()
             raise

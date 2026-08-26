@@ -37,6 +37,7 @@ from printing_agent.domain import (
     WorkflowState,
     WorkKind,
     canonical_digest,
+    new_id,
 )
 from printing_agent.errors import (
     BudgetExhaustedError,
@@ -51,14 +52,19 @@ from printing_agent.errors import (
 from printing_agent.fabrication import (
     JobOverrides,
     MaterialAssignment,
+    MaterialCandidate,
     MaterialDefinitionRevision,
     MaterialSlotSpec,
+    PartMaterialAssignment,
+    PartMaterialRequest,
     PhysicalSpool,
     PrinterProfileRevision,
     ProfileOrigin,
     SliceJob,
     SliceJobStatus,
+    SliceMaterialAssessment,
     SlotPolicy,
+    SpoolReconciliationResult,
     SpoolReservation,
     SpoolStatus,
     WorkflowPrinterSnapshot,
@@ -570,7 +576,96 @@ class PrintingApplication:
                     "material_assignment_stale": assignment_stale,
                 },
             )
+        await self._retry_material_recovery_after_refresh(
+            workflow_id,
+            profile,
+            snapshot,
+        )
         return snapshot
+
+    async def _retry_material_recovery_after_refresh(
+        self,
+        workflow_id: str,
+        profile: PrinterProfileRevision,
+        snapshot: CloudDeviceSnapshot,
+    ) -> None:
+        try:
+            job = await self.repository.get_latest_slice_job(workflow_id)
+            assignment = await self.repository.get_latest_material_assignment(
+                workflow_id
+            )
+        except NotFoundError:
+            return
+        assessment = job.material_assessment
+        if assessment is None or assessment.status != "load_required":
+            return
+        printer_snapshot = (
+            await self.repository.get_workflow_printer_snapshot(workflow_id)
+        )
+        try:
+            spools, materials = await self._observed_cloud_spools(profile, snapshot)
+            available = await self.repository.available_spool_weights(
+                {item.id for item in spools}
+            )
+            spools = [
+                item.model_copy(
+                    update={
+                        "remaining_weight_g": available.get(
+                            item.id,
+                            item.remaining_weight_g,
+                        )
+                    }
+                )
+                for item in spools
+            ]
+            proposed = self._build_usage_recovery_assignment(
+                assignment,
+                assessment,
+                profile,
+                printer_snapshot,
+                snapshot,
+                spools,
+                materials,
+            )
+        except PrintingAgentError as exc:
+            await self._save_blocked_recovery_assignment(
+                job,
+                assignment,
+                assessment,
+                str(exc),
+                cloud_snapshot=snapshot,
+            )
+            return
+        recovered_assessment = assessment.model_copy(
+            update={"status": "replacement_proposed", "digest": None}
+        ).with_digest()
+        proposed = proposed.model_copy(
+            update={
+                "source_assessment_digest": recovered_assessment.digest,
+                "digest": None,
+            }
+        ).with_digest()
+        await self.repository.save_slice_job(
+            job.model_copy(
+                update={
+                    "material_assessment": recovered_assessment,
+                    "message": "Sufficient replacement material is ready for review",
+                    "updated_at": fabrication_utc_now(),
+                }
+            )
+        )
+        await self.repository.save_material_assignment(proposed)
+        workflow = await self.repository.get_workflow(workflow_id)
+        if workflow.state == WorkflowState.SLICE_SETUP:
+            await self.repository.transition(
+                workflow_id,
+                WorkflowState.AWAITING_MATERIAL_REVIEW,
+                event_kind="material.recovery_proposed",
+                payload={
+                    "assignment_id": proposed.id,
+                    "assessment_digest": recovered_assessment.digest,
+                },
+            )
 
     async def _material_mapping_signature(
         self,
@@ -2113,6 +2208,19 @@ class PrintingApplication:
             raise ConflictError(
                 "Refresh a complete cloud device snapshot before assigning materials"
             )
+        try:
+            latest_job = await self.repository.get_latest_slice_job(workflow_id)
+        except NotFoundError:
+            latest_job = None
+        if (
+            latest_job is not None
+            and latest_job.material_assessment is not None
+            and latest_job.material_assessment.status != "sufficient"
+        ):
+            raise ConflictError(
+                "Resolve the active sliced-usage material recovery before "
+                "creating a new assignment"
+            )
         if workflow.active_artifact_version is None:
             raise ConflictError("Workflow has no active artifact")
         artifact = await self.repository.get_artifact(
@@ -2271,12 +2379,36 @@ class PrintingApplication:
         assignment = await self.repository.get_latest_material_assignment(workflow_id)
         if assignment.id != assignment_id:
             raise ConflictError("Material assignment is stale")
+        try:
+            latest_job = await self.repository.get_latest_slice_job(workflow_id)
+            assessment = latest_job.material_assessment
+        except NotFoundError:
+            assessment = None
+        if assessment is not None and assessment.status != "sufficient":
+            if (
+                assessment.status != "replacement_proposed"
+                or assignment.usage_basis != "sliced_usage"
+                or assignment.source_assessment_digest != assessment.digest
+            ):
+                raise ConflictError(
+                    "Load a sufficient compatible spool and refresh inventory "
+                    "before confirming material recovery"
+                )
         if spool_overrides:
             assignment = self.material_assignment.apply_user_overrides(
                 assignment,
                 spool_overrides,
             )
+        assignment = self._normalize_assignment_toolheads(assignment)
         await self._ensure_assignment_materials_current(workflow, assignment)
+        if assignment.usage_basis == "sliced_usage":
+            printer_snapshot = (
+                await self.repository.get_workflow_printer_snapshot(workflow_id)
+            )
+            self._validate_recovery_assignment_capacity(
+                assignment,
+                printer_snapshot.overrides.material_safety_margin_percent,
+            )
         confirmed = assignment.model_copy(
             update={
                 "confirmed_by": confirmed_by,
@@ -2285,7 +2417,110 @@ class PrintingApplication:
             }
         ).with_digest()
         await self.repository.save_material_assignment(confirmed)
+        if assessment is not None and assessment.status == "replacement_proposed":
+            sufficient = assessment.model_copy(
+                update={"status": "sufficient", "digest": None}
+            ).with_digest()
+            await self.repository.save_slice_job(
+                latest_job.model_copy(
+                    update={
+                        "material_assessment": sufficient,
+                        "message": "Recovered material assignment confirmed",
+                        "updated_at": fabrication_utc_now(),
+                    }
+                )
+            )
         return confirmed
+
+    @staticmethod
+    def _normalize_assignment_toolheads(
+        assignment: MaterialAssignment,
+    ) -> MaterialAssignment:
+        candidates = {
+            (part_id, item.spool_id): item
+            for part_id, values in assignment.candidate_options.items()
+            for item in values
+        }
+        by_spool: dict[str, list[PartMaterialAssignment]] = {}
+        for item in assignment.assignments:
+            by_spool.setdefault(item.spool_id, []).append(item)
+        normalized: list[PartMaterialAssignment] = []
+        for spool_id, items in by_spool.items():
+            common: set[str] | None = None
+            for item in items:
+                candidate = candidates.get((item.part_id, spool_id))
+                if candidate is None:
+                    raise ValidationError(
+                        f"Material selection for '{item.part_id}' is unavailable"
+                    )
+                common = (
+                    set(candidate.toolhead_ids)
+                    if common is None
+                    else common & candidate.toolhead_ids
+                )
+            if not common:
+                raise ValidationError(
+                    f"Spool '{spool_id}' has no common compatible toolhead"
+                )
+            preferred = next(
+                (item.toolhead_id for item in items if item.toolhead_id in common),
+                sorted(common)[0],
+            )
+            normalized.extend(
+                item.model_copy(update={"toolhead_id": preferred})
+                for item in items
+            )
+        normalized.sort(
+            key=lambda item: next(
+                index
+                for index, current in enumerate(assignment.assignments)
+                if current.part_id == item.part_id
+            )
+        )
+        return assignment.model_copy(
+            update={"assignments": normalized, "digest": None}
+        ).with_digest()
+
+    @staticmethod
+    def _validate_recovery_assignment_capacity(
+        assignment: MaterialAssignment,
+        safety_margin_percent: float,
+    ) -> None:
+        requests = {
+            item.part_id: item for item in assignment.requests
+        }
+        candidate_by_spool = {
+            (part_id, candidate.spool_id): candidate
+            for part_id, values in assignment.candidate_options.items()
+            for candidate in values
+        }
+        required_by_spool: dict[str, float] = {}
+        capacity_by_spool: dict[str, float] = {}
+        margin = 1 + safety_margin_percent / 100
+        for selected in assignment.assignments:
+            candidate = candidate_by_spool.get(
+                (selected.part_id, selected.spool_id)
+            )
+            if candidate is None:
+                raise ValidationError(
+                    f"Recovery selection for '{selected.part_id}' is no longer available"
+                )
+            required_by_spool[selected.spool_id] = (
+                required_by_spool.get(selected.spool_id, 0)
+                + float(requests[selected.part_id].estimated_weight_g or 0)
+                * margin
+            )
+            capacity_by_spool[selected.spool_id] = candidate.remaining_weight_g
+        insufficient = [
+            spool_id
+            for spool_id, required in required_by_spool.items()
+            if required > capacity_by_spool[spool_id]
+        ]
+        if insufficient:
+            raise ValidationError(
+                "Recovery selection exceeds available material for: "
+                + ", ".join(sorted(insufficient))
+            )
 
     async def request_slice(self, workflow_id: str) -> SliceJob:
         workflow = await self.repository.get_workflow(workflow_id)
@@ -2309,6 +2544,15 @@ class PrintingApplication:
         )
         assignment = await self.repository.get_latest_material_assignment(workflow_id)
         await self._ensure_assignment_materials_current(workflow, assignment)
+        try:
+            previous_job = await self.repository.get_latest_slice_job(workflow_id)
+            active_assessment = previous_job.material_assessment
+        except NotFoundError:
+            active_assessment = None
+        if active_assessment is not None and active_assessment.status != "sufficient":
+            raise ConflictError(
+                "Material recovery must be confirmed before requesting another slice"
+            )
         if assignment.confirmed_at is None:
             raise ConflictError("Material assignment requires user confirmation")
         if (
@@ -2361,6 +2605,7 @@ class PrintingApplication:
             material_safety_margin_percent=(
                 snapshot.overrides.material_safety_margin_percent
             ),
+            recovery_round=assignment.recovery_round,
             idempotency_key=idempotency_key,
         )
         requested_weights = {
@@ -2486,11 +2731,22 @@ class PrintingApplication:
                     workspace=workspace,
                 )
             )
-            await self.repository.reconcile_spool_reservations(
+            reconciliation = await self.repository.reconcile_spool_reservations(
                 job.id,
                 sliced.filament_usage_g,
                 job.material_safety_margin_percent,
             )
+            if reconciliation.shortages:
+                await self._recover_insufficient_material(
+                    job,
+                    artifact,
+                    snapshot,
+                    assignment,
+                    reconciliation,
+                )
+                if workspace is not None:
+                    await asyncio.to_thread(shutil.rmtree, workspace, True)
+                return
             job = job.model_copy(
                 update={
                     "status": SliceJobStatus.VALIDATING,
@@ -2523,6 +2779,399 @@ class PrintingApplication:
                         workspace,
                         True,
                     )
+
+    async def _recover_insufficient_material(
+        self,
+        job: SliceJob,
+        artifact: ModelArtifact,
+        printer_snapshot: WorkflowPrinterSnapshot,
+        assignment: MaterialAssignment,
+        reconciliation: SpoolReconciliationResult,
+    ) -> None:
+        recovery_round = assignment.recovery_round + 1
+        parts_by_spool: dict[str, list[str]] = {}
+        for item in assignment.assignments:
+            parts_by_spool.setdefault(item.spool_id, []).append(item.part_id)
+        requirements = tuple(
+            item.model_copy(
+                update={
+                    "affected_part_ids": tuple(
+                        sorted(parts_by_spool.get(item.spool_id, []))
+                    )
+                }
+            )
+            for item in reconciliation.requirements
+        )
+        status = (
+            "manual_intervention_required"
+            if recovery_round > 3
+            else "replacement_proposed"
+        )
+        assessment = SliceMaterialAssessment(
+            slice_job_id=job.id,
+            material_assignment_digest=assignment.digest or "0" * 64,
+            cloud_snapshot_digest=job.cloud_snapshot_digest,
+            recovery_round=min(recovery_round, 3),
+            requirements=requirements,
+            status=status,
+        ).with_digest()
+        failed_job = job.model_copy(
+            update={
+                "status": SliceJobStatus.FAILED,
+                "message": "Actual sliced usage requires material reassignment",
+                "failure_category": "insufficient_material",
+                "recovery_round": min(recovery_round, 3),
+                "material_assessment": assessment,
+                "updated_at": fabrication_utc_now(),
+            }
+        )
+        await self.repository.fail_slice(failed_job, failed_job.message or "")
+        if recovery_round > 3:
+            await self._save_blocked_recovery_assignment(
+                failed_job,
+                assignment,
+                assessment,
+                "Manual intervention required after three recovery rounds.",
+            )
+            return
+        try:
+            fresh_snapshot = await self.refresh_cloud_snapshot(job.workflow_id)
+            profile = await self.repository.get_printer_profile(
+                printer_snapshot.profile_id,
+                printer_snapshot.profile_revision,
+            )
+            spools, materials = await self._observed_cloud_spools(
+                profile,
+                fresh_snapshot,
+            )
+            available = await self.repository.available_spool_weights(
+                {item.id for item in spools}
+            )
+            spools = [
+                item.model_copy(
+                    update={
+                        "remaining_weight_g": available.get(
+                            item.id,
+                            item.remaining_weight_g,
+                        )
+                    }
+                )
+                for item in spools
+            ]
+            recovered = self._build_usage_recovery_assignment(
+                assignment,
+                assessment,
+                profile,
+                printer_snapshot,
+                fresh_snapshot,
+                spools,
+                materials,
+            )
+        except PrintingAgentError as exc:
+            blocked = assessment.model_copy(
+                update={
+                    "status": "load_required",
+                    "digest": None,
+                }
+            ).with_digest()
+            failed_job = failed_job.model_copy(
+                update={
+                    "material_assessment": blocked,
+                    "message": str(exc)[-2_000:],
+                    "updated_at": fabrication_utc_now(),
+                }
+            )
+            await self.repository.save_slice_job(failed_job)
+            await self._save_blocked_recovery_assignment(
+                failed_job,
+                assignment,
+                blocked,
+                str(exc),
+            )
+            return
+        failed_job = failed_job.model_copy(
+            update={
+                "material_assessment": assessment,
+                "updated_at": fabrication_utc_now(),
+            }
+        )
+        await self.repository.save_slice_job(failed_job)
+        workflow = await self.repository.get_workflow(job.workflow_id)
+        if workflow.state == WorkflowState.SLICE_FAILED:
+            await self.repository.transition(
+                job.workflow_id,
+                WorkflowState.SLICE_SETUP,
+                event_kind="material.recovery_started",
+                payload={
+                    "slice_job_id": job.id,
+                    "assessment_digest": assessment.digest,
+                    "recovery_round": recovery_round,
+                },
+            )
+        await self.repository.save_material_assignment(recovered)
+        await self.repository.transition(
+            job.workflow_id,
+            WorkflowState.AWAITING_MATERIAL_REVIEW,
+            event_kind="material.recovery_proposed",
+            payload={
+                "assignment_id": recovered.id,
+                "assessment_digest": assessment.digest,
+                "recovery_round": recovery_round,
+            },
+        )
+
+    def _build_usage_recovery_assignment(
+        self,
+        assignment: MaterialAssignment,
+        assessment: SliceMaterialAssessment,
+        profile: PrinterProfileRevision,
+        printer_snapshot: WorkflowPrinterSnapshot,
+        cloud_snapshot: CloudDeviceSnapshot,
+        spools: list[PhysicalSpool],
+        materials: dict[tuple[str, int], MaterialDefinitionRevision],
+    ) -> MaterialAssignment:
+        requests = {item.part_id: item for item in assignment.requests}
+        selected = {item.part_id: item for item in assignment.assignments}
+        requirement_by_spool = {
+            item.spool_id: item for item in assessment.requirements
+        }
+        allocated_usage: dict[str, float] = {}
+        recovered_requests: list[PartMaterialRequest] = []
+        for spool_id, requirement in requirement_by_spool.items():
+            part_ids = [
+                item.part_id
+                for item in assignment.assignments
+                if item.spool_id == spool_id
+            ]
+            total_estimate = sum(
+                float(requests[part_id].estimated_weight_g or 0)
+                for part_id in part_ids
+            )
+            for index, part_id in enumerate(part_ids):
+                if index + 1 == len(part_ids):
+                    used = requirement.actual_usage_g - sum(
+                        allocated_usage.get(value, 0) for value in part_ids
+                    )
+                else:
+                    estimate = float(requests[part_id].estimated_weight_g or 0)
+                    used = (
+                        requirement.actual_usage_g * estimate / total_estimate
+                        if total_estimate > 0
+                        else requirement.actual_usage_g / max(1, len(part_ids))
+                    )
+                allocated_usage[part_id] = max(0.001, used)
+        for request in assignment.requests:
+            recovered_requests.append(
+                request.model_copy(
+                    update={
+                        "estimated_weight_g": allocated_usage.get(
+                            request.part_id,
+                            request.estimated_weight_g,
+                        )
+                    }
+                )
+            )
+        candidates = self.material_assignment.compatible_candidates(
+            requests=recovered_requests,
+            profile=profile,
+            policy=printer_snapshot.resolved_slot_policy,
+            overrides=printer_snapshot.overrides,
+            spools=spools,
+            materials=materials,
+        )
+        margin = 1 + printer_snapshot.overrides.material_safety_margin_percent / 100
+        sufficient_existing = {
+            item.spool_id
+            for item in assessment.requirements
+            if item.shortfall_g == 0
+        }
+        required_by_part = {
+            item.part_id: float(item.estimated_weight_g or 0) * margin
+            for item in recovered_requests
+        }
+        ordered_requests = sorted(
+            recovered_requests,
+            key=lambda item: (
+                len(candidates[item.part_id]),
+                -required_by_part[item.part_id],
+                item.part_id,
+            ),
+        )
+        search_budget = 10_000
+        searched = 0
+
+        def solve(
+            index: int,
+            allocated: dict[str, float],
+            toolhead_by_spool: dict[str, str],
+            chosen: dict[str, tuple[MaterialCandidate, str]],
+        ) -> dict[str, tuple[MaterialCandidate, str]] | None:
+            nonlocal searched
+            searched += 1
+            if searched > search_budget:
+                return None
+            if index == len(ordered_requests):
+                return chosen
+            request = ordered_requests[index]
+            required = required_by_part[request.part_id]
+            options = sorted(
+                candidates[request.part_id],
+                key=lambda candidate: (
+                    0
+                    if candidate.spool_id in allocated
+                    or candidate.spool_id in sufficient_existing
+                    else 1,
+                    candidate.color_distance,
+                    bool(candidate.warnings),
+                    candidate.slot_id,
+                ),
+            )
+            for candidate in options:
+                total = allocated.get(candidate.spool_id, 0) + required
+                if total > candidate.remaining_weight_g:
+                    continue
+                existing_toolhead = toolhead_by_spool.get(candidate.spool_id)
+                if existing_toolhead is not None:
+                    toolhead_options = (
+                        [existing_toolhead]
+                        if existing_toolhead in candidate.toolhead_ids
+                        else []
+                    )
+                else:
+                    previous = selected[request.part_id].toolhead_id
+                    toolhead_options = sorted(
+                        candidate.toolhead_ids,
+                        key=lambda value: (value != previous, value),
+                    )
+                for toolhead_id in toolhead_options:
+                    result = solve(
+                        index + 1,
+                        {**allocated, candidate.spool_id: total},
+                        {**toolhead_by_spool, candidate.spool_id: toolhead_id},
+                        {**chosen, request.part_id: (candidate, toolhead_id)},
+                    )
+                    if result is not None:
+                        return result
+            return None
+
+        chosen = solve(0, {}, {}, {})
+        if chosen is None:
+            raise ConflictError(
+                "No loaded compatible spool combination can satisfy actual sliced usage"
+            )
+        recovered_assignments: list[PartMaterialAssignment] = []
+        for request in recovered_requests:
+            candidate, toolhead_id = chosen[request.part_id]
+            recovered_assignments.append(
+                PartMaterialAssignment(
+                    part_id=request.part_id,
+                    spool_id=candidate.spool_id,
+                    slot_id=candidate.slot_id,
+                    toolhead_id=toolhead_id,
+                    material_id=candidate.material_id,
+                    material_revision=candidate.material_revision,
+                    material_digest=candidate.material_digest,
+                    slicer_filament_profile_id=candidate.slicer_filament_profile_id,
+                    slicer_filament_profile_digest=(
+                        candidate.slicer_filament_profile_digest
+                    ),
+                    slicer_filament_dependency_digests=(
+                        candidate.slicer_filament_dependency_digests
+                    ),
+                    color_distance=candidate.color_distance,
+                    confidence=1,
+                    rationale=(
+                        "Recovery proposal uses actual sliced usage and selects "
+                        "a compatible spool with sufficient capacity."
+                    ),
+                    alternatives=[
+                        value.spool_id
+                        for value in candidates[request.part_id]
+                        if value.spool_id != candidate.spool_id
+                    ][:3],
+                )
+            )
+        recovered_assignments.sort(
+            key=lambda item: next(
+                index
+                for index, request in enumerate(assignment.requests)
+                if request.part_id == item.part_id
+            )
+        )
+        return MaterialAssignment(
+            workflow_id=assignment.workflow_id,
+            artifact_version=assignment.artifact_version,
+            artifact_manifest_digest=assignment.artifact_manifest_digest,
+            printer_snapshot_digest=assignment.printer_snapshot_digest,
+            cloud_snapshot_id=cloud_snapshot.id,
+            cloud_snapshot_digest=cloud_snapshot.digest,
+            slot_policy_digest=assignment.slot_policy_digest,
+            requests=recovered_requests,
+            assignments=recovered_assignments,
+            candidate_options=candidates,
+            requires_confirmation=True,
+            recovery_round=assessment.recovery_round,
+            usage_basis="sliced_usage",
+            source_assessment_digest=assessment.digest,
+            recovery_explanation=(
+                "Actual sliced usage exceeded one or more selected spools; "
+                "sufficient replacements were preselected."
+            ),
+        ).with_digest()
+
+    async def _save_blocked_recovery_assignment(
+        self,
+        job: SliceJob,
+        assignment: MaterialAssignment,
+        assessment: SliceMaterialAssessment,
+        explanation: str,
+        *,
+        cloud_snapshot: CloudDeviceSnapshot | None = None,
+    ) -> None:
+        blocked = assignment.model_copy(
+            update={
+                "id": new_id(),
+                "confirmed_by": None,
+                "confirmed_at": None,
+                "requires_confirmation": True,
+                "recovery_round": assessment.recovery_round,
+                "usage_basis": "sliced_usage",
+                "source_assessment_digest": assessment.digest,
+                "recovery_explanation": explanation[:2_000],
+                "cloud_snapshot_id": (
+                    cloud_snapshot.id
+                    if cloud_snapshot is not None
+                    else assignment.cloud_snapshot_id
+                ),
+                "cloud_snapshot_digest": (
+                    cloud_snapshot.digest
+                    if cloud_snapshot is not None
+                    else assignment.cloud_snapshot_digest
+                ),
+                "digest": None,
+                "created_at": fabrication_utc_now(),
+            }
+        ).with_digest()
+        workflow = await self.repository.get_workflow(job.workflow_id)
+        if workflow.state == WorkflowState.SLICE_FAILED:
+            await self.repository.transition(
+                job.workflow_id,
+                WorkflowState.SLICE_SETUP,
+                event_kind="material.recovery_blocked",
+                payload={"assessment_digest": assessment.digest},
+            )
+        await self.repository.save_material_assignment(blocked)
+        workflow = await self.repository.get_workflow(job.workflow_id)
+        if workflow.state == WorkflowState.SLICE_SETUP:
+            await self.repository.transition(
+                job.workflow_id,
+                WorkflowState.AWAITING_MATERIAL_REVIEW,
+                event_kind="material.load_required",
+                payload={
+                    "assignment_id": blocked.id,
+                    "assessment_digest": assessment.digest,
+                },
+            )
 
     async def request_print(self, workflow_id: str) -> None:
         workflow = await self.repository.get_workflow(workflow_id)

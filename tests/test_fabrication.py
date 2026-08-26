@@ -1591,7 +1591,11 @@ async def test_slice_request_reserves_spools_atomically(
             job.id,
             {"other-spool": 40},
         )
-    await repository.reconcile_spool_reservations(job.id, {spool.id: 40})
+    reconciliation = await repository.reconcile_spool_reservations(
+        job.id,
+        {spool.id: 40},
+    )
+    assert reconciliation.shortages == ()
     reconciled = (await repository.list_spool_reservations(job.id))[0]
     assert reconciled.reserved_weight_g == pytest.approx(46)
     assert reconciled.actual_usage_g == pytest.approx(40)
@@ -1636,3 +1640,30 @@ async def test_slice_request_reserves_spools_atomically(
     assert (await repository.get_spool(spool.id)).remaining_weight_g == pytest.approx(
         100
     )
+    shortage_job = job.model_copy(
+        update={
+            "id": new_id(),
+            "idempotency_key": "f" * 64,
+            "status": SliceJobStatus.REQUESTED,
+        }
+    )
+    shortage_reservation = reservation.model_copy(
+        update={
+            "id": new_id(),
+            "slice_job_id": shortage_job.id,
+            "status": "reserved",
+        }
+    )
+    await repository.enqueue_slice(shortage_job, [shortage_reservation])
+    shortage = await repository.reconcile_spool_reservations(
+        shortage_job.id,
+        {spool.id: 90},
+    )
+    assert shortage.shortages[0].required_weight_g == pytest.approx(103.5)
+    assert shortage.shortages[0].available_weight_g == pytest.approx(100)
+    assert shortage.shortages[0].shortfall_g == pytest.approx(3.5)
+    persisted_shortage = (
+        await repository.list_spool_reservations(shortage_job.id)
+    )[0]
+    assert persisted_shortage.status == "insufficient"
+    assert persisted_shortage.actual_usage_g == pytest.approx(90)

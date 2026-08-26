@@ -397,12 +397,58 @@ class MaterialAssignment(FrozenModel):
     requires_confirmation: bool
     confirmed_by: str | None = None
     confirmed_at: datetime | None = None
+    recovery_round: int = Field(default=0, ge=0, le=3)
+    usage_basis: Literal["geometry_estimate", "sliced_usage"] = "geometry_estimate"
+    source_assessment_digest: str | None = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$"
+    )
+    recovery_explanation: str | None = Field(default=None, max_length=2_000)
     digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     created_at: datetime = Field(default_factory=utc_now)
 
     def with_digest(self) -> MaterialAssignment:
         unsigned = self.model_copy(update={"digest": None})
         return self.model_copy(update={"digest": canonical_digest(unsigned)})
+
+
+class SpoolUsageRequirement(FrozenModel):
+    spool_id: str
+    slot_id: str | None = None
+    actual_usage_g: float = Field(gt=0)
+    safety_margin_percent: float = Field(ge=0, le=100)
+    required_weight_g: float = Field(gt=0)
+    available_weight_g: float = Field(ge=0)
+    other_reserved_weight_g: float = Field(default=0, ge=0)
+    shortfall_g: float = Field(default=0, ge=0)
+    affected_part_ids: tuple[str, ...] = ()
+
+
+class SliceMaterialAssessment(FrozenModel):
+    slice_job_id: str
+    material_assignment_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    cloud_snapshot_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    recovery_round: int = Field(ge=1, le=3)
+    requirements: tuple[SpoolUsageRequirement, ...]
+    status: Literal[
+        "sufficient",
+        "replacement_proposed",
+        "load_required",
+        "manual_intervention_required",
+    ]
+    digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    created_at: datetime = Field(default_factory=utc_now)
+
+    def with_digest(self) -> SliceMaterialAssessment:
+        unsigned = self.model_copy(update={"digest": None})
+        return self.model_copy(update={"digest": canonical_digest(unsigned)})
+
+
+class SpoolReconciliationResult(FrozenModel):
+    requirements: tuple[SpoolUsageRequirement, ...]
+
+    @property
+    def shortages(self) -> tuple[SpoolUsageRequirement, ...]:
+        return tuple(item for item in self.requirements if item.shortfall_g > 0)
 
 
 class SliceJob(FrozenModel):
@@ -418,6 +464,12 @@ class SliceJob(FrozenModel):
     status: SliceJobStatus = SliceJobStatus.REQUESTED
     idempotency_key: str = Field(pattern=r"^[a-f0-9]{64}$")
     message: str | None = None
+    recovery_round: int = Field(default=0, ge=0, le=3)
+    failure_category: Literal[
+        "insufficient_material",
+        "slicing_error",
+    ] | None = None
+    material_assessment: SliceMaterialAssessment | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -430,7 +482,7 @@ class SpoolReservation(FrozenModel):
     reserved_weight_g: float = Field(ge=0)
     actual_usage_g: float | None = Field(default=None, ge=0)
     remaining_weight_snapshot_g: float = Field(ge=0)
-    status: Literal["reserved", "released"] = "reserved"
+    status: Literal["reserved", "released", "insufficient"] = "reserved"
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
