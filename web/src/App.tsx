@@ -1679,13 +1679,15 @@ function SlicingWorkspace({
   return (
     <main className="slicing-workspace">
       <header className="slicing-header">
-        <div>
-          <button className="text-button" onClick={onBack}>
+        <div className="slicing-header-copy">
+          <button className="text-button slicing-header-back" onClick={onBack}>
             ← Models
           </button>
-          <span className="eyebrow">Slice workflow {workflow.id.slice(0, 8)}</span>
-          <h1>Prepare H2D printer-ready artifact</h1>
-          <p>{workflow.requirement}</p>
+          <div className="slicing-header-context">
+            <span className="eyebrow">Slice workflow {workflow.id.slice(0, 8)}</span>
+            <h1>Prepare H2D printer-ready artifact</h1>
+            <p>{workflow.requirement}</p>
+          </div>
         </div>
         <span className={`state-pill state-${workflow.state}`}>
           <span />
@@ -1758,7 +1760,7 @@ function SlicingWorkspace({
           </section>
 
           <section className="slice-step-card">
-            <span className="section-label">2 · Slicing profile</span>
+            <span className="section-label">Configuration · Slicing profile</span>
             <strong>{data.printer_snapshot?.profile.display_name}</strong>
             <p>
               Revision {data.printer_snapshot?.profile_revision} ·{' '}

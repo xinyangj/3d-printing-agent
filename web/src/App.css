@@ -1404,11 +1404,27 @@ select:focus {
   margin-bottom: 22px;
 }
 
+.slicing-header-copy {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.slicing-header-back {
+  justify-self: start;
+}
+
+.slicing-header-context {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
 .slicing-header h1 {
   color: var(--ink);
   font-family: var(--display);
   font-size: clamp(30px, 4vw, 48px);
-  margin: 7px 0;
+  margin: 0;
 }
 
 .slicing-header p {
@@ -1817,6 +1833,10 @@ select:focus {
   .slice-review-preview,
   .dashboard-header {
     grid-template-columns: 1fr;
+  }
+
+  .slicing-header {
+    flex-direction: column;
   }
 
   .dashboard-header {
