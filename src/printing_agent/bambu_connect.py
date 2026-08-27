@@ -35,6 +35,9 @@ class BambuConnectReadiness(BaseModel):
     signature_valid: bool
     ready: bool
     message: str
+    installation_digest: str | None = None
+    signer_thumbprint: str | None = None
+    file_version: str | None = None
 
 
 class BambuConnectManager:
@@ -65,9 +68,8 @@ class BambuConnectManager:
                 None,
             )
             if executable is not None:
-                valid = self._signature_is_trusted(
-                    self._authenticode(executable)
-                )
+                signature = self._authenticode(executable)
+                valid = self._signature_is_trusted(signature)
                 return BambuConnectReadiness(
                     installed=True,
                     scheme_registered=False,
@@ -77,6 +79,9 @@ class BambuConnectManager:
                         "Bambu Connect is installed but must be opened once "
                         "to register its URI scheme."
                     ),
+                    installation_digest=sha256_file(executable),
+                    signer_thumbprint=signature.get("thumbprint"),
+                    file_version=signature.get("file_version"),
                 )
             return BambuConnectReadiness(
                 installed=False,
@@ -106,7 +111,36 @@ class BambuConnectManager:
                 if valid
                 else "Bambu Connect has an unexpected or invalid code signature."
             ),
+            installation_digest=sha256_file(executable),
+            signer_thumbprint=signature.get("thumbprint"),
+            file_version=signature.get("file_version"),
         )
+
+    def open(self) -> BambuConnectReadiness:
+        readiness = self.readiness()
+        if not readiness.installed or not readiness.signature_valid:
+            raise ExternalServiceError(readiness.message)
+        command = self._registered_command()
+        executable = (
+            self._command_executable(command or "")
+            if command
+            else next(
+                (
+                    item
+                    for item in self._installed_executables()
+                    if item.is_file()
+                ),
+                None,
+            )
+        )
+        if executable is None:
+            raise ExternalServiceError("Bambu Connect executable is unavailable")
+        subprocess.Popen(
+            [str(executable)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return readiness
 
     def install(self) -> BambuConnectReadiness:
         if os.name != "nt":
@@ -372,8 +406,12 @@ class BambuConnectManager:
         script = (
             "$s=Get-AuthenticodeSignature "
             "-LiteralPath $env:PRINTING_AGENT_SIGNATURE_PATH;"
+            "$v=(Get-Item -LiteralPath "
+            "$env:PRINTING_AGENT_SIGNATURE_PATH).VersionInfo.FileVersion;"
             "[PSCustomObject]@{Status=$s.Status.ToString();"
-            "Subject=$s.SignerCertificate.Subject}|ConvertTo-Json -Compress"
+            "Subject=$s.SignerCertificate.Subject;"
+            "Thumbprint=$s.SignerCertificate.Thumbprint;"
+            "FileVersion=$v}|ConvertTo-Json -Compress"
         )
         shell = shutil.which("pwsh.exe")
         if shell is None:
@@ -430,6 +468,8 @@ class BambuConnectManager:
         return {
             "status": payload.get("Status"),
             "subject": payload.get("Subject"),
+            "thumbprint": payload.get("Thumbprint"),
+            "file_version": payload.get("FileVersion"),
         }
 
     @classmethod

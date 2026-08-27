@@ -84,6 +84,27 @@ class LaunchBambuConnectRequest(BaseModel):
     sliced_artifact_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
+class ConfirmBambuConnectSetupRequest(BaseModel):
+    expected_profile_revision: int = Field(ge=1)
+    expected_device_ref: str = Field(pattern=r"^[a-f0-9]{64}$")
+    expected_installation_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    acknowledged: bool
+    confirmed_by: str = Field(default="local-web", min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def require_acknowledgement(self) -> ConfirmBambuConnectSetupRequest:
+        if not self.acknowledged:
+            raise ValueError("Bambu Connect setup must be acknowledged")
+        return self
+
+
+class ReviseSlicingConfigurationRequest(BaseModel):
+    overrides: JobOverrides
+    expected_configuration_revision: int = Field(ge=1)
+    expected_snapshot_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    created_by: str = Field(default="local-web", min_length=1, max_length=200)
+
+
 class SaveCloudCredentialRequest(BaseModel):
     access_token: SecretStr
     region: CloudRegion
@@ -428,6 +449,19 @@ def create_app(container: Container | None = None) -> FastAPI:
             slice_job = await container.repository.get_latest_slice_job(workflow.id)
         except NotFoundError:
             slice_job = None
+        if (
+            printer_snapshot is not None
+            and material_assignment is not None
+            and material_assignment.printer_snapshot_digest
+            != printer_snapshot.digest
+        ):
+            material_assignment = None
+        if (
+            printer_snapshot is not None
+            and slice_job is not None
+            and slice_job.printer_snapshot_digest != printer_snapshot.digest
+        ):
+            slice_job = None
         sliced_artifact = None
         try:
             bambu_connect_handoff = (
@@ -445,14 +479,17 @@ def create_app(container: Container | None = None) -> FastAPI:
             )
         ):
             bambu_connect_handoff = None
-        try:
-            cloud_snapshot = (
-        await container.repository.get_latest_cloud_device_snapshot(
-            workflow.id
-        )
-            )
-        except NotFoundError:
-            cloud_snapshot = None
+        cloud_snapshot = None
+        if printer_snapshot is not None:
+            try:
+                cloud_snapshot = (
+                    await container.repository.get_latest_cloud_device_snapshot(
+                        workflow.id,
+                        printer_snapshot.digest,
+                    )
+                )
+            except NotFoundError:
+                pass
         if (
             material_assignment is not None
             and cloud_snapshot is not None
@@ -477,6 +514,13 @@ def create_app(container: Container | None = None) -> FastAPI:
                 material_assignment = None
         material_mappings = []
         quantity_authorizations: list[dict[str, object]] = []
+        configuration_history = (
+            await container.repository.list_workflow_printer_snapshot_revisions(
+                workflow.id
+            )
+            if printer_snapshot is not None
+            else []
+        )
         if cloud_snapshot is not None and printer_snapshot is not None:
             profile = await container.repository.get_printer_profile(
                 printer_snapshot.profile_id,
@@ -594,6 +638,10 @@ def create_app(container: Container | None = None) -> FastAPI:
             ),
             "material_mappings": material_mappings,
             "quantity_authorizations": quantity_authorizations,
+            "configuration_history": [
+                _masked_slicing_snapshot(item)
+                for item in configuration_history
+            ],
             "bambu_connect_handoff": (
                 bambu_connect_handoff.model_dump(
                     mode="json",
@@ -630,6 +678,73 @@ def create_app(container: Container | None = None) -> FastAPI:
             request
         ).application.install_bambu_connect()
         return readiness.model_dump(mode="json")
+
+    @app.post("/api/v1/bambu-connect/open")
+    async def open_bambu_connect(
+        request: Request,
+    ) -> dict[str, object]:
+        require_local_credential_request(request)
+        readiness = await get_container(
+            request
+        ).application.open_bambu_connect()
+        return readiness.model_dump(mode="json")
+
+    @app.get(
+        "/api/v1/slicing-profiles/{profile_id}/bambu-connect-status"
+    )
+    async def bambu_connect_setup_status(
+        profile_id: str,
+        request: Request,
+        profile_revision: int | None = None,
+    ) -> dict[str, object]:
+        return await get_container(
+            request
+        ).application.bambu_connect_setup_status(
+            profile_id,
+            profile_revision,
+        )
+
+    @app.post(
+        "/api/v1/slicing-profiles/{profile_id}/bambu-connect-confirmation"
+    )
+    async def confirm_bambu_connect_setup(
+        profile_id: str,
+        body: ConfirmBambuConnectSetupRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        require_local_credential_request(request)
+        confirmation = await get_container(
+            request
+        ).application.confirm_bambu_connect_setup(
+            profile_id,
+            profile_revision=body.expected_profile_revision,
+            expected_device_ref=body.expected_device_ref,
+            expected_installation_digest=(
+                body.expected_installation_digest
+            ),
+            confirmed_by=body.confirmed_by,
+        )
+        return confirmation.model_dump(
+            mode="json",
+            exclude={"device_ref"},
+        )
+
+    @app.delete(
+        "/api/v1/slicing-profiles/{profile_id}/bambu-connect-confirmation"
+    )
+    async def revoke_bambu_connect_setup(
+        profile_id: str,
+        request: Request,
+        profile_revision: int | None = None,
+    ) -> dict[str, str]:
+        require_local_credential_request(request)
+        await get_container(
+            request
+        ).application.revoke_bambu_connect_setup(
+            profile_id,
+            profile_revision,
+        )
+        return {"status": "revoked"}
 
     @app.post("/api/v1/workflows", status_code=202)
     async def create_workflow(
@@ -1176,7 +1291,8 @@ def create_app(container: Container | None = None) -> FastAPI:
             printer_snapshot.profile_revision,
         )
         snapshot = await container.repository.get_latest_cloud_device_snapshot(
-            workflow_id
+            workflow_id,
+            printer_snapshot.digest,
         )
         return [
             item.model_dump(mode="json")
@@ -1277,6 +1393,27 @@ def create_app(container: Container | None = None) -> FastAPI:
     ) -> dict[str, object]:
         container = get_container(request)
         await container.application.prepare_slicing_materials(workflow_id)
+        workflow = await container.repository.get_workflow(workflow_id)
+        return await serialize_workflow(container, workflow)
+
+    @app.post(
+        "/api/v1/workflows/{workflow_id}/slicing-configuration"
+    )
+    async def revise_slicing_configuration(
+        workflow_id: str,
+        body: ReviseSlicingConfigurationRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        container = get_container(request)
+        await container.application.revise_slicing_configuration(
+            workflow_id,
+            body.overrides,
+            expected_configuration_revision=(
+                body.expected_configuration_revision
+            ),
+            expected_snapshot_digest=body.expected_snapshot_digest,
+            created_by=body.created_by,
+        )
         workflow = await container.repository.get_workflow(workflow_id)
         return await serialize_workflow(container, workflow)
 

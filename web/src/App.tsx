@@ -131,6 +131,14 @@ type WorkflowResponse = {
   revision_failure: RevisionVerification | null
   revision_verification: RevisionVerification | null
   printer_snapshot: {
+    configuration_revision: number
+    revision_reason:
+      | 'initial'
+      | 'settings_applied'
+      | 'post_slice_revision'
+      | 'restored'
+    created_by: string
+    created_at: string
     profile_id: string
     profile_revision: number
     digest: string
@@ -151,6 +159,18 @@ type WorkflowResponse = {
   material_mappings: FilamentMappingStatus[]
   quantity_authorizations: QuantityAuthorizationState[]
   bambu_connect_handoff: BambuConnectHandoffPayload | null
+  configuration_history: Array<{
+    configuration_revision: number
+    revision_reason:
+      | 'initial'
+      | 'settings_applied'
+      | 'post_slice_revision'
+      | 'restored'
+    created_by: string
+    created_at: string
+    digest: string
+    overrides: JobOverrides
+  }>
 }
 
 type Printer = {
@@ -178,6 +198,26 @@ type JobOverrides = {
   allow_manual_swaps: boolean | null
   maximum_color_distance: number
   material_safety_margin_percent: number
+}
+
+const DEFAULT_H2D_OVERRIDES: JobOverrides = {
+  toolhead_id: null,
+  nozzle_diameter_mm: null,
+  plate_id: null,
+  layer_height_mm: null,
+  infill_percent: null,
+  supports: null,
+  brim: null,
+  raft: null,
+  timelapse: null,
+  calibration: null,
+  forbidden_slot_ids: [],
+  allowed_slot_ids: null,
+  part_allowed_slot_ids: {},
+  part_forbidden_slot_ids: {},
+  allow_manual_swaps: null,
+  maximum_color_distance: 12,
+  material_safety_margin_percent: 15,
 }
 
 type PrinterProfile = {
@@ -324,6 +364,14 @@ type BambuConnectReadiness = {
   signature_valid: boolean
   ready: boolean
   message: string
+}
+
+type BambuConnectSetupPayload = {
+  status: string
+  message: string
+  active: boolean
+  device_name: string | null
+  readiness: BambuConnectReadiness
 }
 
 type MaterialEligibilityRejection = {
@@ -1019,7 +1067,7 @@ function ModelThumbnail({ url }: { url: string }) {
   return <div className="model-thumbnail" ref={containerRef} aria-label="3D model preview" />
 }
 
-function PrepareH2DSliceDialog({
+export function PrepareH2DSliceDialog({
   source,
   profiles,
   readiness,
@@ -1312,7 +1360,6 @@ function DashboardPanel({
 }) {
   const queryClient = useQueryClient()
   const [filter, setFilter] = useState<DashboardFilter>('all')
-  const [printSource, setPrintSource] = useState<WorkflowResponse | null>(null)
   const workflows = useQuery({
     queryKey: ['workflows'],
     queryFn: () => api<WorkflowResponse[]>('/workflows'),
@@ -1322,10 +1369,6 @@ function DashboardPanel({
       )
         ? 2500
         : 10000,
-  })
-  const profiles = useQuery({
-    queryKey: ['printer-profiles'],
-    queryFn: () => api<PrinterProfile[]>('/slicing-profiles'),
   })
   const readiness = useQuery({
     queryKey: ['fabrication-readiness'],
@@ -1343,6 +1386,20 @@ function DashboardPanel({
     mutationFn: (id: string) => api(`/workflows/${id}/print`, { method: 'POST' }),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['workflows'] }),
   })
+  const createH2dSlice = useMutation({
+    mutationFn: (id: string) =>
+      api<WorkflowResponse>(`/workflows/${id}/slicing-copies`, {
+        method: 'POST',
+        body: JSON.stringify({
+          profile_id: 'bambu-h2d',
+          overrides: DEFAULT_H2D_OVERRIDES,
+        }),
+      }),
+    onSuccess: (created) => {
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+      onSlice(created.workflow.id)
+    },
+  })
   const archive = useMutation({
     mutationFn: ({ id, restore }: { id: string; restore: boolean }) =>
       api<WorkflowResponse>(`/workflows/${id}/${restore ? 'restore' : 'archive'}`, {
@@ -1352,6 +1409,9 @@ function DashboardPanel({
   })
   const items = (workflows.data ?? []).filter((item) =>
     matchesFilter(item.workflow, filter),
+  )
+  const h2dReadiness = readiness.data?.find(
+    (item) => item.profile_id === 'bambu-h2d',
   )
 
   const archiveModel = (workflow: Workflow) => {
@@ -1506,11 +1566,25 @@ function DashboardPanel({
                       {artifact && (
                         <button
                           className="primary-action"
-                          onClick={() => setPrintSource(entry)}
+                          disabled={
+                            createH2dSlice.isPending ||
+                            h2dReadiness?.ready_for_fabrication !== true
+                          }
+                          onClick={() => createH2dSlice.mutate(workflow.id)}
                         >
-                          Prepare H2D slice <span>→</span>
+                          {createH2dSlice.isPending
+                            ? 'Opening slicing…'
+                            : 'Slice with H2D'}{' '}
+                          <span>→</span>
                         </button>
                       )}
+                      {artifact &&
+                        h2dReadiness &&
+                        !h2dReadiness.ready_for_fabrication && (
+                          <a className="text-button" href="#/fabrication">
+                            {h2dReadiness.cloud_binding.message}
+                          </a>
+                        )}
                       {['awaiting_approval', 'approved'].includes(workflow.state) &&
                         artifact?.source_available && (
                           <button className="text-button" onClick={() => onOpen(workflow.id)}>
@@ -1555,19 +1629,13 @@ function DashboardPanel({
           )
         })}
       </section>
-      {(copy.error || print.error || archive.error) && (
+      {(copy.error || print.error || archive.error || createH2dSlice.error) && (
         <p className="error-copy">
-          {copy.error?.message ?? print.error?.message ?? archive.error?.message}
+          {copy.error?.message ??
+            print.error?.message ??
+            archive.error?.message ??
+            createH2dSlice.error?.message}
         </p>
-      )}
-      {printSource && (
-        <PrepareH2DSliceDialog
-          onClose={() => setPrintSource(null)}
-          onCreated={onSlice}
-          profiles={profiles.data ?? []}
-          readiness={readiness.data ?? []}
-          source={printSource}
-        />
       )}
     </main>
   )
@@ -1631,6 +1699,284 @@ function FabricationStepper({
   )
 }
 
+function SlicingJobSettings({
+  snapshot,
+  draft,
+  cloudSnapshot,
+  history,
+  editable,
+  canRevise,
+  dirty,
+  pending,
+  error,
+  onChange,
+  onApply,
+  onReset,
+  onRevise,
+}: {
+  snapshot: NonNullable<WorkflowResponse['printer_snapshot']>
+  draft: JobOverrides
+  cloudSnapshot: CloudDeviceSnapshotPayload | null
+  history: WorkflowResponse['configuration_history']
+  editable: boolean
+  canRevise: boolean
+  dirty: boolean
+  pending: boolean
+  error: string | null
+  onChange: (value: JobOverrides) => void
+  onApply: () => void
+  onReset: () => void
+  onRevise: () => void
+}) {
+  const trays = new Map(
+    [
+      ...(cloudSnapshot?.ams_units.flatMap((unit) => unit.trays) ?? []),
+      ...(cloudSnapshot?.external_trays ?? []),
+    ].map((tray) => [tray.slot_id, tray]),
+  )
+  const update = <Key extends keyof JobOverrides>(
+    key: Key,
+    value: JobOverrides[Key],
+  ) => onChange({ ...draft, [key]: value })
+  const triValue = (value: boolean | null) =>
+    value == null ? '' : value ? 'true' : 'false'
+  const triUpdate = (
+    key: 'supports' | 'brim' | 'raft' | 'allow_manual_swaps',
+    value: string,
+  ) => update(key, value === '' ? null : value === 'true')
+  const toggleSlot = (slotId: string) =>
+    update(
+      'forbidden_slot_ids',
+      draft.forbidden_slot_ids.includes(slotId)
+        ? draft.forbidden_slot_ids.filter((item) => item !== slotId)
+        : [...draft.forbidden_slot_ids, slotId],
+    )
+
+  return (
+    <section className="slice-step-card job-settings-card">
+      <span className="section-label">Job settings</span>
+      <div className="job-settings-heading">
+        <div>
+          <strong>Configuration revision {snapshot.configuration_revision}</strong>
+          <p>
+            {editable
+              ? dirty
+                ? 'Unsaved job settings'
+                : 'Defaults and overrides are ready'
+              : 'Settings locked for this slice'}
+          </p>
+        </div>
+        {!editable && canRevise && (
+          <button className="secondary-action" onClick={onRevise}>
+            Revise settings &amp; reslice
+          </button>
+        )}
+      </div>
+
+      <div className="job-settings-grid">
+        <label>
+          Toolhead
+          <select
+            disabled={!editable}
+            value={draft.toolhead_id ?? ''}
+            onChange={(event) =>
+              update('toolhead_id', event.target.value || null)
+            }
+          >
+            <option value="">Profile default</option>
+            {snapshot.profile.toolheads.map((toolhead) => (
+              <option key={toolhead.id} value={toolhead.id}>
+                {toolhead.name} · {toolhead.nozzle_diameter_mm} mm
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Nozzle diameter override
+          <input
+            disabled={!editable}
+            max="2"
+            min="0.1"
+            step="0.1"
+            type="number"
+            value={draft.nozzle_diameter_mm ?? ''}
+            onChange={(event) =>
+              update(
+                'nozzle_diameter_mm',
+                event.target.value ? Number(event.target.value) : null,
+              )
+            }
+          />
+        </label>
+        <label>
+          Plate
+          <select
+            disabled={!editable}
+            value={draft.plate_id ?? ''}
+            onChange={(event) =>
+              update('plate_id', event.target.value || null)
+            }
+          >
+            <option value="">Profile default</option>
+            {snapshot.profile.plates.map((plate) => (
+              <option key={plate.id} value={plate.id}>
+                {plate.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Layer height
+          <input
+            disabled={!editable}
+            max="1"
+            min="0.05"
+            step="0.05"
+            type="number"
+            value={draft.layer_height_mm ?? ''}
+            onChange={(event) =>
+              update(
+                'layer_height_mm',
+                event.target.value ? Number(event.target.value) : null,
+              )
+            }
+          />
+        </label>
+        <label>
+          Infill %
+          <input
+            disabled={!editable}
+            max="100"
+            min="0"
+            type="number"
+            value={draft.infill_percent ?? ''}
+            onChange={(event) =>
+              update(
+                'infill_percent',
+                event.target.value ? Number(event.target.value) : null,
+              )
+            }
+          />
+        </label>
+        {(
+          [
+            ['supports', 'Supports'],
+            ['brim', 'Brim'],
+            ['raft', 'Raft'],
+            ['allow_manual_swaps', 'Manual spool swaps'],
+          ] as const
+        ).map(([key, label]) => (
+          <label key={key}>
+            {label}
+            <select
+              disabled={!editable}
+              value={triValue(draft[key])}
+              onChange={(event) => triUpdate(key, event.target.value)}
+            >
+              <option value="">Profile default</option>
+              <option value="true">Enabled</option>
+              <option value="false">Disabled</option>
+            </select>
+          </label>
+        ))}
+        <label>
+          Maximum color distance
+          <input
+            disabled={!editable}
+            max="100"
+            min="0"
+            step="0.5"
+            type="number"
+            value={draft.maximum_color_distance}
+            onChange={(event) =>
+              update('maximum_color_distance', Number(event.target.value))
+            }
+          />
+        </label>
+        <label>
+          Material safety margin %
+          <input
+            disabled={!editable}
+            max="100"
+            min="0"
+            step="1"
+            type="number"
+            value={draft.material_safety_margin_percent}
+            onChange={(event) =>
+              update(
+                'material_safety_margin_percent',
+                Number(event.target.value),
+              )
+            }
+          />
+        </label>
+      </div>
+
+      <span className="section-label">Masked slots for this job</span>
+      <div className="job-slot-grid">
+        {snapshot.profile.material_slots.map((slot) => {
+          const tray = trays.get(slot.id)
+          return (
+            <label className="checkbox-label" key={slot.id}>
+              <input
+                checked={draft.forbidden_slot_ids.includes(slot.id)}
+                disabled={!editable}
+                onChange={() => toggleSlot(slot.id)}
+                type="checkbox"
+              />
+              <span>
+                {studioSlotLabel(slot.id)}
+                <small>
+                  {tray?.material ?? 'Empty'}
+                  {tray?.color ? ` · ${tray.color}` : ''}
+                </small>
+              </span>
+            </label>
+          )
+        })}
+      </div>
+
+      {editable && (
+        <div className="job-settings-actions">
+          <button
+            className="secondary-action"
+            disabled={!dirty || pending}
+            onClick={onReset}
+          >
+            Reset
+          </button>
+          <button
+            className="primary-action"
+            disabled={!dirty || pending}
+            onClick={onApply}
+          >
+            {pending
+              ? 'Applying settings…'
+              : 'Apply settings & refresh materials'}
+          </button>
+        </div>
+      )}
+      {error && <p className="error-copy">{error}</p>}
+
+      <details>
+        <summary>Configuration history</summary>
+        <div className="configuration-history">
+          {history.map((item) => (
+            <div key={item.configuration_revision}>
+              <strong>Revision {item.configuration_revision}</strong>
+              <span>{item.revision_reason.replaceAll('_', ' ')}</span>
+              <small>
+                {new Date(item.created_at).toLocaleString()} · {item.created_by}
+              </small>
+              <code>{item.digest}</code>
+            </div>
+          ))}
+        </div>
+      </details>
+    </section>
+  )
+}
+
 function SlicingWorkspace({
   workflowId,
   onBack,
@@ -1643,6 +1989,11 @@ function SlicingWorkspace({
   const [connectDialogOpen, setConnectDialogOpen] = useState(false)
   const [quantityReview, setQuantityReview] =
     useState<MaterialEligibilityRejection | null>(null)
+  const [settingsDraft, setSettingsDraft] = useState<JobOverrides | null>(null)
+  const [settingsDraftSource, setSettingsDraftSource] = useState<string | null>(
+    null,
+  )
+  const [revisingSettings, setRevisingSettings] = useState(false)
   const preparationAttempted = useRef(false)
   const workflowQuery = useQuery({
     queryKey: ['workflow', workflowId],
@@ -1685,6 +2036,32 @@ function SlicingWorkspace({
       setMaterialOverrides({})
       queryClient.setQueryData(['workflow', workflowId], prepared)
       void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+    },
+  })
+  const applySlicingSettings = useMutation({
+    mutationFn: (overrides: JobOverrides) =>
+      api<WorkflowResponse>(
+        `/workflows/${workflowId}/slicing-configuration`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            overrides,
+            expected_configuration_revision:
+              data!.printer_snapshot!.configuration_revision,
+            expected_snapshot_digest: data!.printer_snapshot!.digest,
+            created_by: 'local-web',
+          }),
+        },
+      ),
+    onSuccess: (updated) => {
+      setMaterialOverrides({})
+      setRevisingSettings(false)
+      preparationAttempted.current = true
+      queryClient.setQueryData(['workflow', workflowId], updated)
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+    },
+    onError: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
     },
   })
   const authorizeUnknownQuantity = useMutation({
@@ -1783,17 +2160,25 @@ function SlicingWorkspace({
       void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
     },
   })
-  const connectReadiness = useQuery({
-    queryKey: ['bambu-connect-readiness'],
-    queryFn: () => api<BambuConnectReadiness>('/bambu-connect/readiness'),
-    enabled: Boolean(data?.sliced_artifact),
+  const connectSetup = useQuery({
+    queryKey: ['bambu-connect-setup', data?.printer_snapshot?.profile_id],
+    queryFn: () =>
+      api<BambuConnectSetupPayload>(
+        `/slicing-profiles/${encodeURIComponent(
+          data!.printer_snapshot!.profile_id,
+        )}/bambu-connect-status?profile_revision=${
+          data!.printer_snapshot!.profile_revision
+        }`,
+      ),
+    enabled: Boolean(data?.sliced_artifact && data?.printer_snapshot),
   })
   const installConnect = useMutation({
     mutationFn: () =>
       api<BambuConnectReadiness>('/bambu-connect/install', { method: 'POST' }),
-    onSuccess: (readiness) => {
-      queryClient.setQueryData(['bambu-connect-readiness'], readiness)
-    },
+    onSuccess: () =>
+      void queryClient.invalidateQueries({
+        queryKey: ['bambu-connect-setup'],
+      }),
   })
   const launchConnect = useMutation({
     mutationFn: () =>
@@ -1825,7 +2210,19 @@ function SlicingWorkspace({
     confirmAndSlice.isPending ||
     retrySlice.isPending ||
     prepareMaterials.isPending ||
-    authorizeUnknownQuantity.isPending
+    authorizeUnknownQuantity.isPending ||
+    applySlicingSettings.isPending
+
+  useEffect(() => {
+    if (
+      data?.printer_snapshot &&
+      data.printer_snapshot.digest !== settingsDraftSource
+    ) {
+      setSettingsDraft(data.printer_snapshot.overrides)
+      setRevisingSettings(false)
+      setSettingsDraftSource(data.printer_snapshot.digest)
+    }
+  }, [data?.printer_snapshot, settingsDraftSource])
 
   useEffect(() => {
     if (
@@ -1890,6 +2287,20 @@ function SlicingWorkspace({
   const recoveryCanConfirm =
     !materialRecovery || materialRecovery.status === 'replacement_proposed'
   const connectHandoff = data.bambu_connect_handoff
+  const settingsDirty =
+    settingsDraft != null &&
+    JSON.stringify(settingsDraft) !==
+      JSON.stringify(data.printer_snapshot?.overrides)
+  const settingsStateEditable = [
+    'approved',
+    'slice_setup',
+    'awaiting_material_review',
+  ].includes(workflow.state)
+  const settingsEditable = settingsStateEditable || revisingSettings
+  const settingsCanRevise = [
+    'awaiting_slice_review',
+    'slice_failed',
+  ].includes(workflow.state)
   const connectMonitoringActive =
     connectHandoff != null &&
     [
@@ -2003,6 +2414,26 @@ function SlicingWorkspace({
               {data.printer_snapshot?.profile.slicer.process_profile_id}
             </p>
           </section>
+
+          {data.printer_snapshot && settingsDraft && (
+            <SlicingJobSettings
+              canRevise={settingsCanRevise}
+              cloudSnapshot={data.cloud_snapshot}
+              dirty={settingsDirty}
+              draft={settingsDraft}
+              editable={settingsEditable}
+              error={applySlicingSettings.error?.message ?? null}
+              history={data.configuration_history}
+              onApply={() => applySlicingSettings.mutate(settingsDraft)}
+              onChange={setSettingsDraft}
+              onReset={() =>
+                setSettingsDraft(data.printer_snapshot!.overrides)
+              }
+              onRevise={() => setRevisingSettings(true)}
+              pending={applySlicingSettings.isPending}
+              snapshot={data.printer_snapshot}
+            />
+          )}
 
           <section className="slice-step-card">
             <span className="section-label">2 · Cloud device snapshot</span>
@@ -2347,7 +2778,8 @@ function SlicingWorkspace({
                     disabled={
                       confirmAndSlice.isPending ||
                       refreshCloud.isPending ||
-                      !recoveryCanConfirm
+                      !recoveryCanConfirm ||
+                      settingsDirty
                     }
                     onClick={() => confirmAndSlice.mutate()}
                   >
@@ -2466,18 +2898,21 @@ function SlicingWorkspace({
               </p>
 
               {!connectHandoff &&
-                (connectReadiness.isLoading ? (
+                (connectSetup.isLoading ? (
                   <small>Checking Bambu Connect…</small>
-                ) : connectReadiness.data?.ready ? (
+                ) : connectSetup.data?.active ? (
                   <button
                     className="primary-action"
                     onClick={() => setConnectDialogOpen(true)}
                   >
                     Open verified file in Bambu Connect
                   </button>
-                ) : (
+                ) : !connectSetup.data?.readiness.ready ? (
                   <div className="connect-prerequisite">
-                    <span>{connectReadiness.data?.message ?? 'Bambu Connect is unavailable.'}</span>
+                    <span>
+                      {connectSetup.data?.readiness.message ??
+                        'Bambu Connect is unavailable.'}
+                    </span>
                     <button
                       className="primary-action"
                       disabled={installConnect.isPending}
@@ -2487,6 +2922,16 @@ function SlicingWorkspace({
                         ? 'Downloading and installing Connect…'
                         : 'Install official Bambu Connect'}
                     </button>
+                  </div>
+                ) : (
+                  <div className="connect-prerequisite">
+                    <span>
+                      {connectSetup.data?.message ??
+                        'Confirm Bambu Connect setup for the bound H2D.'}
+                    </span>
+                    <a className="primary-action" href="#/fabrication">
+                      Open Connect setup
+                    </a>
                   </div>
                 ))}
 
@@ -2554,12 +2999,12 @@ function SlicingWorkspace({
                 </div>
               )}
 
-              {(connectReadiness.error ||
+              {(connectSetup.error ||
                 installConnect.error ||
                 launchConnect.error ||
                 stopConnectMonitoring.error) && (
                 <p className="error-copy">
-                  {connectReadiness.error?.message ??
+                  {connectSetup.error?.message ??
                     installConnect.error?.message ??
                     launchConnect.error?.message ??
                     stopConnectMonitoring.error?.message}

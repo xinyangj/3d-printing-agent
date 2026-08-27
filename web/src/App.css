@@ -1017,6 +1017,102 @@ select:focus {
   max-width: 760px;
 }
 
+.connect-setup-card {
+  align-content: start;
+}
+
+.connect-setup-step {
+  align-items: center;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  padding-top: 12px;
+}
+
+.connect-setup-step > span {
+  align-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  display: inline-flex;
+  font-size: 11px;
+  font-weight: 750;
+  height: 26px;
+  justify-content: center;
+  width: 26px;
+}
+
+.connect-setup-step > div {
+  display: grid;
+  gap: 3px;
+}
+
+.job-settings-card {
+  border-color: #78958e;
+}
+
+.job-settings-heading {
+  align-items: start;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.job-settings-heading > div {
+  display: grid;
+  gap: 4px;
+}
+
+.job-settings-heading p {
+  margin: 0;
+}
+
+.job-settings-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.job-slot-grid {
+  display: grid;
+  gap: 7px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.job-slot-grid .checkbox-label {
+  align-items: start;
+  border: 1px solid var(--line);
+  padding: 8px;
+}
+
+.job-slot-grid .checkbox-label span {
+  display: grid;
+  gap: 2px;
+}
+
+.job-settings-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.configuration-history {
+  display: grid;
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.configuration-history > div {
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 3px;
+  padding: 8px;
+}
+
+.configuration-history code {
+  overflow-wrap: anywhere;
+}
+
 .slot-observation-actions {
   align-items: center;
   display: flex;

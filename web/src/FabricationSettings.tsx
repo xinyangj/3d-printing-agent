@@ -5,6 +5,7 @@ import {
   type CloudDevice,
   type CredentialStatus,
 } from './BambuAccountConnection'
+import { BambuConnectSetupCard } from './BambuConnectSetupCard'
 import { UnknownQuantityAuthorizationDialog } from './UnknownQuantityAuthorizationDialog'
 
 const API = '/api/v1'
@@ -401,6 +402,12 @@ export function FabricationSettings() {
           credentialStatus={credentials.data}
           devices={devices.data}
           localCredentialSetup={localCredentialSetup}
+        />
+
+        <BambuConnectSetupCard
+          localManagement={localCredentialSetup}
+          profileId={selectedProfileId}
+          profileRevision={selectedProfile?.revision ?? null}
         />
 
         <section className="inspection-panel">

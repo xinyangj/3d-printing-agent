@@ -61,6 +61,7 @@ from printing_agent.errors import (
 from printing_agent.fabrication import (
     BambuConnectHandoff,
     BambuConnectHandoffStatus,
+    BambuConnectSetupConfirmation,
     JobOverrides,
     MaterialAssignment,
     MaterialCandidate,
@@ -187,40 +188,7 @@ class PrintingApplication:
             and not cloud_binding_available
         ):
             raise ConflictError(cloud_binding_message)
-        if profile.spec.slicer.driver_id == "bambu_studio_cli" and (
-            resolved_overrides.timelapse is not None
-            or resolved_overrides.calibration is not None
-        ):
-            raise ValidationError(
-                "Timelapse and calibration are not supported by the slice-only workflow"
-            )
-        slot_ids = {slot.id for slot in profile.spec.material_slots}
-        toolhead_ids = {toolhead.id for toolhead in profile.spec.toolheads}
-        plate_ids = {plate.id for plate in profile.spec.plates}
-        referenced_slots = set(resolved_overrides.forbidden_slot_ids)
-        referenced_slots.update(resolved_overrides.allowed_slot_ids or set())
-        referenced_slots.update(
-            slot
-            for values in resolved_overrides.part_allowed_slot_ids.values()
-            for slot in values
-        )
-        referenced_slots.update(
-            slot
-            for values in resolved_overrides.part_forbidden_slot_ids.values()
-            for slot in values
-        )
-        if not referenced_slots.issubset(slot_ids):
-            raise ValidationError("Job overrides reference unknown material slots")
-        if (
-            resolved_overrides.toolhead_id is not None
-            and resolved_overrides.toolhead_id not in toolhead_ids
-        ):
-            raise ValidationError("Job overrides reference an unknown toolhead")
-        if (
-            resolved_overrides.plate_id is not None
-            and resolved_overrides.plate_id not in plate_ids
-        ):
-            raise ValidationError("Job overrides reference an unknown plate")
+        self._validate_job_overrides(profile, resolved_overrides)
         snapshot = WorkflowPrinterSnapshot(
             workflow_id=workflow_id,
             profile_id=profile.profile_id,
@@ -238,6 +206,46 @@ class PrintingApplication:
             ),
         ).with_digest()
         return profile, snapshot
+
+    @staticmethod
+    def _validate_job_overrides(
+        profile: PrinterProfileRevision,
+        overrides: JobOverrides,
+    ) -> None:
+        if profile.spec.slicer.driver_id == "bambu_studio_cli" and (
+            overrides.timelapse is not None
+            or overrides.calibration is not None
+        ):
+            raise ValidationError(
+                "Timelapse and calibration are not supported by the slice-only workflow"
+            )
+        slot_ids = {slot.id for slot in profile.spec.material_slots}
+        toolhead_ids = {toolhead.id for toolhead in profile.spec.toolheads}
+        plate_ids = {plate.id for plate in profile.spec.plates}
+        referenced_slots = set(overrides.forbidden_slot_ids)
+        referenced_slots.update(overrides.allowed_slot_ids or set())
+        referenced_slots.update(
+            slot
+            for values in overrides.part_allowed_slot_ids.values()
+            for slot in values
+        )
+        referenced_slots.update(
+            slot
+            for values in overrides.part_forbidden_slot_ids.values()
+            for slot in values
+        )
+        if not referenced_slots.issubset(slot_ids):
+            raise ValidationError("Job overrides reference unknown material slots")
+        if (
+            overrides.toolhead_id is not None
+            and overrides.toolhead_id not in toolhead_ids
+        ):
+            raise ValidationError("Job overrides reference an unknown toolhead")
+        if (
+            overrides.plate_id is not None
+            and overrides.plate_id not in plate_ids
+        ):
+            raise ValidationError("Job overrides reference an unknown plate")
 
     async def fabrication_readiness(
         self,
@@ -610,7 +618,8 @@ class PrintingApplication:
                 printer_snapshot.profile_revision,
             )
             snapshot = await self.repository.get_latest_cloud_device_snapshot(
-                workflow_id
+                workflow_id,
+                printer_snapshot.digest,
             )
             await self._authorize_unknown_quantity_slot(
                 profile,
@@ -751,7 +760,8 @@ class PrintingApplication:
         try:
             previous_snapshot = (
                 await self.repository.get_latest_cloud_device_snapshot(
-                    workflow_id
+                    workflow_id,
+                    profile_snapshot.digest,
                 )
             )
         except NotFoundError:
@@ -764,6 +774,7 @@ class PrintingApplication:
             workflow_id,
             profile.profile_id,
             snapshot,
+            profile_snapshot.digest,
         )
         await self.synchronize_material_mappings(profile, snapshot)
         mapping_after = await self._material_mapping_signature(
@@ -831,6 +842,11 @@ class PrintingApplication:
         printer_snapshot = (
             await self.repository.get_workflow_printer_snapshot(workflow_id)
         )
+        if (
+            job.printer_snapshot_digest != printer_snapshot.digest
+            or assignment.printer_snapshot_digest != printer_snapshot.digest
+        ):
+            return
         try:
             spools, materials = await self._observed_cloud_spools(profile, snapshot)
             available = await self.repository.available_spool_weights(
@@ -1244,7 +1260,10 @@ class PrintingApplication:
             printer_snapshot.profile_id,
             printer_snapshot.profile_revision,
         )
-        snapshot = await self.repository.get_latest_cloud_device_snapshot(workflow_id)
+        snapshot = await self.repository.get_latest_cloud_device_snapshot(
+            workflow_id,
+            printer_snapshot.digest,
+        )
         groups = observed_filament_groups(snapshot)
         group = groups.get(cloud_filament_id)
         if group is None:
@@ -2427,6 +2446,89 @@ class PrintingApplication:
             )
         )
 
+    async def revise_slicing_configuration(
+        self,
+        workflow_id: str,
+        overrides: JobOverrides,
+        *,
+        expected_configuration_revision: int,
+        expected_snapshot_digest: str,
+        created_by: str,
+    ) -> MaterialAssignment:
+        await self.repository.get_workflow(workflow_id)
+        async with self._slicing_operation_lock(workflow_id):
+            workflow = await self.repository.get_workflow(workflow_id)
+            PrintingApplication._ensure_not_archived(workflow)
+            current = await self.repository.get_workflow_printer_snapshot(
+                workflow_id
+            )
+            if (
+                current.configuration_revision
+                != expected_configuration_revision
+                or current.digest != expected_snapshot_digest
+            ):
+                raise ConflictError(
+                    "Slicing settings changed; refresh the workspace and retry"
+                )
+            profile = await self.repository.get_printer_profile(
+                current.profile_id,
+                current.profile_revision,
+            )
+            self._validate_job_overrides(profile, overrides)
+            if overrides == current.overrides:
+                raise ConflictError("No slicing settings changed")
+            try:
+                handoff = await self.repository.get_latest_bambu_connect_handoff(
+                    workflow_id
+                )
+            except NotFoundError:
+                handoff = None
+            if (
+                handoff is not None
+                and handoff.status
+                not in {
+                    BambuConnectHandoffStatus.COMPLETED,
+                    BambuConnectHandoffStatus.FAILED,
+                    BambuConnectHandoffStatus.TIMED_OUT,
+                    BambuConnectHandoffStatus.CANCELLED,
+                }
+            ):
+                await self._stop_bambu_connect_monitoring_unlocked(workflow_id)
+            reason = (
+                "post_slice_revision"
+                if workflow.state
+                in {
+                    WorkflowState.AWAITING_SLICE_REVIEW,
+                    WorkflowState.SLICE_FAILED,
+                }
+                else "settings_applied"
+            )
+            revised = current.model_copy(
+                update={
+                    "configuration_revision": (
+                        current.configuration_revision + 1
+                    ),
+                    "revision_reason": reason,
+                    "created_by": created_by,
+                    "overrides": overrides,
+                    "resolved_slot_policy": resolve_slot_policy(
+                        profile.spec,
+                        overrides,
+                    ),
+                    "digest": None,
+                    "created_at": fabrication_utc_now(),
+                }
+            ).with_digest()
+            await self.repository.revise_workflow_printer_snapshot(
+                revised,
+                expected_configuration_revision=(
+                    expected_configuration_revision
+                ),
+                expected_digest=expected_snapshot_digest,
+            )
+            await self.refresh_cloud_snapshot(workflow_id)
+            return await self._propose_material_assignment_unlocked(workflow_id)
+
     async def propose_material_assignment(
         self,
         workflow_id: str,
@@ -2445,12 +2547,14 @@ class PrintingApplication:
             raise ConflictError(
                 "Refresh a complete cloud device snapshot before assigning materials"
             )
+        snapshot = await self.repository.get_workflow_printer_snapshot(workflow_id)
         try:
             latest_job = await self.repository.get_latest_slice_job(workflow_id)
         except NotFoundError:
             latest_job = None
         if (
             latest_job is not None
+            and latest_job.printer_snapshot_digest == snapshot.digest
             and latest_job.material_assessment is not None
             and latest_job.material_assessment.status != "sufficient"
         ):
@@ -2464,13 +2568,15 @@ class PrintingApplication:
             workflow_id,
             workflow.active_artifact_version,
         )
-        snapshot = await self.repository.get_workflow_printer_snapshot(workflow_id)
         profile = await self.repository.get_printer_profile(
             snapshot.profile_id,
             snapshot.profile_revision,
         )
         cloud_snapshot = (
-            await self.repository.get_latest_cloud_device_snapshot(workflow_id)
+            await self.repository.get_latest_cloud_device_snapshot(
+                workflow_id,
+                snapshot.digest,
+            )
         )
         if fabrication_utc_now() >= cloud_snapshot.expires_at:
             cloud_snapshot = await self.refresh_cloud_snapshot(
@@ -2708,7 +2814,12 @@ class PrintingApplication:
             raise ConflictError("Material assignment is stale")
         try:
             latest_job = await self.repository.get_latest_slice_job(workflow_id)
-            assessment = latest_job.material_assessment
+            assessment = (
+                latest_job.material_assessment
+                if latest_job.printer_snapshot_digest
+                == assignment.printer_snapshot_digest
+                else None
+            )
         except NotFoundError:
             assessment = None
         if assessment is not None and assessment.status != "sufficient":
@@ -2736,7 +2847,10 @@ class PrintingApplication:
             printer_snapshot.profile_revision,
         )
         cloud_snapshot = (
-            await self.repository.get_latest_cloud_device_snapshot(workflow_id)
+            await self.repository.get_latest_cloud_device_snapshot(
+                workflow_id,
+                printer_snapshot.digest,
+            )
         )
         await self._ensure_unknown_quantity_authorizations_current(
             profile,
@@ -2978,6 +3092,7 @@ class PrintingApplication:
             workflow_id,
             profile.profile_id,
             fresh_cloud_snapshot,
+            snapshot.digest,
         )
         if fresh_cloud_snapshot.digest != assignment.cloud_snapshot_digest:
             if workflow.state != WorkflowState.SLICE_SETUP:
@@ -3606,6 +3721,146 @@ class PrintingApplication:
     async def bambu_connect_readiness(self) -> BambuConnectReadiness:
         return await asyncio.to_thread(self.bambu_connect.readiness)
 
+    async def bambu_connect_setup_status(
+        self,
+        profile_id: str,
+        profile_revision: int | None = None,
+    ) -> dict[str, object]:
+        profile = await self.repository.get_printer_profile(
+            profile_id,
+            profile_revision,
+        )
+        readiness = await self.bambu_connect_readiness()
+        device_id = profile.spec.cloud_device_serial
+        device_ref = self._device_ref(device_id) if device_id else None
+        try:
+            confirmation = (
+                await self.repository.get_bambu_connect_setup_confirmation(
+                    profile_id,
+                    device_ref or "",
+                )
+            )
+        except NotFoundError:
+            confirmation = None
+        active = bool(
+            readiness.ready
+            and readiness.installation_digest
+            and readiness.signer_thumbprint
+            and readiness.file_version
+            and device_ref
+            and confirmation is not None
+            and confirmation.device_ref == device_ref
+            and confirmation.installation_digest
+            == readiness.installation_digest
+            and confirmation.signer_thumbprint
+            == readiness.signer_thumbprint
+            and confirmation.file_version == readiness.file_version
+        )
+        if not readiness.ready:
+            status = "connect_not_ready"
+            message = readiness.message
+        elif not device_ref:
+            status = "device_not_bound"
+            message = "Bind an H2D before confirming Bambu Connect setup."
+        elif active:
+            status = "confirmed"
+            message = (
+                "Bambu Connect setup is user-confirmed for "
+                f"{profile.spec.cloud_device_name or profile.spec.display_name}."
+            )
+        elif confirmation is not None:
+            status = "stale"
+            message = (
+                "Bambu Connect installation or bound H2D changed; "
+                "confirm setup again."
+            )
+        else:
+            status = "confirmation_required"
+            message = (
+                "Open Bambu Connect, sign in, and confirm the bound H2D is visible."
+            )
+        return {
+            "status": status,
+            "message": message,
+            "active": active,
+            "profile_id": profile.profile_id,
+            "device_ref": device_ref,
+            "device_name": profile.spec.cloud_device_name,
+            "readiness": readiness.model_dump(mode="json"),
+            "confirmation": (
+                confirmation.model_dump(
+                    mode="json",
+                    exclude={"device_ref"},
+                )
+                if confirmation is not None
+                else None
+            ),
+        }
+
+    async def open_bambu_connect(self) -> BambuConnectReadiness:
+        return await asyncio.to_thread(self.bambu_connect.open)
+
+    async def confirm_bambu_connect_setup(
+        self,
+        profile_id: str,
+        *,
+        profile_revision: int,
+        expected_device_ref: str,
+        expected_installation_digest: str,
+        confirmed_by: str,
+    ) -> BambuConnectSetupConfirmation:
+        profile = await self.repository.get_printer_profile(
+            profile_id,
+            profile_revision,
+        )
+        device_id = profile.spec.cloud_device_serial
+        if not device_id:
+            raise ConflictError("Slicing profile has no bound cloud H2D device")
+        device_ref = self._device_ref(device_id)
+        readiness = await self.bambu_connect_readiness()
+        if (
+            not readiness.ready
+            or not readiness.installation_digest
+            or not readiness.signer_thumbprint
+            or not readiness.file_version
+        ):
+            raise ConflictError("Bambu Connect is not ready")
+        if device_ref != expected_device_ref:
+            raise ConflictError("The bound H2D changed; review Connect setup again")
+        if readiness.installation_digest != expected_installation_digest:
+            raise ConflictError(
+                "Bambu Connect installation changed; review setup again"
+            )
+        confirmation = BambuConnectSetupConfirmation(
+            profile_id=profile_id,
+            device_ref=device_ref,
+            installation_digest=readiness.installation_digest,
+            signer_thumbprint=readiness.signer_thumbprint,
+            file_version=readiness.file_version,
+            confirmed_by=confirmed_by,
+        )
+        await self.repository.save_bambu_connect_setup_confirmation(
+            confirmation
+        )
+        return confirmation
+
+    async def revoke_bambu_connect_setup(
+        self,
+        profile_id: str,
+        profile_revision: int | None = None,
+    ) -> None:
+        profile = await self.repository.get_printer_profile(
+            profile_id,
+            profile_revision,
+        )
+        device_id = profile.spec.cloud_device_serial
+        if not device_id:
+            raise ConflictError("Slicing profile has no bound cloud H2D device")
+        await self.repository.revoke_bambu_connect_setup_confirmation(
+            profile_id,
+            self._device_ref(device_id),
+        )
+
     async def install_bambu_connect(self) -> BambuConnectReadiness:
         return await asyncio.to_thread(self.bambu_connect.install)
 
@@ -3727,6 +3982,14 @@ class PrintingApplication:
         device_id = profile.spec.cloud_device_serial
         if not device_id:
             raise ConflictError("Slicing profile has no bound cloud H2D device")
+        connect_status = await self.bambu_connect_setup_status(
+            profile.profile_id,
+            profile.revision,
+        )
+        if not connect_status["active"]:
+            raise ConflictError(
+                "Confirm Bambu Connect setup for the bound H2D before handoff"
+            )
         try:
             fresh_snapshot = await self.inventory.snapshot(device_id)
             baseline = await self.inventory.print_status(device_id)

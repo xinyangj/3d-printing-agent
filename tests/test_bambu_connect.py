@@ -19,9 +19,12 @@ from printing_agent.config import Settings
 from printing_agent.errors import PolicyViolationError
 from printing_agent.fabrication import (
     BambuConnectHandoff,
+    BambuConnectSetupConfirmation,
     SlicedArtifact,
 )
 from printing_agent.fabrication_drivers import BambuStudioCliDriver
+from printing_agent.fabrication_profiles import built_in_h2d_profile
+from printing_agent.repositories import WorkflowRepository
 
 
 def _sliced(path: Path) -> SlicedArtifact:
@@ -179,3 +182,66 @@ def test_connect_status_requires_expected_filename_or_task_name() -> None:
     assert PrintingApplication._connect_status_matches(handoff, matching)
     assert not PrintingApplication._connect_status_matches(handoff, unrelated)
     assert not PrintingApplication._connect_status_matches(handoff, prefixed)
+
+
+async def test_connect_setup_confirmation_is_bound_to_install_and_device(
+    repository: WorkflowRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = built_in_h2d_profile()
+    profile = base.model_copy(
+        update={
+            "spec": base.spec.model_copy(
+                update={
+                    "cloud_device_name": "Workshop H2D",
+                    "cloud_device_serial": "H2D-PRIVATE-SERIAL",
+                }
+            ),
+            "digest": None,
+        }
+    ).with_digest()
+    await repository.save_printer_profile(profile)
+    readiness = BambuConnectReadiness(
+        installed=True,
+        scheme_registered=True,
+        signature_valid=True,
+        ready=True,
+        message="ready",
+        installation_digest="a" * 64,
+        signer_thumbprint="thumbprint",
+        file_version="2.5.0",
+    )
+    application = object.__new__(PrintingApplication)
+    application.repository = repository
+    application.bambu_connect = BambuConnectManager(
+        Settings(database_url=repository.database_path)
+    )
+    monkeypatch.setattr(
+        application.bambu_connect,
+        "readiness",
+        lambda: readiness,
+    )
+    device_ref = application._device_ref("H2D-PRIVATE-SERIAL")
+
+    confirmation = await application.confirm_bambu_connect_setup(
+        profile.profile_id,
+        profile_revision=profile.revision,
+        expected_device_ref=device_ref,
+        expected_installation_digest=readiness.installation_digest or "",
+        confirmed_by="test",
+    )
+    assert isinstance(confirmation, BambuConnectSetupConfirmation)
+    assert (
+        await application.bambu_connect_setup_status(profile.profile_id)
+    )["active"] is True
+
+    monkeypatch.setattr(
+        application.bambu_connect,
+        "readiness",
+        lambda: readiness.model_copy(
+            update={"installation_digest": "b" * 64}
+        ),
+    )
+    stale = await application.bambu_connect_setup_status(profile.profile_id)
+    assert stale["active"] is False
+    assert stale["status"] == "stale"

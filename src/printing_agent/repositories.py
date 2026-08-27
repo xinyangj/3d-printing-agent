@@ -35,6 +35,7 @@ from printing_agent.errors import ConflictError, NotFoundError
 from printing_agent.fabrication import (
     BambuConnectHandoff,
     BambuConnectHandoffStatus,
+    BambuConnectSetupConfirmation,
     MaterialAssignment,
     MaterialDefinitionRevision,
     MaterialDefinitionSpec,
@@ -260,6 +261,7 @@ CREATE TABLE IF NOT EXISTS printer_profile_revisions (
 
 CREATE TABLE IF NOT EXISTS workflow_printer_snapshots (
     workflow_id TEXT PRIMARY KEY REFERENCES workflows(id),
+    configuration_revision INTEGER NOT NULL DEFAULT 1,
     profile_id TEXT NOT NULL,
     profile_revision INTEGER NOT NULL,
     digest TEXT NOT NULL,
@@ -267,10 +269,21 @@ CREATE TABLE IF NOT EXISTS workflow_printer_snapshots (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workflow_printer_snapshot_revisions (
+    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+    configuration_revision INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(workflow_id, configuration_revision),
+    UNIQUE(workflow_id, digest)
+);
+
 CREATE TABLE IF NOT EXISTS cloud_device_snapshots (
     id TEXT PRIMARY KEY,
     workflow_id TEXT NOT NULL REFERENCES workflows(id),
     profile_id TEXT NOT NULL,
+    printer_snapshot_digest TEXT,
     digest TEXT NOT NULL,
     observed_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
@@ -320,6 +333,15 @@ CREATE TABLE IF NOT EXISTS unknown_quantity_slot_authorizations (
     payload_json TEXT NOT NULL,
     authorized_at TEXT NOT NULL,
     PRIMARY KEY(profile_id, device_ref, slot_id)
+);
+
+CREATE TABLE IF NOT EXISTS bambu_connect_setup_confirmations (
+    profile_id TEXT NOT NULL,
+    device_ref TEXT NOT NULL,
+    installation_digest TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    confirmed_at TEXT NOT NULL,
+    PRIMARY KEY(profile_id, device_ref)
 );
 
 CREATE TABLE IF NOT EXISTS material_assignments (
@@ -437,6 +459,37 @@ class WorkflowRepository:
                 await db.execute(
                     "ALTER TABLE spool_reservations ADD COLUMN actual_usage_g REAL"
                 )
+            cursor = await db.execute(
+                "PRAGMA table_info(workflow_printer_snapshots)"
+            )
+            snapshot_columns = {row[1] for row in await cursor.fetchall()}
+            if "configuration_revision" not in snapshot_columns:
+                await db.execute(
+                    """
+                    ALTER TABLE workflow_printer_snapshots
+                    ADD COLUMN configuration_revision INTEGER NOT NULL DEFAULT 1
+                    """
+                )
+            cursor = await db.execute("PRAGMA table_info(cloud_device_snapshots)")
+            cloud_columns = {row[1] for row in await cursor.fetchall()}
+            if "printer_snapshot_digest" not in cloud_columns:
+                await db.execute(
+                    """
+                    ALTER TABLE cloud_device_snapshots
+                    ADD COLUMN printer_snapshot_digest TEXT
+                    """
+                )
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO workflow_printer_snapshot_revisions (
+                    workflow_id, configuration_revision, digest,
+                    payload_json, created_at
+                )
+                SELECT workflow_id, configuration_revision, digest,
+                       payload_json, created_at
+                FROM workflow_printer_snapshots
+                """
+            )
             await self._migrate_legacy_combined_fabrication(db)
             await db.commit()
 
@@ -628,12 +681,13 @@ class WorkflowRepository:
             await db.execute(
                 """
                 INSERT INTO workflow_printer_snapshots (
-                    workflow_id, profile_id, profile_revision, digest,
-                    payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    workflow_id, configuration_revision, profile_id,
+                    profile_revision, digest, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     snapshot.workflow_id,
+                    snapshot.configuration_revision,
                     snapshot.profile_id,
                     snapshot.profile_revision,
                     snapshot.digest,
@@ -641,6 +695,7 @@ class WorkflowRepository:
                     snapshot.created_at.isoformat(),
                 ),
             )
+            await self._insert_workflow_printer_snapshot_revision(db, snapshot)
             await self._insert_event(
                 db,
                 workflow.id,
@@ -2720,12 +2775,13 @@ class WorkflowRepository:
             await db.execute(
                 """
                 INSERT INTO workflow_printer_snapshots (
-                    workflow_id, profile_id, profile_revision,
-                    digest, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    workflow_id, configuration_revision, profile_id,
+                    profile_revision, digest, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     snapshot.workflow_id,
+                    snapshot.configuration_revision,
                     snapshot.profile_id,
                     snapshot.profile_revision,
                     snapshot.digest,
@@ -2733,6 +2789,7 @@ class WorkflowRepository:
                     snapshot.created_at.isoformat(),
                 ),
             )
+            await self._insert_workflow_printer_snapshot_revision(db, snapshot)
             if approval is not None:
                 await db.execute(
                     """
@@ -2971,12 +3028,13 @@ class WorkflowRepository:
             await db.execute(
                 """
                 INSERT INTO workflow_printer_snapshots (
-                    workflow_id, profile_id, profile_revision, digest,
-                    payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    workflow_id, configuration_revision, profile_id,
+                    profile_revision, digest, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     snapshot.workflow_id,
+                    snapshot.configuration_revision,
                     snapshot.profile_id,
                     snapshot.profile_revision,
                     snapshot.digest,
@@ -2984,9 +3042,170 @@ class WorkflowRepository:
                     snapshot.created_at.isoformat(),
                 ),
             )
+            await self._insert_workflow_printer_snapshot_revision(db, snapshot)
             await db.commit()
         except aiosqlite.IntegrityError as exc:
             raise ConflictError("Workflow printer snapshot already exists") from exc
+        finally:
+            await db.close()
+
+    @staticmethod
+    async def _insert_workflow_printer_snapshot_revision(
+        db: aiosqlite.Connection,
+        snapshot: WorkflowPrinterSnapshot,
+    ) -> None:
+        await db.execute(
+            """
+            INSERT INTO workflow_printer_snapshot_revisions (
+                workflow_id, configuration_revision, digest,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot.workflow_id,
+                snapshot.configuration_revision,
+                snapshot.digest,
+                snapshot.model_dump_json(),
+                snapshot.created_at.isoformat(),
+            ),
+        )
+
+    async def revise_workflow_printer_snapshot(
+        self,
+        snapshot: WorkflowPrinterSnapshot,
+        *,
+        expected_configuration_revision: int,
+        expected_digest: str,
+    ) -> PrintWorkflow:
+        if snapshot.digest is None:
+            raise ValueError("Workflow printer snapshot requires a digest")
+        db = await self._connect()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                SELECT s.configuration_revision, s.digest,
+                       w.state, w.version, w.archived_at
+                FROM workflow_printer_snapshots s
+                JOIN workflows w ON w.id = s.workflow_id
+                WHERE s.workflow_id = ?
+                """,
+                (snapshot.workflow_id,),
+            )
+            current = await cursor.fetchone()
+            if current is None:
+                raise NotFoundError(
+                    f"Workflow '{snapshot.workflow_id}' was not found"
+                )
+            if current["archived_at"] is not None:
+                raise ConflictError(
+                    "Restore the archived workflow before editing slicing settings"
+                )
+            if (
+                int(current["configuration_revision"])
+                != expected_configuration_revision
+                or current["digest"] != expected_digest
+            ):
+                raise ConflictError(
+                    "Slicing settings changed in another request; refresh and retry"
+                )
+            if snapshot.configuration_revision != expected_configuration_revision + 1:
+                raise ConflictError("Slicing configuration revision is invalid")
+            state = WorkflowState(current["state"])
+            allowed = {
+                WorkflowState.APPROVED,
+                WorkflowState.SLICE_SETUP,
+                WorkflowState.AWAITING_MATERIAL_REVIEW,
+                WorkflowState.AWAITING_SLICE_REVIEW,
+                WorkflowState.SLICE_FAILED,
+            }
+            if state not in allowed:
+                raise ConflictError(
+                    "Slicing settings are locked in the current workflow state"
+                )
+            await self._insert_workflow_printer_snapshot_revision(db, snapshot)
+            await db.execute(
+                """
+                UPDATE workflow_printer_snapshots
+                SET configuration_revision = ?, profile_id = ?,
+                    profile_revision = ?, digest = ?, payload_json = ?,
+                    created_at = ?
+                WHERE workflow_id = ?
+                """,
+                (
+                    snapshot.configuration_revision,
+                    snapshot.profile_id,
+                    snapshot.profile_revision,
+                    snapshot.digest,
+                    snapshot.model_dump_json(),
+                    snapshot.created_at.isoformat(),
+                    snapshot.workflow_id,
+                ),
+            )
+            await db.execute(
+                """
+                UPDATE spool_reservations
+                SET status = 'released', updated_at = ?
+                WHERE workflow_id = ? AND status = 'reserved'
+                """,
+                (utc_now().isoformat(), snapshot.workflow_id),
+            )
+            now = utc_now()
+            next_version = int(current["version"]) + 1
+            await db.execute(
+                """
+                UPDATE workflows
+                SET state = ?, version = ?, failure_code = NULL,
+                    failure_message = NULL, updated_at = ?
+                WHERE id = ? AND version = ?
+                """,
+                (
+                    WorkflowState.SLICE_SETUP.value,
+                    next_version,
+                    now.isoformat(),
+                    snapshot.workflow_id,
+                    current["version"],
+                ),
+            )
+            await self._insert_event(
+                db,
+                snapshot.workflow_id,
+                "slicing.configuration_revised",
+                WorkflowState.SLICE_SETUP,
+                {
+                    "configuration_revision": snapshot.configuration_revision,
+                    "printer_snapshot_digest": snapshot.digest,
+                    "reason": snapshot.revision_reason,
+                },
+            )
+            await db.commit()
+            workflow = await self.get_workflow(snapshot.workflow_id)
+            return workflow
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def list_workflow_printer_snapshot_revisions(
+        self,
+        workflow_id: str,
+    ) -> list[WorkflowPrinterSnapshot]:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT payload_json
+                FROM workflow_printer_snapshot_revisions
+                WHERE workflow_id = ?
+                ORDER BY configuration_revision DESC
+                """,
+                (workflow_id,),
+            )
+            return [
+                WorkflowPrinterSnapshot.model_validate_json(row["payload_json"])
+                for row in await cursor.fetchall()
+            ]
         finally:
             await db.close()
 
@@ -3006,6 +3225,7 @@ class WorkflowRepository:
         workflow_id: str,
         profile_id: str,
         snapshot: CloudDeviceSnapshot,
+        printer_snapshot_digest: str | None = None,
     ) -> None:
         db = await self._connect()
         try:
@@ -3019,14 +3239,15 @@ class WorkflowRepository:
             await db.execute(
                 """
                 INSERT INTO cloud_device_snapshots (
-                    id, workflow_id, profile_id, digest, observed_at,
-                    expires_at, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    id, workflow_id, profile_id, printer_snapshot_digest,
+                    digest, observed_at, expires_at, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     snapshot.id,
                     workflow_id,
                     profile_id,
+                    printer_snapshot_digest,
                     snapshot.digest,
                     snapshot.observed_at.isoformat(),
                     snapshot.expires_at.isoformat(),
@@ -3044,17 +3265,44 @@ class WorkflowRepository:
     async def get_latest_cloud_device_snapshot(
         self,
         workflow_id: str,
+        printer_snapshot_digest: str | None = None,
     ) -> CloudDeviceSnapshot:
         db = await self._connect()
         try:
-            cursor = await db.execute(
-                """
-                SELECT payload_json FROM cloud_device_snapshots
-                WHERE workflow_id = ?
-                ORDER BY observed_at DESC, created_at DESC LIMIT 1
-                """,
-                (workflow_id,),
-            )
+            if printer_snapshot_digest is None:
+                cursor = await db.execute(
+                    """
+                    SELECT payload_json FROM cloud_device_snapshots
+                    WHERE workflow_id = ?
+                    ORDER BY observed_at DESC, created_at DESC LIMIT 1
+                    """,
+                    (workflow_id,),
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    SELECT c.payload_json FROM cloud_device_snapshots c
+                    WHERE c.workflow_id = ?
+                      AND (
+                        c.printer_snapshot_digest = ?
+                        OR (
+                          c.printer_snapshot_digest IS NULL
+                          AND EXISTS (
+                            SELECT 1 FROM workflow_printer_snapshots s
+                            WHERE s.workflow_id = c.workflow_id
+                              AND s.configuration_revision = 1
+                              AND s.digest = ?
+                          )
+                        )
+                      )
+                    ORDER BY observed_at DESC, created_at DESC LIMIT 1
+                    """,
+                    (
+                        workflow_id,
+                        printer_snapshot_digest,
+                        printer_snapshot_digest,
+                    ),
+                )
             row = await cursor.fetchone()
             if row is None:
                 raise NotFoundError("Workflow has no cloud device snapshot")
@@ -3513,6 +3761,79 @@ class WorkflowRepository:
                 WHERE profile_id = ? AND device_ref = ? AND slot_id = ?
                 """,
                 (profile_id, device_ref, slot_id),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def save_bambu_connect_setup_confirmation(
+        self,
+        confirmation: BambuConnectSetupConfirmation,
+    ) -> None:
+        db = await self._connect()
+        try:
+            await db.execute(
+                """
+                INSERT INTO bambu_connect_setup_confirmations (
+                    profile_id, device_ref, installation_digest,
+                    payload_json, confirmed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id, device_ref) DO UPDATE SET
+                    installation_digest = excluded.installation_digest,
+                    payload_json = excluded.payload_json,
+                    confirmed_at = excluded.confirmed_at
+                """,
+                (
+                    confirmation.profile_id,
+                    confirmation.device_ref,
+                    confirmation.installation_digest,
+                    confirmation.model_dump_json(),
+                    confirmation.confirmed_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    async def get_bambu_connect_setup_confirmation(
+        self,
+        profile_id: str,
+        device_ref: str,
+    ) -> BambuConnectSetupConfirmation:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT payload_json
+                FROM bambu_connect_setup_confirmations
+                WHERE profile_id = ? AND device_ref = ?
+                """,
+                (profile_id, device_ref),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError(
+                    "Bambu Connect setup confirmation was not found"
+                )
+            return BambuConnectSetupConfirmation.model_validate_json(
+                row["payload_json"]
+            )
+        finally:
+            await db.close()
+
+    async def revoke_bambu_connect_setup_confirmation(
+        self,
+        profile_id: str,
+        device_ref: str,
+    ) -> None:
+        db = await self._connect()
+        try:
+            await db.execute(
+                """
+                DELETE FROM bambu_connect_setup_confirmations
+                WHERE profile_id = ? AND device_ref = ?
+                """,
+                (profile_id, device_ref),
             )
             await db.commit()
         finally:

@@ -222,6 +222,20 @@ async def test_connect_install_and_launch_are_local_only(
             headers=headers,
         ).status_code == 404
         assert client.post(
+            "/api/v1/bambu-connect/open",
+            headers=headers,
+        ).status_code == 404
+        assert client.post(
+            "/api/v1/slicing-profiles/bambu-h2d/bambu-connect-confirmation",
+            headers=headers,
+            json={
+                "expected_profile_revision": 1,
+                "expected_device_ref": "a" * 64,
+                "expected_installation_digest": "b" * 64,
+                "acknowledged": True,
+            },
+        ).status_code == 404
+        assert client.post(
             "/api/v1/workflows/workflow/bambu-connect",
             headers=headers,
             json={

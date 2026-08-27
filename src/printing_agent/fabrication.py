@@ -214,6 +214,14 @@ class JobOverrides(FrozenModel):
 
 class WorkflowPrinterSnapshot(FrozenModel):
     workflow_id: str
+    configuration_revision: int = Field(default=1, ge=1)
+    revision_reason: Literal[
+        "initial",
+        "settings_applied",
+        "post_slice_revision",
+        "restored",
+    ] = "initial"
+    created_by: str = Field(default="system", min_length=1, max_length=200)
     profile_id: str
     profile_revision: int = Field(ge=1)
     profile_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -327,6 +335,16 @@ class UnknownQuantitySlotAuthorization(FrozenModel):
     color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
     authorized_by: str = Field(min_length=1, max_length=200)
     authorized_at: datetime = Field(default_factory=utc_now)
+
+
+class BambuConnectSetupConfirmation(FrozenModel):
+    profile_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    device_ref: str = Field(pattern=r"^[a-f0-9]{64}$")
+    installation_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    signer_thumbprint: str = Field(min_length=1, max_length=200)
+    file_version: str = Field(min_length=1, max_length=100)
+    confirmed_by: str = Field(min_length=1, max_length=200)
+    confirmed_at: datetime = Field(default_factory=utc_now)
 
 
 class PhysicalSpool(FrozenModel):

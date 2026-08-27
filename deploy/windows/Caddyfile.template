@@ -16,8 +16,11 @@ http://127.0.0.1:8080 {
 	@bambu_studio_session path /api/v1/bambu-studio-session*
 	respond @bambu_studio_session 404
 
-	@bambu_connect_install path /api/v1/bambu-connect/install*
-	respond @bambu_connect_install 404
+	@bambu_connect_management path /api/v1/bambu-connect/install* /api/v1/bambu-connect/open*
+	respond @bambu_connect_management 404
+
+	@bambu_connect_confirmation path_regexp bambu_connect_confirmation ^/api/v1/slicing-profiles/[^/]+/bambu-connect-confirmation$
+	respond @bambu_connect_confirmation 404
 
 	@bambu_connect_launch path_regexp bambu_connect_launch ^/api/v1/workflows/[^/]+/bambu-connect(?:/.*)?$
 	respond @bambu_connect_launch 404

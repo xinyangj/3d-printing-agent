@@ -634,6 +634,67 @@ async def test_fabrication_copy_carries_exact_schema_v2_approval(
     assert copied_artifact.files == source_artifact.files
 
 
+async def test_slicing_configuration_revisions_preserve_history_and_cas(
+    repository: WorkflowRepository,
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    source, _ = await _stored_source_artifact(
+        repository,
+        store,
+        tmp_path,
+        schema_version="2",
+        approved=True,
+    )
+    application = await _copy_application(repository, store)
+    copied = await application.copy_workflow(
+        source.id,
+        target_printer_name="bambu-h2d",
+    )
+    current = await repository.get_workflow_printer_snapshot(copied.id)
+    overrides = current.overrides.model_copy(
+        update={"plate_id": "smooth_pei", "infill_percent": 35}
+    )
+    revised = current.model_copy(
+        update={
+            "configuration_revision": 2,
+            "revision_reason": "settings_applied",
+            "created_by": "test",
+            "overrides": overrides,
+            "resolved_slot_policy": resolve_slot_policy(
+                current.profile,
+                overrides,
+            ),
+            "digest": None,
+            "created_at": current.created_at + timedelta(seconds=1),
+        }
+    ).with_digest()
+
+    workflow = await repository.revise_workflow_printer_snapshot(
+        revised,
+        expected_configuration_revision=1,
+        expected_digest=current.digest or "",
+    )
+
+    assert workflow.state == WorkflowState.SLICE_SETUP
+    assert (
+        await repository.get_workflow_printer_snapshot(copied.id)
+    ) == revised
+    history = await repository.list_workflow_printer_snapshot_revisions(
+        copied.id
+    )
+    assert [item.configuration_revision for item in history] == [2, 1]
+    assert history[0].overrides.infill_percent == 35
+    assert history[1].overrides.infill_percent is None
+
+    with pytest.raises(ConflictError, match="changed in another request"):
+        await repository.revise_workflow_printer_snapshot(
+            revised,
+            expected_configuration_revision=1,
+            expected_digest=current.digest or "",
+        )
+
+
 async def test_fabrication_copy_rejects_printer_from_previous_account(
     repository: WorkflowRepository,
     tmp_path: Path,
