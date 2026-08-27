@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import math
 import os
@@ -11,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 from xml.etree import ElementTree
+
+from PIL import Image, ImageDraw
 
 from printing_agent.artifact_store import sha256_file
 from printing_agent.domain import ModelArtifact, canonical_digest
@@ -247,6 +250,16 @@ class BambuStudioCliDriver:
                     "Bambu Studio slicing failed: " + detail
                 )
             self._raise_if_cancelled(request.job.id)
+            output_size = await asyncio.to_thread(
+                lambda: output_path.stat().st_size
+            )
+            if output_size > self.maximum_output_bytes:
+                raise PolicyViolationError("Sliced job exceeds the configured size limit")
+            await asyncio.to_thread(
+                self._ensure_bambu_connect_metadata,
+                output_path,
+                self.maximum_output_bytes * 4,
+            )
             output_size = await asyncio.to_thread(
                 lambda: output_path.stat().st_size
             )
@@ -864,6 +877,196 @@ class BambuStudioCliDriver:
             raise ValidationError("Sliced output is not a valid 3MF archive") from exc
         if not any(name.casefold().endswith(".gcode") for name in names):
             raise ValidationError("Sliced 3MF contains no G-code payload")
+
+    @staticmethod
+    def _ensure_bambu_connect_metadata(
+        path: Path,
+        maximum_uncompressed_bytes: int = 8 * 1024 * 1024 * 1024,
+    ) -> None:
+        thumbnail_name = "Metadata/plate_1.png"
+        temporary = path.with_name(f"{path.name}.connect.tmp")
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = set(archive.namelist())
+                total_uncompressed = sum(
+                    item.file_size for item in archive.infolist()
+                )
+                if total_uncompressed > maximum_uncompressed_bytes:
+                    raise PolicyViolationError(
+                        "Sliced archive exceeds the expanded size limit"
+                    )
+                for required, maximum in (
+                    ("Metadata/model_settings.config", 2 * 1024 * 1024),
+                    ("Metadata/plate_1.json", 10 * 1024 * 1024),
+                ):
+                    if required in names and archive.getinfo(required).file_size > maximum:
+                        raise PolicyViolationError(
+                            f"Sliced {required} exceeds the metadata size limit"
+                        )
+                model_settings = ElementTree.fromstring(
+                    archive.read("Metadata/model_settings.config")
+                )
+                plate = model_settings.find("plate")
+                if plate is None:
+                    raise ValidationError(
+                        "Sliced output lacks plate metadata for Bambu Connect"
+                    )
+                metadata = {
+                    item.get("key"): item
+                    for item in plate.findall("metadata")
+                }
+                current_thumbnail = metadata.get("thumbnail_file")
+                if (
+                    current_thumbnail is not None
+                    and current_thumbnail.get("value") in names
+                ):
+                    return
+                plate_payload = (
+                    json.loads(archive.read("Metadata/plate_1.json"))
+                    if "Metadata/plate_1.json" in names
+                    else {}
+                )
+                thumbnail = BambuStudioCliDriver._render_plate_thumbnail(
+                    plate_payload
+                )
+                if current_thumbnail is None:
+                    ElementTree.SubElement(
+                        plate,
+                        "metadata",
+                        {"key": "thumbnail_file", "value": thumbnail_name},
+                    )
+                else:
+                    current_thumbnail.set("value", thumbnail_name)
+                model_payload = ElementTree.tostring(
+                    model_settings,
+                    encoding="utf-8",
+                    xml_declaration=True,
+                )
+                with zipfile.ZipFile(
+                    temporary,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                    allowZip64=True,
+                ) as output:
+                    for info in archive.infolist():
+                        if info.filename in {
+                            "Metadata/model_settings.config",
+                            thumbnail_name,
+                        }:
+                            continue
+                        with (
+                            archive.open(info, "r") as source,
+                            output.open(info, "w", force_zip64=True) as target,
+                        ):
+                            shutil.copyfileobj(
+                                source,
+                                target,
+                                length=1024 * 1024,
+                            )
+                    output.writestr(
+                        "Metadata/model_settings.config",
+                        model_payload,
+                    )
+                    output.writestr(thumbnail_name, thumbnail)
+            temporary.replace(path)
+        except (
+            json.JSONDecodeError,
+            KeyError,
+            OSError,
+            zipfile.BadZipFile,
+            ElementTree.ParseError,
+        ) as exc:
+            raise ValidationError(
+                "Sliced output cannot be prepared for Bambu Connect"
+            ) from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _render_plate_thumbnail(plate_payload: dict[str, object]) -> bytes:
+        image = Image.new("RGB", (256, 256), "#ECEDE8")
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle(
+            (12, 12, 244, 244),
+            radius=12,
+            fill="#D8DDD8",
+            outline="#51615E",
+            width=3,
+        )
+        raw_bbox = plate_payload.get("bbox_all")
+        bbox = (
+            [float(value) for value in raw_bbox]
+            if isinstance(raw_bbox, list) and len(raw_bbox) == 4
+            else [0.0, 0.0, 1.0, 1.0]
+        )
+        width = max(1.0, bbox[2] - bbox[0])
+        height = max(1.0, bbox[3] - bbox[1])
+        colors = plate_payload.get("filament_colors")
+        fill = (
+            str(colors[0])
+            if isinstance(colors, list)
+            and colors
+            and re.fullmatch(r"#[0-9A-Fa-f]{6}", str(colors[0]))
+            else "#4E8278"
+        )
+        objects = plate_payload.get("bbox_objects")
+        if isinstance(objects, list):
+            for item in objects:
+                if not isinstance(item, dict):
+                    continue
+                raw = item.get("bbox")
+                if not isinstance(raw, list) or len(raw) != 4:
+                    continue
+                values = [float(value) for value in raw]
+                x1 = 24 + (values[0] - bbox[0]) / width * 208
+                x2 = 24 + (values[2] - bbox[0]) / width * 208
+                y1 = 232 - (values[3] - bbox[1]) / height * 208
+                y2 = 232 - (values[1] - bbox[1]) / height * 208
+                draw.rectangle(
+                    (x1, y1, max(x1 + 2, x2), max(y1 + 2, y2)),
+                    fill=fill,
+                    outline="#273432",
+                    width=1,
+                )
+        output = io.BytesIO()
+        image.save(output, format="PNG", optimize=True)
+        return output.getvalue()
+
+    @staticmethod
+    def _validate_bambu_connect_compatibility(path: Path) -> None:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                names = set(archive.namelist())
+                root = ElementTree.fromstring(
+                    archive.read("Metadata/model_settings.config")
+                )
+                plate = root.find("plate")
+                metadata = {
+                    item.get("key"): item.get("value")
+                    for item in plate.findall("metadata")
+                } if plate is not None else {}
+                gcode = metadata.get("gcode_file")
+                thumbnail = metadata.get("thumbnail_file")
+                if (
+                    not gcode
+                    or gcode not in names
+                    or not thumbnail
+                    or thumbnail not in names
+                ):
+                    raise ValidationError(
+                        "Slice lacks Bambu Connect plate metadata; re-slice it"
+                    )
+                with Image.open(io.BytesIO(archive.read(thumbnail))) as image:
+                    image.verify()
+        except (
+            KeyError,
+            OSError,
+            zipfile.BadZipFile,
+            ElementTree.ParseError,
+        ) as exc:
+            raise ValidationError(
+                "Slice is incompatible with Bambu Connect; re-slice it"
+            ) from exc
 
     @staticmethod
     def _extract_plate_thumbnail(

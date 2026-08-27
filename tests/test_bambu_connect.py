@@ -79,6 +79,11 @@ def test_connect_handoff_stages_exact_bytes_and_builds_fixed_uri(
         "_validate_gcode_3mf",
         staticmethod(lambda _path: None),
     )
+    monkeypatch.setattr(
+        BambuStudioCliDriver,
+        "_validate_bambu_connect_compatibility",
+        staticmethod(lambda _path: None),
+    )
 
     handoff = manager.prepare_handoff(
         workflow_id="workflow",

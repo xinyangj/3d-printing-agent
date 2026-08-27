@@ -2379,14 +2379,22 @@ function SlicingWorkspace({
               <pre>{JSON.stringify(data.printer_snapshot?.overrides, null, 2)}</pre>
             </details>
             {data.material_assignment?.confirmed_at &&
-              ['slice_failed', 'awaiting_material_review'].includes(workflow.state) &&
+              [
+                'slice_failed',
+                'awaiting_material_review',
+                'awaiting_slice_review',
+              ].includes(workflow.state) &&
               !materialRecovery && (
                 <button
                   className="primary-action"
                   disabled={retrySlice.isPending || refreshCloud.isPending}
                   onClick={() => retrySlice.mutate()}
                 >
-                  {retrySlice.isPending ? 'Requesting retry…' : 'Retry slicing'}
+                  {retrySlice.isPending
+                    ? 'Requesting retry…'
+                    : workflow.state === 'awaiting_slice_review'
+                      ? 'Re-slice for Bambu Connect'
+                      : 'Retry slicing'}
                 </button>
               )}
             {data.slice_job && (

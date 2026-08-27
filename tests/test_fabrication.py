@@ -1277,6 +1277,43 @@ def test_sliced_3mf_requires_gcode_payload(tmp_path: Path) -> None:
     BambuStudioCliDriver._validate_gcode_3mf(path)
 
 
+def test_sliced_3mf_adds_bambu_connect_plate_thumbnail(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "connect-ready.gcode.3mf"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "Metadata/model_settings.config",
+            (
+                '<?xml version="1.0"?><config><plate>'
+                '<metadata key="gcode_file" '
+                'value="Metadata/plate_1.gcode"/>'
+                "</plate></config>"
+            ),
+        )
+        archive.writestr(
+            "Metadata/plate_1.json",
+            json.dumps(
+                {
+                    "bbox_all": [0, 0, 20, 20],
+                    "bbox_objects": [{"bbox": [2, 3, 18, 17]}],
+                    "filament_colors": ["#FF0000"],
+                }
+            ),
+        )
+        archive.writestr("Metadata/plate_1.gcode", "G1 X1 Y1\n")
+
+    BambuStudioCliDriver._ensure_bambu_connect_metadata(path)
+    BambuStudioCliDriver._validate_bambu_connect_compatibility(path)
+
+    with zipfile.ZipFile(path) as archive:
+        assert "Metadata/plate_1.png" in archive.namelist()
+        model_settings = archive.read(
+            "Metadata/model_settings.config"
+        ).decode()
+        assert 'key="thumbnail_file"' in model_settings
+
+
 def test_profile_dependency_digest_includes_inherited_and_included_files(
     tmp_path: Path,
 ) -> None:

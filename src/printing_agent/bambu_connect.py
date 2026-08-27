@@ -184,9 +184,10 @@ class BambuConnectManager:
             raise PolicyViolationError(
                 "Sliced artifact is outside the immutable slice root"
             )
-        BambuStudioCliDriver._validate_gcode_3mf(source)
         if sha256_file(source) != sliced.digest:
             raise ConflictError("Sliced artifact digest changed before handoff")
+        BambuStudioCliDriver._validate_gcode_3mf(source)
+        BambuStudioCliDriver._validate_bambu_connect_compatibility(source)
         safe_workflow = re.sub(r"[^A-Za-z0-9_-]+", "_", workflow_id)[:32]
         safe_slice_job = re.sub(
             r"[^A-Za-z0-9_-]+",
