@@ -24,6 +24,25 @@ class Settings(BaseSettings):
     bambu_studio_path: str | None = None
     bambu_studio_resource_dir: Path | None = None
     bambu_studio_config_dir: Path | None = None
+    bambu_connect_download_url: str = (
+        "https://public-cdn.bblmw.com/upgrade/bambu-connect/updates/versions/"
+        "2.5.0-beta.15/bambu-connect-v2.5.0-beta.15-win32-x64.exe"
+    )
+    bambu_connect_download_max_bytes: int = Field(
+        default=200 * 1024 * 1024,
+        ge=1024,
+        le=512 * 1024 * 1024,
+    )
+    bambu_connect_match_timeout_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=3600,
+    )
+    bambu_connect_monitor_failure_timeout_seconds: int = Field(
+        default=1800,
+        ge=60,
+        le=86400,
+    )
     bambu_cloud_credential_path: Path = Path(
         "var/secrets/bambu-cloud-credentials.json"
     )

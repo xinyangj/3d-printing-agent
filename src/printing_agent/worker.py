@@ -36,6 +36,10 @@ class DurableWorker:
                     await self.application.submit_print(item.workflow_id)
                 elif item.kind == WorkKind.REFRESH_PRINT:
                     await self.application.refresh_print(item.workflow_id)
+                elif item.kind == WorkKind.MONITOR_CONNECT:
+                    await self.application.monitor_bambu_connect_handoff(
+                        item.workflow_id
+                    )
                 await self.repository.complete_work(item.id)
             except Exception as exc:
                 await self.repository.fail_work(item.id, str(exc)[-2_000:])
@@ -75,6 +79,8 @@ class DurableWorker:
                 else WorkflowState.PREPARATION_FAILED
             )
             if kind == WorkKind.SLICE:
+                return
+            if kind == WorkKind.MONITOR_CONNECT:
                 return
             await self.repository.transition(
                 workflow_id,

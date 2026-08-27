@@ -79,6 +79,11 @@ class AuthorizeUnknownQuantityRequest(BaseModel):
         return self
 
 
+class LaunchBambuConnectRequest(BaseModel):
+    slice_job_id: str = Field(min_length=1, max_length=100)
+    sliced_artifact_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
 class SaveCloudCredentialRequest(BaseModel):
     access_token: SecretStr
     region: CloudRegion
@@ -425,6 +430,22 @@ def create_app(container: Container | None = None) -> FastAPI:
             slice_job = None
         sliced_artifact = None
         try:
+            bambu_connect_handoff = (
+                await container.repository.get_latest_bambu_connect_handoff(
+                    workflow.id
+                )
+            )
+        except NotFoundError:
+            bambu_connect_handoff = None
+        if (
+            bambu_connect_handoff is not None
+            and (
+                slice_job is None
+                or bambu_connect_handoff.slice_job_id != slice_job.id
+            )
+        ):
+            bambu_connect_handoff = None
+        try:
             cloud_snapshot = (
         await container.repository.get_latest_cloud_device_snapshot(
             workflow.id
@@ -573,11 +594,42 @@ def create_app(container: Container | None = None) -> FastAPI:
             ),
             "material_mappings": material_mappings,
             "quantity_authorizations": quantity_authorizations,
+            "bambu_connect_handoff": (
+                bambu_connect_handoff.model_dump(
+                    mode="json",
+                    exclude={
+                        "staged_path",
+                        "launch_uri",
+                        "expected_device_ref",
+                    },
+                )
+                if bambu_connect_handoff is not None
+                else None
+            ),
         }
 
     @app.get("/api/v1/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/api/v1/bambu-connect/readiness")
+    async def bambu_connect_readiness(
+        request: Request,
+    ) -> dict[str, object]:
+        readiness = await get_container(
+            request
+        ).application.bambu_connect_readiness()
+        return readiness.model_dump(mode="json")
+
+    @app.post("/api/v1/bambu-connect/install")
+    async def install_bambu_connect(
+        request: Request,
+    ) -> dict[str, object]:
+        require_local_credential_request(request)
+        readiness = await get_container(
+            request
+        ).application.install_bambu_connect()
+        return readiness.model_dump(mode="json")
 
     @app.post("/api/v1/workflows", status_code=202)
     async def create_workflow(
@@ -1225,6 +1277,35 @@ def create_app(container: Container | None = None) -> FastAPI:
     ) -> dict[str, object]:
         container = get_container(request)
         await container.application.prepare_slicing_materials(workflow_id)
+        workflow = await container.repository.get_workflow(workflow_id)
+        return await serialize_workflow(container, workflow)
+
+    @app.post("/api/v1/workflows/{workflow_id}/bambu-connect")
+    async def launch_bambu_connect_handoff(
+        workflow_id: str,
+        body: LaunchBambuConnectRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        require_local_credential_request(request)
+        container = get_container(request)
+        await container.application.launch_bambu_connect_handoff(
+            workflow_id,
+            expected_slice_job_id=body.slice_job_id,
+            expected_artifact_digest=body.sliced_artifact_digest,
+        )
+        workflow = await container.repository.get_workflow(workflow_id)
+        return await serialize_workflow(container, workflow)
+
+    @app.post(
+        "/api/v1/workflows/{workflow_id}/bambu-connect/stop-monitoring"
+    )
+    async def stop_bambu_connect_monitoring(
+        workflow_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        require_local_credential_request(request)
+        container = get_container(request)
+        await container.application.stop_bambu_connect_monitoring(workflow_id)
         workflow = await container.repository.get_workflow(workflow_id)
         return await serialize_workflow(container, workflow)
 

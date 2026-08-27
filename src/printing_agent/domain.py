@@ -83,6 +83,7 @@ class WorkKind(StrEnum):
     SLICE = "slice"
     SUBMIT = "submit"
     REFRESH_PRINT = "refresh_print"
+    MONITOR_CONNECT = "monitor_connect"
 
 
 class RevisionMode(StrEnum):
@@ -737,6 +738,8 @@ _ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
     WorkflowState.AWAITING_SLICE_REVIEW: {
         WorkflowState.SLICE_SETUP,
         WorkflowState.SLICE_REQUESTED,
+        WorkflowState.PRINTING,
+        WorkflowState.PRINT_FAILED,
         WorkflowState.CANCELLED,
     },
     WorkflowState.SLICE_FAILED: {

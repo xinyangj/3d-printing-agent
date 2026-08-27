@@ -7,14 +7,21 @@ import math
 import re
 import shutil
 import weakref
+from datetime import timedelta
+from pathlib import Path
 from typing import cast
 
 from printing_agent.artifact_store import ArtifactStore, sha256_file
+from printing_agent.bambu_connect import (
+    BambuConnectManager,
+    BambuConnectReadiness,
+)
 from printing_agent.catalogs import ThingiverseCatalog
 from printing_agent.cloud_inventory import (
     AMSTray,
     CloudDeviceSnapshot,
     CloudInventoryError,
+    CloudPrintStatusObservation,
     DeviceSummary,
     InventoryProvider,
 )
@@ -52,6 +59,8 @@ from printing_agent.errors import (
     ValidationError,
 )
 from printing_agent.fabrication import (
+    BambuConnectHandoff,
+    BambuConnectHandoffStatus,
     JobOverrides,
     MaterialAssignment,
     MaterialCandidate,
@@ -120,6 +129,7 @@ class PrintingApplication:
         slicers: SlicerRegistry,
         inventory: InventoryProvider,
         material_assignment: MaterialAssignmentService,
+        bambu_connect: BambuConnectManager,
     ) -> None:
         self.settings = settings
         self.repository = repository
@@ -134,6 +144,7 @@ class PrintingApplication:
         self.slicers = slicers
         self.inventory = inventory
         self.material_assignment = material_assignment
+        self.bambu_connect = bambu_connect
         self.filament_catalog = InstalledFilamentCatalog()
         self._slicing_operation_locks: weakref.WeakValueDictionary[
             str, asyncio.Lock
@@ -2895,6 +2906,36 @@ class PrintingApplication:
             WorkflowState.AWAITING_SLICE_REVIEW,
         }:
             raise ConflictError("Workflow is not ready for slicing or reslicing")
+        if workflow.state == WorkflowState.AWAITING_SLICE_REVIEW:
+            try:
+                existing_handoff = (
+                    await self.repository.get_latest_bambu_connect_handoff(
+                        workflow_id
+                    )
+                )
+            except NotFoundError:
+                existing_handoff = None
+            if (
+                existing_handoff is not None
+                and existing_handoff.status
+                not in {
+                    BambuConnectHandoffStatus.COMPLETED,
+                    BambuConnectHandoffStatus.FAILED,
+                    BambuConnectHandoffStatus.TIMED_OUT,
+                    BambuConnectHandoffStatus.CANCELLED,
+                }
+            ):
+                await self.repository.save_bambu_connect_handoff(
+                    existing_handoff.model_copy(
+                        update={
+                            "status": BambuConnectHandoffStatus.CANCELLED,
+                            "message": (
+                                "Handoff cancelled because a new slice was requested."
+                            ),
+                            "updated_at": fabrication_utc_now(),
+                        }
+                    )
+                )
         if workflow.active_artifact_version is None:
             raise ConflictError("Workflow has no active artifact")
         artifact = await self.repository.get_artifact(
@@ -3562,6 +3603,567 @@ class PrintingApplication:
                 },
             )
 
+    async def bambu_connect_readiness(self) -> BambuConnectReadiness:
+        return await asyncio.to_thread(self.bambu_connect.readiness)
+
+    async def install_bambu_connect(self) -> BambuConnectReadiness:
+        return await asyncio.to_thread(self.bambu_connect.install)
+
+    async def launch_bambu_connect_handoff(
+        self,
+        workflow_id: str,
+        *,
+        expected_slice_job_id: str,
+        expected_artifact_digest: str,
+    ) -> BambuConnectHandoff:
+        async with self._slicing_operation_lock(workflow_id):
+            workflow = await self.repository.get_workflow(workflow_id)
+            PrintingApplication._ensure_not_archived(workflow)
+            if workflow.state != WorkflowState.AWAITING_SLICE_REVIEW:
+                raise ConflictError(
+                    "A reviewed ready slice is required before opening Bambu Connect"
+                )
+            job = await self.repository.get_latest_slice_job(workflow_id)
+            if job.id != expected_slice_job_id or job.status != SliceJobStatus.READY:
+                raise ConflictError("The selected slice job is stale or not ready")
+            sliced = await self.repository.get_sliced_artifact(job.id)
+            if sliced.digest != expected_artifact_digest:
+                raise ConflictError("The selected sliced artifact digest is stale")
+            latest: BambuConnectHandoff | None = None
+            try:
+                latest = await self.repository.get_latest_bambu_connect_handoff(
+                    workflow_id
+                )
+            except NotFoundError:
+                pass
+            active_statuses = {
+                BambuConnectHandoffStatus.READY,
+                BambuConnectHandoffStatus.CONNECT_OPENED,
+                BambuConnectHandoffStatus.WAITING_FOR_MATCH,
+                BambuConnectHandoffStatus.ACTIVITY_UNVERIFIED,
+                BambuConnectHandoffStatus.PRINT_MATCHED,
+                BambuConnectHandoffStatus.PRINTING,
+            }
+            if (
+                latest is not None
+                and latest.slice_job_id == job.id
+                and latest.status in active_statuses
+            ):
+                return latest
+            profile, baseline = await self._validate_bambu_connect_preflight(
+                workflow_id,
+                job,
+                sliced,
+            )
+            attempt = (
+                latest.attempt + 1
+                if latest is not None and latest.slice_job_id == job.id
+                else 1
+            )
+            handoff = await asyncio.to_thread(
+                self.bambu_connect.prepare_handoff,
+                workflow_id=workflow_id,
+                sliced=sliced,
+                expected_device_ref=self._device_ref(
+                    profile.spec.cloud_device_serial or ""
+                ),
+                expected_device_name=profile.spec.cloud_device_name
+                or profile.spec.display_name,
+                attempt=attempt,
+                baseline_state=baseline.state,
+            )
+            await self.repository.save_bambu_connect_handoff(handoff)
+            try:
+                await asyncio.to_thread(self.bambu_connect.launch, handoff)
+            except Exception as exc:
+                failed = handoff.model_copy(
+                    update={
+                        "status": BambuConnectHandoffStatus.FAILED,
+                        "message": str(exc)[-2_000:],
+                        "updated_at": fabrication_utc_now(),
+                    }
+                )
+                await self.repository.save_bambu_connect_handoff(failed)
+                raise
+            now = fabrication_utc_now()
+            opened = handoff.model_copy(
+                update={
+                    "status": BambuConnectHandoffStatus.WAITING_FOR_MATCH,
+                    "launched_at": now,
+                    "match_deadline": now
+                    + timedelta(
+                        seconds=self.settings.bambu_connect_match_timeout_seconds
+                    ),
+                    "message": (
+                        "Bambu Connect opened. Select the expected H2D, keep the "
+                        "correlation name unchanged, and press Print/Send in Connect."
+                    ),
+                    "updated_at": now,
+                }
+            )
+            await self.repository.save_bambu_connect_handoff(opened)
+            await self.repository.enqueue(
+                workflow_id,
+                WorkKind.MONITOR_CONNECT,
+                delay_seconds=2,
+            )
+            return opened
+
+    async def _validate_bambu_connect_preflight(
+        self,
+        workflow_id: str,
+        job: SliceJob,
+        sliced,
+    ) -> tuple[PrinterProfileRevision, CloudPrintStatusObservation]:
+        if sha256_file(Path(sliced.path)) != sliced.digest:
+            raise ConflictError("Sliced artifact digest changed before handoff")
+        printer_snapshot = (
+            await self.repository.get_workflow_printer_snapshot(workflow_id)
+        )
+        profile = await self.repository.get_printer_profile(
+            printer_snapshot.profile_id,
+            printer_snapshot.profile_revision,
+        )
+        device_id = profile.spec.cloud_device_serial
+        if not device_id:
+            raise ConflictError("Slicing profile has no bound cloud H2D device")
+        try:
+            fresh_snapshot = await self.inventory.snapshot(device_id)
+            baseline = await self.inventory.print_status(device_id)
+        except CloudInventoryError as exc:
+            raise ExternalServiceError(str(exc)) from exc
+        self._validate_cloud_snapshot(profile, fresh_snapshot)
+        if baseline.state in {"preparing", "printing", "paused"}:
+            raise ConflictError("The expected H2D is already busy")
+        assignment = await self.repository.get_latest_material_assignment(workflow_id)
+        if assignment.digest != job.material_assignment_digest:
+            raise ConflictError("Material assignment changed after slicing")
+        await self._ensure_unknown_quantity_authorizations_current(
+            profile,
+            fresh_snapshot,
+            assignment,
+        )
+        reservations = await self.repository.list_spool_reservations(job.id)
+        if not reservations or any(
+            item.status not in {"reserved", "released"} for item in reservations
+        ):
+            raise ConflictError(
+                "Slice material reservations are unavailable or insufficient"
+            )
+        current_profile = await self.repository.get_printer_profile(
+            printer_snapshot.profile_id
+        )
+        current_policy = resolve_slot_policy(
+            current_profile.spec,
+            printer_snapshot.overrides,
+        )
+        trays = {
+            item.slot_id: item
+            for item in self._snapshot_trays(fresh_snapshot)
+        }
+        required_by_spool = {
+            spool_id: usage
+            * (1 + job.material_safety_margin_percent / 100)
+            for spool_id, usage in sliced.filament_usage_g.items()
+        }
+        checked_spools: set[str] = set()
+        for selected in assignment.assignments:
+            if (
+                selected.slot_id in current_policy.forbidden_slot_ids
+                or (
+                    current_policy.allowed_slot_ids is not None
+                    and selected.slot_id not in current_policy.allowed_slot_ids
+                )
+                or selected.slot_id
+                in current_policy.part_forbidden_slot_ids.get(
+                    selected.part_id,
+                    set(),
+                )
+            ):
+                raise ConflictError(
+                    f"Material slot '{selected.slot_id}' is no longer allowed"
+                )
+            part_allowed = current_policy.part_allowed_slot_ids.get(
+                selected.part_id
+            )
+            if part_allowed is not None and selected.slot_id not in part_allowed:
+                raise ConflictError(
+                    f"Material slot '{selected.slot_id}' is no longer allowed "
+                    f"for '{selected.part_id}'"
+                )
+            if selected.spool_id in checked_spools:
+                continue
+            checked_spools.add(selected.spool_id)
+            tray = trays.get(selected.slot_id)
+            if tray is None or tray.material is None:
+                raise ConflictError(
+                    f"Material slot '{selected.slot_id}' is no longer loaded"
+                )
+            spool = await self.repository.get_spool(selected.spool_id)
+            identity = self._tray_identity_digest(device_id, tray)
+            if spool.tray_identity_digest != identity:
+                raise ConflictError(
+                    f"Material in slot '{selected.slot_id}' changed after slicing"
+                )
+            material = await self.repository.get_material_definition(
+                selected.material_id,
+                selected.material_revision,
+            )
+            if (
+                tray.material_profile_id is None
+                or tray.material_profile_id not in material.spec.cloud_filament_ids
+            ):
+                raise ConflictError(
+                    f"Material mapping for slot '{selected.slot_id}' changed"
+                )
+            if (
+                selected.quantity_status
+                == SpoolQuantityStatus.CLOUD_ESTIMATE
+            ):
+                required = required_by_spool.get(selected.spool_id)
+                if (
+                    required is not None
+                    and (
+                        tray.estimated_remaining_g is None
+                        or tray.estimated_remaining_g < required
+                    )
+                ):
+                    raise ConflictError(
+                        f"Slot '{selected.slot_id}' no longer has enough material"
+                    )
+        return profile, baseline
+
+    @staticmethod
+    def _connect_status_matches(
+        handoff: BambuConnectHandoff,
+        observation: CloudPrintStatusObservation,
+    ) -> bool:
+        expected = handoff.correlation_name.casefold()
+
+        def normalized(value: str) -> str:
+            name = Path(value.replace("\\", "/")).name.casefold()
+            for suffix in (".gcode.3mf", ".3mf", ".gcode"):
+                if name.endswith(suffix):
+                    return name[: -len(suffix)]
+            return name
+
+        values = [
+            observation.gcode_file,
+            observation.subtask_name,
+        ]
+        return any(
+            normalized(value) == expected
+            for value in values
+            if value
+        )
+
+    async def monitor_bambu_connect_handoff(self, workflow_id: str) -> None:
+        async with self._slicing_operation_lock(workflow_id):
+            await self._monitor_bambu_connect_handoff_unlocked(workflow_id)
+
+    async def _monitor_bambu_connect_handoff_unlocked(
+        self,
+        workflow_id: str,
+    ) -> None:
+        handoff = await self.repository.get_latest_bambu_connect_handoff(
+            workflow_id
+        )
+        terminal = {
+            BambuConnectHandoffStatus.COMPLETED,
+            BambuConnectHandoffStatus.FAILED,
+            BambuConnectHandoffStatus.TIMED_OUT,
+            BambuConnectHandoffStatus.CANCELLED,
+        }
+        if handoff.status in terminal:
+            return
+        current_job = await self.repository.get_latest_slice_job(workflow_id)
+        if current_job.id != handoff.slice_job_id:
+            stale = handoff.model_copy(
+                update={
+                    "status": BambuConnectHandoffStatus.CANCELLED,
+                    "message": "Handoff no longer matches the current slice job.",
+                    "updated_at": fabrication_utc_now(),
+                }
+            )
+            await self.repository.save_bambu_connect_handoff(stale)
+            return
+        printer_snapshot = (
+            await self.repository.get_workflow_printer_snapshot(workflow_id)
+        )
+        device_id = printer_snapshot.profile.cloud_device_serial
+        if not device_id:
+            raise ConflictError("Slicing profile has no bound cloud H2D device")
+        now = fabrication_utc_now()
+        if (
+            handoff.matched_at is None
+            and handoff.match_deadline is not None
+            and now >= handoff.match_deadline
+        ):
+            timed_out = handoff.model_copy(
+                update={
+                    "status": BambuConnectHandoffStatus.TIMED_OUT,
+                    "message": (
+                        "No strictly matching H2D job was observed within 15 minutes."
+                    ),
+                    "updated_at": now,
+                }
+            )
+            await self.repository.save_bambu_connect_handoff(timed_out)
+            return
+        try:
+            observation = await self.inventory.print_status(device_id)
+        except CloudInventoryError as exc:
+            last_success = handoff.last_observed_at or handoff.matched_at
+            if (
+                handoff.matched_at is not None
+                and last_success is not None
+                and (
+                    now - last_success
+                ).total_seconds()
+                >= self.settings.bambu_connect_monitor_failure_timeout_seconds
+            ):
+                failed = handoff.model_copy(
+                    update={
+                        "status": BambuConnectHandoffStatus.FAILED,
+                        "message": (
+                            "Printer monitoring was unavailable for too long; "
+                            "physical print status is unknown."
+                        ),
+                        "updated_at": now,
+                    }
+                )
+                await self.repository.save_bambu_connect_handoff(failed)
+                workflow = await self.repository.get_workflow(workflow_id)
+                if workflow.state == WorkflowState.PRINTING:
+                    await self.repository.transition(
+                        workflow_id,
+                        WorkflowState.PRINT_FAILED,
+                        event_kind="bambu_connect.monitoring_lost",
+                        payload={"handoff_id": handoff.id},
+                    )
+                return
+            waiting = handoff.model_copy(
+                update={
+                    "message": f"Printer status is temporarily unavailable: {exc}",
+                    "updated_at": now,
+                }
+            )
+            await self.repository.save_bambu_connect_handoff(waiting)
+            await self.repository.enqueue(
+                workflow_id,
+                WorkKind.MONITOR_CONNECT,
+                delay_seconds=5,
+            )
+            return
+        matches = self._connect_status_matches(handoff, observation)
+        active = observation.state in {"preparing", "printing", "paused"}
+        matched = handoff.matched_at is not None
+        if not matched and active and matches:
+            matched = True
+            handoff = handoff.model_copy(
+                update={
+                    "status": BambuConnectHandoffStatus.PRINT_MATCHED,
+                    "matched_at": observation.observed_at,
+                    "matched_task_id": observation.task_id,
+                    "matched_file": observation.gcode_file,
+                    "matched_name": observation.subtask_name,
+                    "message": "Matching H2D print job detected.",
+                }
+            )
+            workflow = await self.repository.get_workflow(workflow_id)
+            if workflow.state == WorkflowState.AWAITING_SLICE_REVIEW:
+                await self.repository.transition(
+                    workflow_id,
+                    WorkflowState.PRINTING,
+                    event_kind="bambu_connect.print_matched",
+                    payload={"handoff_id": handoff.id},
+                )
+        elif not matched and active:
+            handoff = handoff.model_copy(
+                update={
+                    "status": BambuConnectHandoffStatus.ACTIVITY_UNVERIFIED,
+                    "message": (
+                        "Printer activity was detected, but filename/task metadata "
+                        "does not match this artifact."
+                    ),
+                }
+            )
+        elif not matched:
+            handoff = handoff.model_copy(
+                update={
+                    "status": BambuConnectHandoffStatus.WAITING_FOR_MATCH,
+                    "message": "Waiting for a matching job on the expected H2D.",
+                }
+            )
+
+        if matched:
+            if (
+                handoff.matched_task_id
+                and observation.task_id
+                and handoff.matched_task_id != observation.task_id
+            ) or (
+                (observation.gcode_file or observation.subtask_name)
+                and not matches
+            ):
+                failed = handoff.model_copy(
+                    update={
+                        "status": BambuConnectHandoffStatus.FAILED,
+                        "message": "Matched printer task identity changed.",
+                        "last_observed_at": observation.observed_at,
+                        "updated_at": now,
+                    }
+                )
+                await self.repository.save_bambu_connect_handoff(failed)
+                workflow = await self.repository.get_workflow(workflow_id)
+                if workflow.state == WorkflowState.PRINTING:
+                    await self.repository.transition(
+                        workflow_id,
+                        WorkflowState.PRINT_FAILED,
+                        event_kind="bambu_connect.identity_changed",
+                        payload={"handoff_id": handoff.id},
+                    )
+                return
+            if observation.state == "completed":
+                status = BambuConnectHandoffStatus.COMPLETED
+                message = "Matching H2D print completed."
+            elif observation.state == "failed":
+                status = BambuConnectHandoffStatus.FAILED
+                message = "Matching H2D print failed."
+            elif observation.state == "idle":
+                status = BambuConnectHandoffStatus.FAILED
+                message = (
+                    "The matched H2D returned to idle without a verified completion; "
+                    "review the job in Bambu Connect."
+                )
+            elif observation.state == "unknown":
+                status = BambuConnectHandoffStatus.PRINT_MATCHED
+                message = "Matching job identity is retained; printer state is unknown."
+            else:
+                status = BambuConnectHandoffStatus.PRINTING
+                message = (
+                    "Matching H2D print is paused."
+                    if observation.state == "paused"
+                    else "Matching H2D print is active."
+                )
+            handoff = handoff.model_copy(
+                update={
+                    "status": status,
+                    "matched_task_id": (
+                        handoff.matched_task_id or observation.task_id
+                    ),
+                    "matched_file": handoff.matched_file
+                    or observation.gcode_file,
+                    "matched_name": handoff.matched_name
+                    or observation.subtask_name,
+                    "progress_percent": observation.progress_percent,
+                    "remaining_time_seconds": (
+                        observation.remaining_time_seconds
+                    ),
+                    "printer_state": observation.state,
+                    "printer_error_code": observation.error_code,
+                    "last_observed_at": observation.observed_at,
+                    "message": message,
+                    "updated_at": now,
+                }
+            )
+            await self.repository.save_bambu_connect_handoff(handoff)
+            workflow = await self.repository.get_workflow(workflow_id)
+            if status == BambuConnectHandoffStatus.COMPLETED:
+                if workflow.state == WorkflowState.PRINTING:
+                    await self.repository.transition(
+                        workflow_id,
+                        WorkflowState.COMPLETED,
+                        event_kind="bambu_connect.completed",
+                        payload={"handoff_id": handoff.id},
+                    )
+                return
+            if status == BambuConnectHandoffStatus.FAILED:
+                if workflow.state == WorkflowState.PRINTING:
+                    await self.repository.transition(
+                        workflow_id,
+                        WorkflowState.PRINT_FAILED,
+                        event_kind="bambu_connect.failed",
+                        payload={
+                            "handoff_id": handoff.id,
+                            "printer_error_code": observation.error_code,
+                        },
+                    )
+                return
+        else:
+            handoff = handoff.model_copy(
+                update={
+                    "printer_state": observation.state,
+                    "progress_percent": observation.progress_percent,
+                    "remaining_time_seconds": (
+                        observation.remaining_time_seconds
+                    ),
+                    "last_observed_at": observation.observed_at,
+                    "updated_at": now,
+                }
+            )
+            await self.repository.save_bambu_connect_handoff(handoff)
+        await self.repository.enqueue(
+            workflow_id,
+            WorkKind.MONITOR_CONNECT,
+            delay_seconds=5,
+        )
+
+    async def stop_bambu_connect_monitoring(
+        self,
+        workflow_id: str,
+    ) -> BambuConnectHandoff:
+        async with self._slicing_operation_lock(workflow_id):
+            return await self._stop_bambu_connect_monitoring_unlocked(
+                workflow_id
+            )
+
+    async def _stop_bambu_connect_monitoring_unlocked(
+        self,
+        workflow_id: str,
+    ) -> BambuConnectHandoff:
+        handoff = await self.repository.get_latest_bambu_connect_handoff(
+            workflow_id
+        )
+        if handoff.status in {
+            BambuConnectHandoffStatus.COMPLETED,
+            BambuConnectHandoffStatus.FAILED,
+            BambuConnectHandoffStatus.TIMED_OUT,
+            BambuConnectHandoffStatus.CANCELLED,
+        }:
+            return handoff
+        matched = handoff.status in {
+            BambuConnectHandoffStatus.PRINT_MATCHED,
+            BambuConnectHandoffStatus.PRINTING,
+        }
+        cancelled = handoff.model_copy(
+            update={
+                "status": (
+                    BambuConnectHandoffStatus.FAILED
+                    if matched
+                    else BambuConnectHandoffStatus.CANCELLED
+                ),
+                "message": (
+                    "Monitoring stopped; physical print status is unknown. "
+                    "The physical printer was not controlled."
+                    if matched
+                    else (
+                        "Monitoring stopped. The physical printer was not controlled."
+                    )
+                ),
+                "updated_at": fabrication_utc_now(),
+            }
+        )
+        await self.repository.save_bambu_connect_handoff(cancelled)
+        workflow = await self.repository.get_workflow(workflow_id)
+        if matched and workflow.state == WorkflowState.PRINTING:
+            await self.repository.transition(
+                workflow_id,
+                WorkflowState.PRINT_FAILED,
+                event_kind="bambu_connect.monitoring_stopped",
+                payload={"handoff_id": handoff.id},
+            )
+        return cancelled
+
     async def request_print(self, workflow_id: str) -> None:
         workflow = await self.repository.get_workflow(workflow_id)
         PrintingApplication._ensure_not_archived(workflow)
@@ -4027,6 +4629,26 @@ class PrintingApplication:
             PrintingApplication._ensure_not_archived(workflow)
             if workflow.state == WorkflowState.CANCELLED:
                 return
+            if workflow.state == WorkflowState.PRINTING:
+                try:
+                    connect_handoff = (
+                        await self.repository.get_latest_bambu_connect_handoff(
+                            workflow_id
+                        )
+                    )
+                except NotFoundError:
+                    connect_handoff = None
+                if (
+                    connect_handoff is not None
+                    and connect_handoff.status
+                    in {
+                        BambuConnectHandoffStatus.PRINT_MATCHED,
+                        BambuConnectHandoffStatus.PRINTING,
+                    }
+                ):
+                    raise ConflictError(
+                        "Use Bambu Connect or the printer to control the physical job"
+                    )
             if workflow.state in {WorkflowState.QUEUED, WorkflowState.PRINTING}:
                 job = await self.repository.get_latest_job(workflow_id)
                 if job is None:

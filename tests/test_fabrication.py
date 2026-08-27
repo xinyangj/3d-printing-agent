@@ -39,6 +39,7 @@ from printing_agent.errors import (
     ValidationError,
 )
 from printing_agent.fabrication import (
+    BambuConnectHandoff,
     JobOverrides,
     MaterialAssignment,
     MaterialDefinitionRevision,
@@ -1924,10 +1925,25 @@ async def test_slice_request_reserves_spools_atomically(
     )
 
     await repository.enqueue_slice(job, [reservation])
+    handoff = BambuConnectHandoff(
+        workflow_id=workflow.id,
+        slice_job_id=job.id,
+        sliced_artifact_digest="e" * 64,
+        sliced_manifest_digest="f" * 64,
+        expected_device_ref="a" * 64,
+        expected_device_name="Workshop H2D",
+        staged_path=str(tmp_path / "connect.gcode.3mf"),
+        correlation_name="agent-workflow-deadbeef-a1",
+        launch_uri="bambu-connect://import-file?path=verified",
+    )
+    await repository.save_bambu_connect_handoff(handoff)
 
     assert (await repository.get_workflow(workflow.id)).state == (
         WorkflowState.SLICE_REQUESTED
     )
+    assert (
+        await repository.get_latest_bambu_connect_handoff(workflow.id)
+    ) == handoff
     assert (await repository.list_spool_reservations(job.id))[0].status == (
         "reserved"
     )

@@ -16,6 +16,12 @@ http://127.0.0.1:8080 {
 	@bambu_studio_session path /api/v1/bambu-studio-session*
 	respond @bambu_studio_session 404
 
+	@bambu_connect_install path /api/v1/bambu-connect/install*
+	respond @bambu_connect_install 404
+
+	@bambu_connect_launch path_regexp bambu_connect_launch ^/api/v1/workflows/[^/]+/bambu-connect(?:/.*)?$
+	respond @bambu_connect_launch 404
+
 	reverse_proxy 127.0.0.1:8000
 
 	log {

@@ -973,6 +973,50 @@ select:focus {
   margin-top: 6px;
 }
 
+.connect-handoff-panel {
+  border-color: #5f817a;
+}
+
+.connect-prerequisite,
+.connect-status {
+  background: #f5f5ef;
+  border: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.connect-status-waiting_for_match,
+.connect-status-connect_opened,
+.connect-status-ready {
+  background: #fff8e6;
+  border-color: #c8922e;
+}
+
+.connect-status-activity_unverified,
+.connect-status-failed,
+.connect-status-timed_out {
+  background: #fff0ec;
+  border-color: #c85d4e;
+}
+
+.connect-status-print_matched,
+.connect-status-printing,
+.connect-status-completed {
+  background: #edf8f3;
+  border-color: #5f817a;
+}
+
+.connect-status .primary-action,
+.connect-status .secondary-action,
+.connect-prerequisite .primary-action {
+  justify-self: start;
+}
+
+.connect-launch-dialog {
+  max-width: 760px;
+}
+
 .slot-observation-actions {
   align-items: center;
   display: flex;

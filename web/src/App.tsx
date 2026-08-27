@@ -150,6 +150,7 @@ type WorkflowResponse = {
   cloud_snapshot: CloudDeviceSnapshotPayload | null
   material_mappings: FilamentMappingStatus[]
   quantity_authorizations: QuantityAuthorizationState[]
+  bambu_connect_handoff: BambuConnectHandoffPayload | null
 }
 
 type Printer = {
@@ -189,6 +190,7 @@ type PrinterProfile = {
     toolheads: Array<{ id: string; name: string; nozzle_diameter_mm: number }>
     plates: Array<{ id: string; name: string }>
     material_slots: Array<{ id: string; name: string; automatic_assignment: boolean }>
+    cloud_device_name?: string | null
     slicer: {
       driver_id: string
       machine_profile_id: string
@@ -280,6 +282,48 @@ type QuantityAuthorizationState = {
   tray_identity_digest: string
   status: 'authorization_required' | 'authorized_unknown'
   authorized_at: string | null
+}
+
+type BambuConnectHandoffPayload = {
+  id: string
+  workflow_id: string
+  slice_job_id: string
+  sliced_artifact_digest: string
+  sliced_manifest_digest: string
+  expected_device_name: string
+  correlation_name: string
+  attempt: number
+  status:
+    | 'ready'
+    | 'connect_opened'
+    | 'waiting_for_match'
+    | 'activity_unverified'
+    | 'print_matched'
+    | 'printing'
+    | 'completed'
+    | 'failed'
+    | 'timed_out'
+    | 'cancelled'
+  matched_task_id: string | null
+  matched_file: string | null
+  matched_name: string | null
+  progress_percent: number | null
+  remaining_time_seconds: number | null
+  printer_state: string | null
+  printer_error_code: number | null
+  launched_at: string | null
+  match_deadline: string | null
+  matched_at: string | null
+  last_observed_at: string | null
+  message: string | null
+}
+
+type BambuConnectReadiness = {
+  installed: boolean
+  scheme_registered: boolean
+  signature_valid: boolean
+  ready: boolean
+  message: string
 }
 
 type MaterialEligibilityRejection = {
@@ -1540,6 +1584,9 @@ function FabricationStepper({
   const cloudComplete = data.cloud_snapshot?.completeness === 'complete'
   const materialComplete = Boolean(data.material_assignment?.confirmed_at)
   const sliceComplete = Boolean(data.sliced_artifact)
+  const connectHandoff = data.bambu_connect_handoff
+  const connectComplete =
+    connectHandoff?.status === 'completed' || workflow.state === 'completed'
   const statuses: Array<'complete' | 'active' | 'pending'> = [
     approvalComplete ? 'complete' : 'active',
     cloudComplete
@@ -1560,7 +1607,8 @@ function FabricationStepper({
           )
         ? 'active'
         : 'pending',
-    workflow.state === 'awaiting_slice_review' ? 'active' : 'pending',
+    sliceComplete ? 'complete' : workflow.state === 'awaiting_slice_review' ? 'active' : 'pending',
+    connectComplete ? 'complete' : connectHandoff ? 'active' : sliceComplete ? 'active' : 'pending',
   ]
   const steps = [
     ['1', 'Model approval'],
@@ -1568,6 +1616,7 @@ function FabricationStepper({
     ['3', 'Material assignment'],
     ['4', 'Slice in Bambu Studio'],
     ['5', 'Review & download'],
+    ['6', 'Bambu Connect & monitor'],
   ]
 
   return (
@@ -1591,20 +1640,38 @@ function SlicingWorkspace({
 }) {
   const queryClient = useQueryClient()
   const [materialOverrides, setMaterialOverrides] = useState<Record<string, string>>({})
-  const [submissionNotice, setSubmissionNotice] = useState(false)
+  const [connectDialogOpen, setConnectDialogOpen] = useState(false)
   const [quantityReview, setQuantityReview] =
     useState<MaterialEligibilityRejection | null>(null)
   const preparationAttempted = useRef(false)
   const workflowQuery = useQuery({
     queryKey: ['workflow', workflowId],
     queryFn: () => api<WorkflowResponse>(`/workflows/${workflowId}`),
-    refetchInterval: (query) =>
-      query.state.data &&
-      ['slice_requested', 'slicing', 'slice_validating'].includes(
-        query.state.data.workflow.state,
-      )
-        ? 1500
-        : 10000,
+    refetchInterval: (query) => {
+      const current = query.state.data
+      if (
+        current &&
+        ['slice_requested', 'slicing', 'slice_validating'].includes(
+          current.workflow.state,
+        )
+      ) {
+        return 1500
+      }
+      if (
+        current?.bambu_connect_handoff &&
+        [
+          'ready',
+          'connect_opened',
+          'waiting_for_match',
+          'activity_unverified',
+          'print_matched',
+          'printing',
+        ].includes(current.bambu_connect_handoff.status)
+      ) {
+        return 3000
+      }
+      return 10000
+    },
   })
   const data = workflowQuery.data
   const workflow = data?.workflow
@@ -1716,6 +1783,43 @@ function SlicingWorkspace({
       void queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
     },
   })
+  const connectReadiness = useQuery({
+    queryKey: ['bambu-connect-readiness'],
+    queryFn: () => api<BambuConnectReadiness>('/bambu-connect/readiness'),
+    enabled: Boolean(data?.sliced_artifact),
+  })
+  const installConnect = useMutation({
+    mutationFn: () =>
+      api<BambuConnectReadiness>('/bambu-connect/install', { method: 'POST' }),
+    onSuccess: (readiness) => {
+      queryClient.setQueryData(['bambu-connect-readiness'], readiness)
+    },
+  })
+  const launchConnect = useMutation({
+    mutationFn: () =>
+      api<WorkflowResponse>(`/workflows/${workflowId}/bambu-connect`, {
+        method: 'POST',
+        body: JSON.stringify({
+          slice_job_id: data!.slice_job!.id,
+          sliced_artifact_digest: data!.sliced_artifact!.digest,
+        }),
+      }),
+    onSuccess: (updated) => {
+      setConnectDialogOpen(false)
+      queryClient.setQueryData(['workflow', workflowId], updated)
+      void queryClient.invalidateQueries({ queryKey: ['workflows'] })
+    },
+  })
+  const stopConnectMonitoring = useMutation({
+    mutationFn: () =>
+      api<WorkflowResponse>(
+        `/workflows/${workflowId}/bambu-connect/stop-monitoring`,
+        { method: 'POST' },
+      ),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(['workflow', workflowId], updated)
+    },
+  })
   const materialOperationPending =
     confirmMapping.isPending ||
     confirmAndSlice.isPending ||
@@ -1785,6 +1889,27 @@ function SlicingWorkspace({
       : data.slice_job?.material_assessment
   const recoveryCanConfirm =
     !materialRecovery || materialRecovery.status === 'replacement_proposed'
+  const connectHandoff = data.bambu_connect_handoff
+  const connectMonitoringActive =
+    connectHandoff != null &&
+    [
+      'ready',
+      'connect_opened',
+      'waiting_for_match',
+      'activity_unverified',
+      'print_matched',
+      'printing',
+    ].includes(connectHandoff.status)
+  const connectMonitoringCanStop =
+    connectHandoff != null &&
+    [
+      'ready',
+      'connect_opened',
+      'waiting_for_match',
+      'activity_unverified',
+      'print_matched',
+      'printing',
+    ].includes(connectHandoff.status)
 
   return (
     <main className="slicing-workspace">
@@ -2310,22 +2435,131 @@ function SlicingWorkspace({
                 >
                   Download slice manifest
                 </a>
-                <button
-                  className="secondary-action"
-                  onClick={() => setSubmissionNotice(true)}
-                >
-                  Submit to printer
-                </button>
               </div>
-              {submissionNotice && (
-                <div className="part-warning">
-                  Printer submission is a future feature. No file was uploaded and no printer
-                  command was sent. Download the validated .gcode.3mf for manual handoff.
+              <div className="boundary-note">
+                Printer-ready artifact created. Opening Bambu Connect does not prove upload or
+                print start; those actions remain visible inside Connect.
+              </div>
+            </section>
+          )}
+
+          {data.sliced_artifact && data.slice_job?.status === 'ready' && (
+            <section className="slice-step-card connect-handoff-panel">
+              <span className="section-label">6 · Bambu Connect &amp; monitor</span>
+              <strong>
+                {connectHandoff
+                  ? formatState(connectHandoff.status)
+                  : 'Official Connect handoff is ready'}
+              </strong>
+              <p>
+                Bambu Connect owns authentication, printer selection, upload, and the visible
+                Print/Send confirmation. This app only opens the verified file and observes the
+                expected H2D read-only.
+              </p>
+
+              {!connectHandoff &&
+                (connectReadiness.isLoading ? (
+                  <small>Checking Bambu Connect…</small>
+                ) : connectReadiness.data?.ready ? (
+                  <button
+                    className="primary-action"
+                    onClick={() => setConnectDialogOpen(true)}
+                  >
+                    Open verified file in Bambu Connect
+                  </button>
+                ) : (
+                  <div className="connect-prerequisite">
+                    <span>{connectReadiness.data?.message ?? 'Bambu Connect is unavailable.'}</span>
+                    <button
+                      className="primary-action"
+                      disabled={installConnect.isPending}
+                      onClick={() => installConnect.mutate()}
+                    >
+                      {installConnect.isPending
+                        ? 'Downloading and installing Connect…'
+                        : 'Install official Bambu Connect'}
+                    </button>
+                  </div>
+                ))}
+
+              {connectHandoff && (
+                <div
+                  className={`connect-status connect-status-${connectHandoff.status}`}
+                >
+                  <strong>{connectHandoff.message ?? formatState(connectHandoff.status)}</strong>
+                  <small>
+                    Expected printer: {connectHandoff.expected_device_name} · attempt{' '}
+                    {connectHandoff.attempt}
+                  </small>
+                  <small>Correlation name: {connectHandoff.correlation_name}</small>
+                  {connectHandoff.printer_state && (
+                    <small>
+                      Printer state: {formatState(connectHandoff.printer_state)}
+                      {connectHandoff.progress_percent != null
+                        ? ` · ${connectHandoff.progress_percent}%`
+                        : ''}
+                      {connectHandoff.remaining_time_seconds != null
+                        ? ` · ${Math.ceil(connectHandoff.remaining_time_seconds / 60)} min remaining`
+                        : ''}
+                    </small>
+                  )}
+                  {connectHandoff.matched_file && (
+                    <small>Matched file: {connectHandoff.matched_file}</small>
+                  )}
+                  {connectHandoff.status === 'waiting_for_match' && (
+                    <p>
+                      Complete upload in Connect, select {connectHandoff.expected_device_name},
+                      keep the correlation name unchanged, then press Print/Send there.
+                    </p>
+                  )}
+                  {connectHandoff.status === 'activity_unverified' && (
+                    <p className="part-warning">
+                      Printer activity was detected, but filename/task metadata does not match
+                      this artifact. The workflow has not been marked as printing.
+                    </p>
+                  )}
+                  {['timed_out', 'failed', 'cancelled'].includes(
+                    connectHandoff.status,
+                  ) && workflow.state === 'awaiting_slice_review' && (
+                    <button
+                      className="primary-action"
+                      onClick={() => setConnectDialogOpen(true)}
+                    >
+                      Retry Bambu Connect
+                    </button>
+                  )}
+                  {connectMonitoringCanStop && (
+                    <button
+                      className={
+                        ['print_matched', 'printing'].includes(connectHandoff.status)
+                          ? 'danger-action'
+                          : 'secondary-action'
+                      }
+                      disabled={stopConnectMonitoring.isPending}
+                      onClick={() => stopConnectMonitoring.mutate()}
+                    >
+                      {['print_matched', 'printing'].includes(connectHandoff.status)
+                        ? 'Stop monitoring and mark status unknown'
+                        : 'Stop monitoring'}
+                    </button>
+                  )}
                 </div>
               )}
+
+              {(connectReadiness.error ||
+                installConnect.error ||
+                launchConnect.error ||
+                stopConnectMonitoring.error) && (
+                <p className="error-copy">
+                  {connectReadiness.error?.message ??
+                    installConnect.error?.message ??
+                    launchConnect.error?.message ??
+                    stopConnectMonitoring.error?.message}
+                </p>
+              )}
               <div className="boundary-note">
-                Printer-ready artifact created. No file was uploaded and no job was submitted
-                to a printer.
+                No upload, start, pause, resume, cancel, motion, temperature, or calibration
+                command is sent by this application.
               </div>
             </section>
           )}
@@ -2348,7 +2582,10 @@ function SlicingWorkspace({
 
       <footer className="slicing-footer">
         <button className="secondary-action" onClick={onBack}>Back to models</button>
-        {!['cancelled', 'completed'].includes(workflow.state) && (
+        {!['cancelled', 'completed', 'printing', 'print_failed'].includes(
+          workflow.state,
+        ) &&
+          !connectMonitoringActive && (
           <button
             className="danger-action"
             disabled={cancel.isPending}
@@ -2356,8 +2593,82 @@ function SlicingWorkspace({
           >
             {cancel.isPending ? 'Cancelling…' : 'Cancel slicing workflow'}
           </button>
-        )}
+          )}
       </footer>
+      {connectDialogOpen && data.sliced_artifact && data.slice_job && (
+        <div
+          className="dialog-backdrop"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target && !launchConnect.isPending) {
+              setConnectDialogOpen(false)
+            }
+          }}
+        >
+          <section
+            aria-labelledby="connect-handoff-title"
+            aria-modal="true"
+            className="fabrication-dialog connect-launch-dialog"
+            role="dialog"
+          >
+            <header>
+              <div>
+                <span className="eyebrow">Visible official handoff</span>
+                <h2 id="connect-handoff-title">Open verified slice in Bambu Connect?</h2>
+                <p>
+                  Connect will own upload and the final Print/Send confirmation.
+                </p>
+              </div>
+              <button
+                aria-label="Close Bambu Connect handoff"
+                className="dialog-close"
+                disabled={launchConnect.isPending}
+                onClick={() => setConnectDialogOpen(false)}
+              >
+                ×
+              </button>
+            </header>
+            <div className="quantity-authorization-summary">
+              <div>
+                <span className="section-label">Expected printer</span>
+                <strong>
+                  {connectHandoff?.expected_device_name ??
+                    data.printer_snapshot?.profile.cloud_device_name ??
+                    'Bound H2D'}
+                </strong>
+              </div>
+              <div>
+                <span className="section-label">Artifact</span>
+                <strong>{data.slice_job.id.slice(0, 8)} · .gcode.3mf</strong>
+                <small>{data.sliced_artifact.digest}</small>
+              </div>
+            </div>
+            <div className="part-warning">
+              In Connect, select the expected H2D, verify AMS/tool mapping, do not rename the
+              imported job, and press Print/Send only after your final review. This web UI cannot
+              verify upload until a matching printer job appears.
+            </div>
+            {launchConnect.error && (
+              <p className="error-copy">{launchConnect.error.message}</p>
+            )}
+            <footer>
+              <button
+                className="secondary-action"
+                disabled={launchConnect.isPending}
+                onClick={() => setConnectDialogOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="primary-action"
+                disabled={launchConnect.isPending}
+                onClick={() => launchConnect.mutate()}
+              >
+                {launchConnect.isPending ? 'Opening Connect…' : 'Open Bambu Connect'}
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
       {quantityReview && quantityReviewTray && (
         <UnknownQuantityAuthorizationDialog
           color={quantityReviewTray.color}

@@ -20,11 +20,13 @@ from printing_agent.cloud_inventory import (
     BambuCloudInventoryProvider,
     CloudAuthenticationError,
     CloudInventoryError,
+    CloudInventoryIncompleteError,
     DeviceSummary,
     _jwt_username,
     _normalize_mqtt_username,
     build_read_only_status_request,
     endpoints_for_region,
+    parse_h2d_print_status,
     parse_h2d_snapshot,
 )
 
@@ -536,6 +538,52 @@ def test_negative_remaining_sentinel_is_unknown_not_global_failure() -> None:
     assert tray.remain_percentage is None
     assert tray.estimated_remaining_g is None
     assert "no usable quantity estimate" in snapshot.warnings[0]
+
+
+def test_print_status_is_separate_from_inventory_digest() -> None:
+    report = _h2d_report()
+    report["print"].update(
+        {
+            "gcode_state": "RUNNING",
+            "gcode_file": "/model/agent-workflow-digest-a1.gcode.3mf",
+            "subtask_name": "agent-workflow-digest-a1",
+            "task_id": "task-42",
+            "mc_percent": "27",
+            "mc_remaining_time": 12,
+            "print_error": 0,
+        }
+    )
+    device = DeviceSummary(
+        device_id="H2D-SERIAL",
+        name="Workshop H2D",
+        model="H2D",
+        online=True,
+    )
+
+    before = parse_h2d_snapshot(report, device)
+    status = parse_h2d_print_status(report, device)
+    report["print"]["mc_percent"] = 28
+    after = parse_h2d_snapshot(report, device)
+
+    assert status.state == "printing"
+    assert status.gcode_file is not None
+    assert status.task_id == "task-42"
+    assert status.progress_percent == 27
+    assert status.remaining_time_seconds == 720
+    assert before.digest == after.digest
+
+
+def test_print_status_rejects_invalid_progress() -> None:
+    with pytest.raises(CloudInventoryIncompleteError, match="progress"):
+        parse_h2d_print_status(
+            {"print": {"gcode_state": "RUNNING", "mc_percent": 101}},
+            DeviceSummary(
+                device_id="H2D-SERIAL",
+                name="Workshop H2D",
+                model="H2D",
+                online=True,
+            ),
+        )
 
 
 @pytest.mark.parametrize("command", ["project_file", "print", "control"])

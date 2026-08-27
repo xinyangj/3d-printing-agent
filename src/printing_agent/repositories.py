@@ -33,6 +33,8 @@ from printing_agent.domain import (
 )
 from printing_agent.errors import ConflictError, NotFoundError
 from printing_agent.fabrication import (
+    BambuConnectHandoff,
+    BambuConnectHandoffStatus,
     MaterialAssignment,
     MaterialDefinitionRevision,
     MaterialDefinitionSpec,
@@ -364,6 +366,21 @@ CREATE TABLE IF NOT EXISTS sliced_artifacts (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS bambu_connect_handoffs (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+    slice_job_id TEXT NOT NULL REFERENCES slice_jobs(id),
+    attempt INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(slice_job_id, attempt)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bambu_connect_handoffs_workflow
+ON bambu_connect_handoffs(workflow_id, created_at DESC);
 """
 
 
@@ -3664,6 +3681,72 @@ class WorkflowRepository:
             slice_job_id,
         )
         return SlicedArtifact.model_validate_json(payload)
+
+    async def save_bambu_connect_handoff(
+        self,
+        handoff: BambuConnectHandoff,
+    ) -> None:
+        db = await self._connect()
+        try:
+            await db.execute(
+                """
+                INSERT INTO bambu_connect_handoffs (
+                    id, workflow_id, slice_job_id, attempt, status,
+                    payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    handoff.id,
+                    handoff.workflow_id,
+                    handoff.slice_job_id,
+                    handoff.attempt,
+                    handoff.status.value,
+                    handoff.model_dump_json(),
+                    handoff.created_at.isoformat(),
+                    handoff.updated_at.isoformat(),
+                ),
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError as exc:
+            await db.rollback()
+            raise ConflictError(
+                "A Bambu Connect handoff attempt already exists"
+            ) from exc
+        finally:
+            await db.close()
+
+    async def get_latest_bambu_connect_handoff(
+        self,
+        workflow_id: str,
+    ) -> BambuConnectHandoff:
+        db = await self._connect()
+        try:
+            cursor = await db.execute(
+                """
+                SELECT payload_json, status
+                FROM bambu_connect_handoffs
+                WHERE workflow_id = ?
+                ORDER BY created_at DESC, attempt DESC
+                LIMIT 1
+                """,
+                (workflow_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"Workflow '{workflow_id}' has no Bambu Connect handoff"
+                )
+            return BambuConnectHandoff.model_validate_json(
+                row["payload_json"]
+            ).model_copy(
+                update={"status": BambuConnectHandoffStatus(row["status"])}
+            )
+        finally:
+            await db.close()
 
     async def _get_single_payload(
         self,

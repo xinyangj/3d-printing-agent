@@ -45,6 +45,19 @@ class SliceJobStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class BambuConnectHandoffStatus(StrEnum):
+    READY = "ready"
+    CONNECT_OPENED = "connect_opened"
+    WAITING_FOR_MATCH = "waiting_for_match"
+    ACTIVITY_UNVERIFIED = "activity_unverified"
+    PRINT_MATCHED = "print_matched"
+    PRINTING = "printing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+
+
 class ToolheadSpec(FrozenModel):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     name: str = Field(min_length=1, max_length=100)
@@ -552,6 +565,38 @@ class SlicedArtifact(FrozenModel):
     thumbnail_path: str | None = None
     manifest_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class BambuConnectHandoff(FrozenModel):
+    id: str = Field(default_factory=new_id)
+    workflow_id: str
+    slice_job_id: str
+    sliced_artifact_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    sliced_manifest_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    expected_device_ref: str = Field(pattern=r"^[a-f0-9]{64}$")
+    expected_device_name: str = Field(min_length=1, max_length=200)
+    staged_path: str
+    correlation_name: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
+    )
+    launch_uri: str = Field(min_length=1, max_length=4_096)
+    attempt: int = Field(default=1, ge=1, le=100)
+    status: BambuConnectHandoffStatus = BambuConnectHandoffStatus.READY
+    baseline_state: str = Field(default="unknown", min_length=1, max_length=50)
+    matched_task_id: str | None = Field(default=None, max_length=200)
+    matched_file: str | None = Field(default=None, max_length=500)
+    matched_name: str | None = Field(default=None, max_length=500)
+    progress_percent: int | None = Field(default=None, ge=0, le=100)
+    remaining_time_seconds: int | None = Field(default=None, ge=0)
+    printer_state: str | None = Field(default=None, max_length=50)
+    printer_error_code: int | None = None
+    launched_at: datetime | None = None
+    match_deadline: datetime | None = None
+    matched_at: datetime | None = None
+    last_observed_at: datetime | None = None
+    message: str | None = Field(default=None, max_length=2_000)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 def resolve_slot_policy(

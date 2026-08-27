@@ -190,7 +190,7 @@ async def test_slicing_profiles_and_material_mapping_api(
     assert material.json()["spec"]["display_name"] == "Red PLA"
 
 
-async def test_api_exposes_slicing_without_submission_routes(
+async def test_api_exposes_connect_handoff_without_control_routes(
     settings: Settings,
 ) -> None:
     app = create_app(await build_container(settings))
@@ -201,10 +201,38 @@ async def test_api_exposes_slicing_without_submission_routes(
 
     assert "/api/v1/slicing-profiles" in paths
     assert "/api/v1/workflows/{workflow_id}/slice" in paths
+    assert "/api/v1/bambu-connect/readiness" in paths
+    assert "/api/v1/bambu-connect/install" in paths
+    assert "/api/v1/workflows/{workflow_id}/bambu-connect" in paths
+    assert not any("submission-handoff" in path for path in paths)
     assert not any(
-        "submission-handoff" in path or "bambu-connect" in path
+        path.endswith(("/start", "/pause", "/resume"))
         for path in paths
     )
+
+
+async def test_connect_install_and_launch_are_local_only(
+    settings: Settings,
+) -> None:
+    app = create_app(await build_container(settings))
+    with TestClient(app) as client:
+        headers = {"X-Forwarded-For": "203.0.113.20"}
+        assert client.post(
+            "/api/v1/bambu-connect/install",
+            headers=headers,
+        ).status_code == 404
+        assert client.post(
+            "/api/v1/workflows/workflow/bambu-connect",
+            headers=headers,
+            json={
+                "slice_job_id": "slice",
+                "sliced_artifact_digest": "a" * 64,
+            },
+        ).status_code == 404
+        assert client.post(
+            "/api/v1/workflows/workflow/bambu-connect/stop-monitoring",
+            headers=headers,
+        ).status_code == 404
 
 
 async def test_fabrication_readiness_contains_no_submission_surface(

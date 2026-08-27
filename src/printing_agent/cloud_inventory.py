@@ -193,6 +193,33 @@ class CloudDeviceSnapshot(_FrozenModel):
         return value
 
 
+class CloudPrintStatusObservation(_FrozenModel):
+    region: CloudRegion
+    device: DeviceSummary
+    state: Literal[
+        "idle",
+        "preparing",
+        "printing",
+        "paused",
+        "completed",
+        "failed",
+        "unknown",
+    ]
+    raw_state: str = Field(min_length=1, max_length=100)
+    gcode_file: str | None = Field(default=None, max_length=500)
+    subtask_name: str | None = Field(default=None, max_length=500)
+    task_id: str | None = Field(default=None, max_length=200)
+    progress_percent: int | None = Field(default=None, ge=0, le=100)
+    remaining_time_seconds: int | None = Field(default=None, ge=0)
+    error_code: int | None = None
+    observed_at: datetime
+
+    def masked_dump(self) -> dict[str, Any]:
+        value = self.model_dump(mode="json")
+        value["device"] = self.device.masked_dump()
+        return value
+
+
 class InventoryProvider(Protocol):
     async def validate_token(
         self,
@@ -203,6 +230,11 @@ class InventoryProvider(Protocol):
     async def list_devices(self) -> tuple[DeviceSummary, ...]: ...
 
     async def snapshot(self, device_id: str) -> CloudDeviceSnapshot: ...
+
+    async def print_status(
+        self,
+        device_id: str,
+    ) -> CloudPrintStatusObservation: ...
 
 
 class _MQTTMessage(Protocol):
@@ -629,6 +661,73 @@ def parse_h2d_snapshot(
         raise CloudInventoryIncompleteError("Printer inventory fields are invalid") from exc
 
 
+def parse_h2d_print_status(
+    payload: Mapping[str, Any],
+    device: DeviceSummary,
+    *,
+    observed_at: datetime | None = None,
+    region: CloudRegion = "global",
+) -> CloudPrintStatusObservation:
+    section = payload.get("print")
+    if not isinstance(section, Mapping):
+        raise CloudInventoryIncompleteError("Bambu Cloud print status is incomplete")
+    raw_state = _string(section.get("gcode_state"), "gcode state").upper()
+    state = {
+        "IDLE": "idle",
+        "INIT": "preparing",
+        "PREPARE": "preparing",
+        "RUNNING": "printing",
+        "PAUSE": "paused",
+        "PAUSED": "paused",
+        "FINISH": "completed",
+        "FINISHED": "completed",
+        "COMPLETED": "completed",
+        "FAILED": "failed",
+        "ERROR": "failed",
+    }.get(raw_state, "unknown")
+
+    def optional_text(*keys: str, maximum: int) -> str | None:
+        value = _nested_mapping(section, *keys)
+        if value is None or not str(value).strip():
+            return None
+        return str(value).strip()[:maximum]
+
+    def optional_int(*keys: str) -> int | None:
+        value = _nested_mapping(section, *keys)
+        if value is None or value == "":
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CloudInventoryIncompleteError(
+                f"Bambu Cloud print status field {keys[0]} is invalid"
+            ) from exc
+
+    progress = optional_int("mc_percent")
+    if progress is not None and not 0 <= progress <= 100:
+        raise CloudInventoryIncompleteError("Bambu Cloud print progress is invalid")
+    remaining_minutes = optional_int("mc_remaining_time")
+    if remaining_minutes is not None and remaining_minutes < 0:
+        raise CloudInventoryIncompleteError(
+            "Bambu Cloud remaining print time is invalid"
+        )
+    return CloudPrintStatusObservation(
+        region=region,
+        device=device,
+        state=state,
+        raw_state=raw_state,
+        gcode_file=optional_text("gcode_file", maximum=500),
+        subtask_name=optional_text("subtask_name", maximum=500),
+        task_id=optional_text("task_id", "job_id", maximum=200),
+        progress_percent=progress,
+        remaining_time_seconds=(
+            remaining_minutes * 60 if remaining_minutes is not None else None
+        ),
+        error_code=optional_int("print_error", "mc_print_error_code"),
+        observed_at=observed_at or datetime.now(UTC),
+    )
+
+
 def _is_h2d(model: str) -> bool:
     return "h2d" in re.sub(r"[^a-z0-9]", "", model.casefold())
 
@@ -762,6 +861,37 @@ class BambuCloudInventoryProvider:
         return devices
 
     async def snapshot(self, device_id: str) -> CloudDeviceSnapshot:
+        credentials, device, payload = await self._device_payload(
+            device_id,
+            require_print_status=False,
+        )
+        return parse_h2d_snapshot(
+            payload,
+            device,
+            ttl=self._snapshot_ttl,
+            region=credentials.region,
+        )
+
+    async def print_status(
+        self,
+        device_id: str,
+    ) -> CloudPrintStatusObservation:
+        credentials, device, payload = await self._device_payload(
+            device_id,
+            require_print_status=True,
+        )
+        return parse_h2d_print_status(
+            payload,
+            device,
+            region=credentials.region,
+        )
+
+    async def _device_payload(
+        self,
+        device_id: str,
+        *,
+        require_print_status: bool,
+    ) -> tuple[CloudCredentials, DeviceSummary, dict[str, Any]]:
         credentials = self._load_credentials()
         devices = await self._list_devices(credentials)
         device = next((item for item in devices if item.device_id == device_id), None)
@@ -783,13 +913,9 @@ class BambuCloudInventoryProvider:
             device,
             username,
             token,
+            require_print_status,
         )
-        return parse_h2d_snapshot(
-            payload,
-            device,
-            ttl=self._snapshot_ttl,
-            region=credentials.region,
-        )
+        return credentials, device, payload
 
     def _load_credentials(self) -> CloudCredentials:
         try:
@@ -879,6 +1005,7 @@ class BambuCloudInventoryProvider:
         device: DeviceSummary,
         username: str,
         token: str,
+        require_print_status: bool = False,
     ) -> dict[str, Any]:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", device.device_id):
             raise CloudInventoryError("Selected printer identifier is invalid")
@@ -970,6 +1097,8 @@ class BambuCloudInventoryProvider:
                 _deep_merge(merged, message)
                 try:
                     parse_h2d_snapshot(merged, device, ttl=self._snapshot_ttl)
+                    if require_print_status:
+                        parse_h2d_print_status(merged, device)
                     return merged
                 except CloudInventoryIncompleteError as exc:
                     last_incomplete = exc
