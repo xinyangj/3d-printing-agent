@@ -1699,10 +1699,46 @@ function FabricationStepper({
   )
 }
 
+function TriStateControl({
+  label,
+  value,
+  disabled,
+  onChange,
+}: {
+  label: string
+  value: boolean | null
+  disabled: boolean
+  onChange: (value: boolean | null) => void
+}) {
+  const options: Array<{ label: string; value: boolean | null }> = [
+    { label: 'Default', value: null },
+    { label: 'On', value: true },
+    { label: 'Off', value: false },
+  ]
+  return (
+    <div className="job-setting-field">
+      <span className="job-setting-label">{label}</span>
+      <div aria-label={label} className="tri-state-control" role="group">
+        {options.map((option) => (
+          <button
+            aria-pressed={value === option.value}
+            className={value === option.value ? 'selected' : ''}
+            disabled={disabled}
+            key={option.label}
+            onClick={() => onChange(option.value)}
+            type="button"
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function SlicingJobSettings({
   snapshot,
   draft,
-  cloudSnapshot,
   history,
   editable,
   canRevise,
@@ -1716,7 +1752,6 @@ function SlicingJobSettings({
 }: {
   snapshot: NonNullable<WorkflowResponse['printer_snapshot']>
   draft: JobOverrides
-  cloudSnapshot: CloudDeviceSnapshotPayload | null
   history: WorkflowResponse['configuration_history']
   editable: boolean
   canRevise: boolean
@@ -1728,32 +1763,50 @@ function SlicingJobSettings({
   onReset: () => void
   onRevise: () => void
 }) {
-  const trays = new Map(
-    [
-      ...(cloudSnapshot?.ams_units.flatMap((unit) => unit.trays) ?? []),
-      ...(cloudSnapshot?.external_trays ?? []),
-    ].map((tray) => [tray.slot_id, tray]),
-  )
   const update = <Key extends keyof JobOverrides>(
     key: Key,
     value: JobOverrides[Key],
   ) => onChange({ ...draft, [key]: value })
-  const triValue = (value: boolean | null) =>
-    value == null ? '' : value ? 'true' : 'false'
-  const triUpdate = (
-    key: 'supports' | 'brim' | 'raft' | 'allow_manual_swaps',
-    value: string,
-  ) => update(key, value === '' ? null : value === 'true')
-  const toggleSlot = (slotId: string) =>
-    update(
-      'forbidden_slot_ids',
-      draft.forbidden_slot_ids.includes(slotId)
-        ? draft.forbidden_slot_ids.filter((item) => item !== slotId)
-        : [...draft.forbidden_slot_ids, slotId],
-    )
+  const controlsDisabled = !editable || pending
+  const advancedConfigured =
+    draft.toolhead_id !== null ||
+    draft.nozzle_diameter_mm !== null ||
+    draft.brim !== null ||
+    draft.raft !== null ||
+    draft.allow_manual_swaps !== null ||
+    draft.maximum_color_distance !== 12 ||
+    draft.material_safety_margin_percent !== 15
+  const [advancedOpen, setAdvancedOpen] = useState(advancedConfigured)
+  useEffect(() => {
+    if (advancedConfigured || error) setAdvancedOpen(true)
+  }, [advancedConfigured, error])
+  const usingProfileDefaults =
+    draft.plate_id === null &&
+    draft.layer_height_mm === null &&
+    draft.infill_percent === null &&
+    draft.supports === null &&
+    draft.forbidden_slot_ids.length === 0 &&
+    draft.allowed_slot_ids === null &&
+    Object.keys(draft.part_allowed_slot_ids).length === 0 &&
+    Object.keys(draft.part_forbidden_slot_ids).length === 0 &&
+    !advancedConfigured
+  const maskedSlotCount = snapshot.resolved_slot_policy.forbidden_slot_ids.length
+  const partRestrictionCount =
+    Object.keys(snapshot.resolved_slot_policy.part_allowed_slot_ids).length +
+    Object.keys(snapshot.resolved_slot_policy.part_forbidden_slot_ids).length
 
   return (
-    <section className="slice-step-card job-settings-card">
+    <section
+      className={[
+        'slice-step-card',
+        'job-settings-card',
+        dirty ? 'dirty' : '',
+        pending ? 'applying' : '',
+        !editable ? 'locked' : '',
+      ]
+        .filter(Boolean)
+        .join(' ')}
+    >
       <span className="section-label">Job settings</span>
       <div className="job-settings-heading">
         <div>
@@ -1762,7 +1815,9 @@ function SlicingJobSettings({
             {editable
               ? dirty
                 ? 'Unsaved job settings'
-                : 'Defaults and overrides are ready'
+                : usingProfileDefaults
+                  ? 'Using profile defaults'
+                  : 'Saved job settings'
               : 'Settings locked for this slice'}
           </p>
         </div>
@@ -1773,167 +1828,192 @@ function SlicingJobSettings({
         )}
       </div>
 
-      <div className="job-settings-grid">
-        <label>
-          Toolhead
-          <select
-            disabled={!editable}
-            value={draft.toolhead_id ?? ''}
-            onChange={(event) =>
-              update('toolhead_id', event.target.value || null)
-            }
-          >
-            <option value="">Profile default</option>
-            {snapshot.profile.toolheads.map((toolhead) => (
-              <option key={toolhead.id} value={toolhead.id}>
-                {toolhead.name} · {toolhead.nozzle_diameter_mm} mm
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Nozzle diameter override
-          <input
-            disabled={!editable}
-            max="2"
-            min="0.1"
-            step="0.1"
-            type="number"
-            value={draft.nozzle_diameter_mm ?? ''}
-            onChange={(event) =>
-              update(
-                'nozzle_diameter_mm',
-                event.target.value ? Number(event.target.value) : null,
-              )
-            }
-          />
-        </label>
-        <label>
-          Plate
-          <select
-            disabled={!editable}
-            value={draft.plate_id ?? ''}
-            onChange={(event) =>
-              update('plate_id', event.target.value || null)
-            }
-          >
-            <option value="">Profile default</option>
-            {snapshot.profile.plates.map((plate) => (
-              <option key={plate.id} value={plate.id}>
-                {plate.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Layer height
-          <input
-            disabled={!editable}
-            max="1"
-            min="0.05"
-            step="0.05"
-            type="number"
-            value={draft.layer_height_mm ?? ''}
-            onChange={(event) =>
-              update(
-                'layer_height_mm',
-                event.target.value ? Number(event.target.value) : null,
-              )
-            }
-          />
-        </label>
-        <label>
-          Infill %
-          <input
-            disabled={!editable}
-            max="100"
-            min="0"
-            type="number"
-            value={draft.infill_percent ?? ''}
-            onChange={(event) =>
-              update(
-                'infill_percent',
-                event.target.value ? Number(event.target.value) : null,
-              )
-            }
-          />
-        </label>
-        {(
-          [
-            ['supports', 'Supports'],
-            ['brim', 'Brim'],
-            ['raft', 'Raft'],
-            ['allow_manual_swaps', 'Manual spool swaps'],
-          ] as const
-        ).map(([key, label]) => (
-          <label key={key}>
-            {label}
+      <div className="job-settings-section">
+        <span className="job-settings-group-title">Common settings</span>
+        <div className="job-settings-grid">
+          <label className="job-setting-field">
+            <span className="job-setting-label">Plate</span>
             <select
-              disabled={!editable}
-              value={triValue(draft[key])}
-              onChange={(event) => triUpdate(key, event.target.value)}
+              disabled={controlsDisabled}
+              value={draft.plate_id ?? ''}
+              onChange={(event) =>
+                update('plate_id', event.target.value || null)
+              }
             >
               <option value="">Profile default</option>
-              <option value="true">Enabled</option>
-              <option value="false">Disabled</option>
+              {snapshot.profile.plates.map((plate) => (
+                <option key={plate.id} value={plate.id}>
+                  {plate.name}
+                </option>
+              ))}
             </select>
           </label>
-        ))}
-        <label>
-          Maximum color distance
-          <input
-            disabled={!editable}
-            max="100"
-            min="0"
-            step="0.5"
-            type="number"
-            value={draft.maximum_color_distance}
-            onChange={(event) =>
-              update('maximum_color_distance', Number(event.target.value))
-            }
+          <label className="job-setting-field">
+            <span className="job-setting-label">Layer height</span>
+            <div className="number-input-shell">
+              <input
+                disabled={controlsDisabled}
+                max="1"
+                min="0.05"
+                placeholder="Profile default"
+                step="0.05"
+                type="number"
+                value={draft.layer_height_mm ?? ''}
+                onChange={(event) =>
+                  update(
+                    'layer_height_mm',
+                    event.target.value ? Number(event.target.value) : null,
+                  )
+                }
+              />
+              <span>mm</span>
+            </div>
+          </label>
+          <label className="job-setting-field">
+            <span className="job-setting-label">Infill</span>
+            <div className="number-input-shell">
+              <input
+                disabled={controlsDisabled}
+                max="100"
+                min="0"
+                placeholder="Profile default"
+                type="number"
+                value={draft.infill_percent ?? ''}
+                onChange={(event) =>
+                  update(
+                    'infill_percent',
+                    event.target.value ? Number(event.target.value) : null,
+                  )
+                }
+              />
+              <span>%</span>
+            </div>
+          </label>
+          <TriStateControl
+            disabled={controlsDisabled}
+            label="Supports"
+            onChange={(value) => update('supports', value)}
+            value={draft.supports}
           />
-        </label>
-        <label>
-          Material safety margin %
-          <input
-            disabled={!editable}
-            max="100"
-            min="0"
-            step="1"
-            type="number"
-            value={draft.material_safety_margin_percent}
-            onChange={(event) =>
-              update(
-                'material_safety_margin_percent',
-                Number(event.target.value),
-              )
-            }
-          />
-        </label>
+        </div>
       </div>
 
-      <span className="section-label">Masked slots for this job</span>
-      <div className="job-slot-grid">
-        {snapshot.profile.material_slots.map((slot) => {
-          const tray = trays.get(slot.id)
-          return (
-            <label className="checkbox-label" key={slot.id}>
+      <details
+        className="job-settings-advanced"
+        onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}
+        open={advancedOpen}
+      >
+        <summary>Advanced settings</summary>
+        <div className="job-settings-grid">
+          <label className="job-setting-field">
+            <span className="job-setting-label">Toolhead</span>
+            <select
+              disabled={controlsDisabled}
+              value={draft.toolhead_id ?? ''}
+              onChange={(event) =>
+                update('toolhead_id', event.target.value || null)
+              }
+            >
+              <option value="">Profile default</option>
+              {snapshot.profile.toolheads.map((toolhead) => (
+                <option key={toolhead.id} value={toolhead.id}>
+                  {toolhead.name} · {toolhead.nozzle_diameter_mm} mm
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="job-setting-field">
+            <span className="job-setting-label">Nozzle diameter override</span>
+            <div className="number-input-shell">
               <input
-                checked={draft.forbidden_slot_ids.includes(slot.id)}
-                disabled={!editable}
-                onChange={() => toggleSlot(slot.id)}
-                type="checkbox"
+                disabled={controlsDisabled}
+                max="2"
+                min="0.1"
+                placeholder="Profile default"
+                step="0.1"
+                type="number"
+                value={draft.nozzle_diameter_mm ?? ''}
+                onChange={(event) =>
+                  update(
+                    'nozzle_diameter_mm',
+                    event.target.value ? Number(event.target.value) : null,
+                  )
+                }
               />
-              <span>
-                {studioSlotLabel(slot.id)}
-                <small>
-                  {tray?.material ?? 'Empty'}
-                  {tray?.color ? ` · ${tray.color}` : ''}
-                </small>
-              </span>
-            </label>
-          )
-        })}
+              <span>mm</span>
+            </div>
+          </label>
+          <TriStateControl
+            disabled={controlsDisabled}
+            label="Brim"
+            onChange={(value) => update('brim', value)}
+            value={draft.brim}
+          />
+          <TriStateControl
+            disabled={controlsDisabled}
+            label="Raft"
+            onChange={(value) => update('raft', value)}
+            value={draft.raft}
+          />
+          <TriStateControl
+            disabled={controlsDisabled}
+            label="Manual spool swaps"
+            onChange={(value) => update('allow_manual_swaps', value)}
+            value={draft.allow_manual_swaps}
+          />
+          <label className="job-setting-field">
+            <span className="job-setting-label">Maximum color distance</span>
+            <div className="number-input-shell">
+              <input
+                disabled={controlsDisabled}
+                max="100"
+                min="0"
+                step="0.5"
+                type="number"
+                value={draft.maximum_color_distance}
+                onChange={(event) =>
+                  update('maximum_color_distance', Number(event.target.value))
+                }
+              />
+              <span>ΔE</span>
+            </div>
+          </label>
+          <label className="job-setting-field">
+            <span className="job-setting-label">Material safety margin</span>
+            <div className="number-input-shell">
+              <input
+                disabled={controlsDisabled}
+                max="100"
+                min="0"
+                step="1"
+                type="number"
+                value={draft.material_safety_margin_percent}
+                onChange={(event) =>
+                  update(
+                    'material_safety_margin_percent',
+                    Number(event.target.value),
+                  )
+                }
+              />
+              <span>%</span>
+            </div>
+          </label>
+        </div>
+      </details>
+
+      <div className="job-slot-policy-summary">
+        <strong>Slot policy</strong>
+        <span>
+          {maskedSlotCount === 0
+            ? 'No masked slots'
+            : `${maskedSlotCount} masked slot${maskedSlotCount === 1 ? '' : 's'}`}
+          {partRestrictionCount > 0
+            ? ` · ${partRestrictionCount} part restriction${
+                partRestrictionCount === 1 ? '' : 's'
+              }`
+            : ''}
+          {' · '}shown with live material state in Cloud device snapshot
+        </span>
       </div>
 
       {editable && (
@@ -2418,7 +2498,6 @@ function SlicingWorkspace({
           {data.printer_snapshot && settingsDraft && (
             <SlicingJobSettings
               canRevise={settingsCanRevise}
-              cloudSnapshot={data.cloud_snapshot}
               dirty={settingsDirty}
               draft={settingsDraft}
               editable={settingsEditable}
@@ -2446,6 +2525,10 @@ function SlicingWorkspace({
                 <p>
                   {data.cloud_snapshot.device.device_id} · {data.cloud_snapshot.region} ·
                   observed {new Date(data.cloud_snapshot.observed_at).toLocaleString()}
+                </p>
+                <p className="cloud-slot-policy-note">
+                  Slot policy and assignment eligibility are shown here with live H2D/AMS
+                  material state.
                 </p>
                 <div className="observed-tray-grid">
                   {cloudTrays.map((tray) => {

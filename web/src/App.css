@@ -1048,7 +1048,15 @@ select:focus {
 }
 
 .job-settings-card {
-  border-color: #78958e;
+  border-color: var(--line-strong);
+}
+
+.job-settings-card.dirty {
+  border-color: #c8922e;
+}
+
+.job-settings-card.locked {
+  background: #f7f7f2;
 }
 
 .job-settings-heading {
@@ -1064,36 +1072,161 @@ select:focus {
 }
 
 .job-settings-heading p {
+  color: var(--ink-soft);
   margin: 0;
+}
+
+.job-settings-card.dirty .job-settings-heading p {
+  color: #8a5b08;
+  font-weight: 700;
+}
+
+.job-settings-section {
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 10px;
+  padding-top: 14px;
+}
+
+.job-settings-group-title,
+.job-setting-label {
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 750;
 }
 
 .job-settings-grid {
   display: grid;
-  gap: 10px;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-.job-slot-grid {
+.job-setting-field {
   display: grid;
-  gap: 7px;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px;
+  min-width: 0;
 }
 
-.job-slot-grid .checkbox-label {
-  align-items: start;
-  border: 1px solid var(--line);
-  padding: 8px;
+.job-setting-field > input,
+.job-setting-field > select,
+.number-input-shell,
+.number-input-shell input {
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
 }
 
-.job-slot-grid .checkbox-label span {
+.job-setting-field > input,
+.job-setting-field > select,
+.number-input-shell input {
+  background: white;
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
+  color: var(--ink);
+  min-height: 40px;
+  padding: 8px 36px 8px 10px;
+}
+
+.number-input-shell {
+  position: relative;
+}
+
+.number-input-shell > span {
+  color: var(--muted);
+  font-size: 10px;
+  pointer-events: none;
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.tri-state-control {
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
   display: grid;
-  gap: 2px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tri-state-control button {
+  background: white;
+  border: 0;
+  border-right: 1px solid var(--line);
+  color: var(--ink-soft);
+  min-height: 38px;
+  min-width: 0;
+  padding: 6px 8px;
+}
+
+.tri-state-control button:last-child {
+  border-right: 0;
+}
+
+.tri-state-control button.selected {
+  background: var(--teal-pale);
+  color: var(--teal-dark);
+  font-weight: 750;
+}
+
+.tri-state-control button:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--teal);
+  outline: 0;
+}
+
+.job-settings-advanced {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.job-settings-advanced > summary {
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.job-settings-advanced[open] > summary {
+  margin-bottom: 12px;
 }
 
 .job-settings-actions {
+  border-top: 1px solid var(--line);
   display: flex;
   gap: 8px;
   justify-content: flex-end;
+  padding-top: 14px;
+}
+
+.job-slot-policy-summary {
+  background: #f5f5ef;
+  border-left: 3px solid #78958e;
+  display: grid;
+  font-size: 11px;
+  gap: 3px;
+  padding: 8px 10px;
+}
+
+.job-slot-policy-summary span {
+  color: var(--ink-soft);
+}
+
+.job-settings-card.locked input:disabled,
+.job-settings-card.locked select:disabled,
+.job-settings-card.locked .tri-state-control button:disabled,
+.job-settings-card.applying input:disabled,
+.job-settings-card.applying select:disabled,
+.job-settings-card.applying .tri-state-control button:disabled {
+  color: var(--ink-soft);
+  opacity: 1;
+}
+
+.job-settings-card.locked input:disabled,
+.job-settings-card.locked select:disabled,
+.job-settings-card.applying input:disabled,
+.job-settings-card.applying select:disabled {
+  background: #efefe9;
 }
 
 .configuration-history {
@@ -1111,6 +1244,29 @@ select:focus {
 
 .configuration-history code {
   overflow-wrap: anywhere;
+}
+
+.cloud-slot-policy-note {
+  background: #f5f5ef;
+  border-left: 3px solid #78958e;
+  padding: 8px 10px;
+}
+
+@media (max-width: 560px) {
+  .job-settings-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .job-settings-heading,
+  .job-settings-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .job-settings-actions .primary-action,
+  .job-settings-actions .secondary-action {
+    width: 100%;
+  }
 }
 
 .slot-observation-actions {
