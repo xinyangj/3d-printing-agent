@@ -1183,6 +1183,25 @@ class BambuStudioCliDriver:
             assignment.part_id: filament_index_by_spool[assignment.spool_id]
             for assignment in request.material_assignment.assignments
         }
+        aliases: dict[str, str | None] = {
+            part_id.casefold(): part_id
+            for part_id in expected_extruders
+        }
+        if request.artifact.project is not None:
+            for part in request.artifact.project.parts:
+                for alias in (part.id, part.name, part.module_name):
+                    if not alias:
+                        continue
+                    key = alias.strip().casefold()
+                    if key not in aliases:
+                        aliases[key] = part.id
+                    elif aliases[key] != part.id:
+                        aliases[key] = None
+
+        def resolve_part_id(value: str) -> str | None:
+            key = value.strip().casefold()
+            return aliases.get(key)
+
         actual_extruders: dict[str, int] = {}
         for object_element in config.findall("object"):
             metadata = {
@@ -1193,19 +1212,40 @@ class BambuStudioCliDriver:
                 actual_extruders[str(metadata["name"])] = int(
                     str(metadata["extruder"])
                 )
-        if actual_extruders != expected_extruders:
-            if actual_extruders:
-                raise ValidationError(
-                    "Sliced output object-to-filament mapping differs from approval"
-                )
+        normalized_extruders: dict[str, int] = {}
+        unresolved_extruders = False
+        for object_name, filament_index in actual_extruders.items():
+            part_id = resolve_part_id(object_name)
+            if part_id is None:
+                unresolved_extruders = True
+                break
+            previous = normalized_extruders.get(part_id)
+            if previous is not None and previous != filament_index:
+                unresolved_extruders = True
+                break
+            normalized_extruders[part_id] = filament_index
+        if unresolved_extruders or normalized_extruders != expected_extruders:
             actual_object_filaments = (
                 BambuStudioCliDriver._sliced_object_filaments(path)
             )
+            normalized_object_filaments: dict[str, set[int]] = {}
+            unresolved_objects = False
+            for object_name, filament_indices in actual_object_filaments.items():
+                part_id = resolve_part_id(object_name)
+                if part_id is None:
+                    unresolved_objects = True
+                    break
+                normalized_object_filaments.setdefault(part_id, set()).update(
+                    filament_indices
+                )
             expected_object_filaments = {
                 part_id: {filament_index}
                 for part_id, filament_index in expected_extruders.items()
             }
-            if actual_object_filaments != expected_object_filaments:
+            if (
+                unresolved_objects
+                or normalized_object_filaments != expected_object_filaments
+            ):
                 raise ValidationError(
                     "Sliced output object-to-filament mapping differs from approval"
                 )
