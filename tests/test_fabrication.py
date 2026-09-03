@@ -1738,6 +1738,33 @@ async def test_bambu_native_settings_bind_single_right_tool_and_usage(
     BambuStudioCliDriver._validate_sliced_assignment(sliced_path, request)
 
     with zipfile.ZipFile(sliced_path, "w") as archive:
+        archive.writestr(
+            "Metadata/model_settings.config",
+            '<?xml version="1.0"?><config><plate/></config>',
+        )
+        archive.writestr(
+            "Metadata/project_settings.config",
+            json.dumps(output_settings),
+        )
+        archive.writestr(
+            "Metadata/slice_info.config",
+            (
+                '<?xml version="1.0"?><config><plate>'
+                '<object identify_id="8" name="body" skipped="false"/>'
+                '<filament id="1" used_for_object="true" '
+                'used_for_support="false"/>'
+                "</plate></config>"
+            ),
+        )
+        archive.writestr(
+            "Metadata/plate_1.gcode",
+            "; filament_map = 2\n"
+            "; OBJECT_ID: 8\n"
+            "; total filament weight [g] : 12.50\n",
+        )
+    BambuStudioCliDriver._validate_sliced_assignment(sliced_path, request)
+
+    with zipfile.ZipFile(sliced_path, "w") as archive:
         archive.writestr("Metadata/model_settings.config", model_settings)
         archive.writestr(
             "Metadata/project_settings.config",

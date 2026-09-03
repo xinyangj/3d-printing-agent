@@ -1309,7 +1309,9 @@ class BambuStudioCliDriver:
             object_names = {
                 item.attrib["identify_id"]: item.attrib["name"]
                 for item in slice_info.findall(".//object")
-                if item.attrib.get("identify_id") and item.attrib.get("name")
+                if item.attrib.get("identify_id")
+                and item.attrib.get("name")
+                and item.attrib.get("skipped", "false").casefold() != "true"
             }
             if not object_names:
                 raise ValidationError("Sliced output contains no named objects")
@@ -1321,6 +1323,13 @@ class BambuStudioCliDriver:
             if not gcode_names:
                 raise ValidationError("Sliced output contains no G-code payload")
             gcode = archive.read(gcode_names[0]).decode(errors="replace")
+            object_filaments = {
+                int(item.attrib["id"])
+                for item in slice_info.findall(".//filament")
+                if item.attrib.get("id")
+                and item.attrib.get("used_for_object", "false").casefold()
+                == "true"
+            }
         active_filament: int | None = None
         pending_object: str | None = None
         active_object: str | None = None
@@ -1348,6 +1357,11 @@ class BambuStudioCliDriver:
             name = object_names.get(object_id)
             if name is not None:
                 by_name.setdefault(name, set()).update(filaments)
+        if not by_name and len(object_filaments) == 1:
+            return {
+                name: set(object_filaments)
+                for name in object_names.values()
+            }
         return by_name
 
     @staticmethod
