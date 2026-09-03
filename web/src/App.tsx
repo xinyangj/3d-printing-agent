@@ -1016,55 +1016,113 @@ function StartPanel({ onCreated }: { onCreated: (id: string) => void }) {
 
 function ModelThumbnail({ url }: { url: string }) {
   const containerRef = useRef<HTMLDivElement>(null)
+  const renderHostRef = useRef<HTMLDivElement>(null)
+  const [shouldRender, setShouldRender] = useState(false)
+  const [snapshot, setSnapshot] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
 
   useEffect(() => {
     const container = containerRef.current
     if (!container) return
-    const scene = new THREE.Scene()
-    scene.background = new THREE.Color('#171b1c')
-    const camera = new THREE.PerspectiveCamera(38, 1.6, 0.1, 5000)
-    const renderer = new THREE.WebGLRenderer({ antialias: true })
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5))
-    renderer.setSize(container.clientWidth, container.clientHeight)
-    container.appendChild(renderer.domElement)
-    scene.add(new THREE.HemisphereLight('#ffffff', '#24332f', 2.4))
-    const key = new THREE.DirectionalLight('#ffffff', 2.5)
-    key.position.set(100, 140, 80)
-    scene.add(key)
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setShouldRender(true)
+          observer.disconnect()
+        }
+      },
+      { rootMargin: '240px 0px' },
+    )
+    observer.observe(container)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!shouldRender || snapshot) return
+    const host = renderHostRef.current
+    if (!host) return
+    let cancelled = false
+    let renderer: THREE.WebGLRenderer | null = null
     let mesh: THREE.Mesh | null = null
-    new STLLoader().load(url, (geometry) => {
-      geometry.computeVertexNormals()
-      geometry.center()
-      mesh = new THREE.Mesh(
-        geometry,
-        new THREE.MeshStandardMaterial({ color: '#79e2ca', roughness: 0.48 }),
-      )
-      scene.add(mesh)
-      const size = new THREE.Box3().setFromObject(mesh).getSize(new THREE.Vector3())
-      const span = Math.max(size.x, size.y, size.z)
-      camera.position.set(span * 1.5, span * 1.1, span * 1.5)
-      camera.lookAt(0, 0, 0)
-    })
-    let frame = 0
-    const render = () => {
-      if (mesh) mesh.rotation.y += 0.003
-      renderer.render(scene, camera)
-      frame = requestAnimationFrame(render)
-    }
-    render()
-    return () => {
-      cancelAnimationFrame(frame)
+    let disposed = false
+    const dispose = () => {
+      if (disposed) return
+      disposed = true
       if (mesh) {
         mesh.geometry.dispose()
         if (Array.isArray(mesh.material)) mesh.material.forEach((item) => item.dispose())
         else mesh.material.dispose()
       }
-      renderer.dispose()
-      container.removeChild(renderer.domElement)
+      renderer?.dispose()
+      renderer?.forceContextLoss()
+      if (renderer && host.contains(renderer.domElement)) {
+        host.removeChild(renderer.domElement)
+      }
     }
-  }, [url])
+    new STLLoader().load(
+      url,
+      (geometry) => {
+        if (cancelled) {
+          geometry.dispose()
+          return
+        }
+        geometry.computeVertexNormals()
+        geometry.center()
+        const scene = new THREE.Scene()
+        scene.background = new THREE.Color('#171b1c')
+        const width = Math.max(1, host.clientWidth)
+        const height = Math.max(1, host.clientHeight)
+        const camera = new THREE.PerspectiveCamera(38, width / height, 0.1, 5000)
+        renderer = new THREE.WebGLRenderer({
+          antialias: true,
+          preserveDrawingBuffer: true,
+        })
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5))
+        renderer.setSize(width, height)
+        host.appendChild(renderer.domElement)
+        scene.add(new THREE.HemisphereLight('#ffffff', '#24332f', 2.4))
+        const key = new THREE.DirectionalLight('#ffffff', 2.5)
+        key.position.set(100, 140, 80)
+        scene.add(key)
+        mesh = new THREE.Mesh(
+          geometry,
+          new THREE.MeshStandardMaterial({ color: '#79e2ca', roughness: 0.48 }),
+        )
+        scene.add(mesh)
+        const size = new THREE.Box3().setFromObject(mesh).getSize(new THREE.Vector3())
+        const span = Math.max(size.x, size.y, size.z, 1)
+        camera.position.set(span * 1.5, span * 1.1, span * 1.5)
+        camera.lookAt(0, 0, 0)
+        renderer.render(scene, camera)
+        const image = renderer.domElement.toDataURL('image/png')
+        dispose()
+        setSnapshot(image)
+      },
+      undefined,
+      () => {
+        if (!cancelled) {
+          dispose()
+          setFailed(true)
+        }
+      },
+    )
+    return () => {
+      cancelled = true
+      dispose()
+    }
+  }, [shouldRender, snapshot, url])
 
-  return <div className="model-thumbnail" ref={containerRef} aria-label="3D model preview" />
+  return (
+    <div className="model-thumbnail" ref={containerRef} aria-label="3D model preview">
+      {snapshot ? (
+        <img alt="" src={snapshot} />
+      ) : (
+        <div className="model-thumbnail-render-host" ref={renderHostRef}>
+          {failed ? 'Preview unavailable' : 'Loading preview…'}
+        </div>
+      )}
+    </div>
+  )
 }
 
 export function PrepareH2DSliceDialog({
@@ -1471,7 +1529,7 @@ function DashboardPanel({
               key={workflow.id}
             >
               {modelUrl ? (
-                <ModelThumbnail url={modelUrl} />
+                <ModelThumbnail key={modelUrl} url={modelUrl} />
               ) : (
                 <div className={`model-placeholder state-${workflow.state}`}>
                   <span>{ACTIVE_STATES.has(workflow.state) ? '◇' : '!'}</span>

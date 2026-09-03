@@ -329,6 +329,26 @@ select:focus {
   display: block;
 }
 
+.model-thumbnail img,
+.model-thumbnail-render-host {
+  height: 100%;
+  width: 100%;
+}
+
+.model-thumbnail img {
+  display: block;
+  object-fit: cover;
+}
+
+.model-thumbnail-render-host {
+  align-items: center;
+  background: #171b1c;
+  color: #9ba7a2;
+  display: flex;
+  font-size: 11px;
+  justify-content: center;
+}
+
 .model-placeholder {
   align-items: center;
   background: #171b1c;
