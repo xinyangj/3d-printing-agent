@@ -1,0 +1,1526 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>3D Printing Agent - Project Introduction</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23071018'/%3E%3Cpath d='M14 16h36v34H14zM20 42h24M32 16v9M25 25h14l-3 8h-8z' fill='none' stroke='%2342d8e8' stroke-width='4' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <style>
+    :root {
+      --ink: #f4f8fb;
+      --muted: #9cb0c2;
+      --faint: #62798d;
+      --bg: #071018;
+      --panel: rgba(14, 29, 42, 0.88);
+      --panel-strong: #102536;
+      --line: rgba(150, 190, 215, 0.18);
+      --cyan: #42d8e8;
+      --cyan-soft: rgba(66, 216, 232, 0.16);
+      --amber: #ffbd59;
+      --amber-soft: rgba(255, 189, 89, 0.16);
+      --green: #66d69e;
+      --red: #ff7285;
+      --shadow: 0 28px 90px rgba(0, 0, 0, 0.42);
+      --radius: 18px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #03090e;
+      color: var(--ink);
+      font-family:
+        Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+
+    body {
+      display: grid;
+      place-items: center;
+    }
+
+    button {
+      font: inherit;
+    }
+
+    .skip-link {
+      position: fixed;
+      left: 1rem;
+      top: -4rem;
+      z-index: 50;
+      padding: 0.65rem 0.9rem;
+      border-radius: 8px;
+      background: var(--cyan);
+      color: #031014;
+      font-weight: 800;
+    }
+
+    .skip-link:focus {
+      top: 1rem;
+    }
+
+    .deck {
+      position: relative;
+      width: min(100vw, calc(100vh * 16 / 9));
+      aspect-ratio: 16 / 9;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 88% 12%, rgba(66, 216, 232, 0.13), transparent 28%),
+        radial-gradient(circle at 12% 88%, rgba(255, 189, 89, 0.08), transparent 26%),
+        linear-gradient(145deg, #08131d 0%, var(--bg) 58%, #07131c 100%);
+      box-shadow: var(--shadow);
+      isolation: isolate;
+    }
+
+    .deck::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      opacity: 0.25;
+      background-image:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 4.2% 7.45%;
+      mask-image: linear-gradient(to bottom, black, transparent 78%);
+    }
+
+    .slide {
+      position: absolute;
+      inset: 0;
+      display: none;
+      padding: 3.8% 4.8% 4.6%;
+      overflow: hidden;
+    }
+
+    .slide.active {
+      display: block;
+      animation: slide-in 320ms ease-out both;
+    }
+
+    .slide-inner {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      width: 100%;
+      height: 100%;
+      gap: 3.2%;
+    }
+
+    @keyframes slide-in {
+      from {
+        opacity: 0;
+        transform: translateY(0.8%);
+      }
+      to {
+        opacity: 1;
+        transform: none;
+      }
+    }
+
+    .slide-header,
+    .slide-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 2rem;
+    }
+
+    .eyebrow {
+      display: flex;
+      align-items: center;
+      gap: 0.65em;
+      color: var(--cyan);
+      font-size: min(1vw, 1.8vh);
+      font-weight: 800;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      content: "";
+      width: 1.8em;
+      height: 2px;
+      background: currentColor;
+      box-shadow: 0 0 12px currentColor;
+    }
+
+    .section-number {
+      color: var(--faint);
+      font-size: min(1vw, 1.8vh);
+      font-weight: 800;
+      letter-spacing: 0.14em;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin: 0;
+    }
+
+    h1 {
+      max-width: 10.5em;
+      font-size: min(4.65vw, 8.25vh);
+      line-height: 0.98;
+      letter-spacing: -0.055em;
+    }
+
+    h2 {
+      font-size: min(2.8vw, 4.95vh);
+      line-height: 1.02;
+      letter-spacing: -0.045em;
+    }
+
+    h3 {
+      font-size: min(1.18vw, 2.1vh);
+      line-height: 1.15;
+    }
+
+    p,
+    li {
+      font-size: min(1.06vw, 1.88vh);
+      line-height: 1.42;
+    }
+
+    .lede {
+      max-width: 48em;
+      color: var(--muted);
+      font-size: min(1.3vw, 2.3vh);
+      line-height: 1.45;
+    }
+
+    .accent {
+      color: var(--cyan);
+    }
+
+    .accent-amber {
+      color: var(--amber);
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45em;
+      padding: 0.42em 0.7em;
+      border: 1px solid rgba(66, 216, 232, 0.25);
+      border-radius: 999px;
+      background: var(--cyan-soft);
+      color: #bdf7fc;
+      font-size: min(0.82vw, 1.46vh);
+      font-weight: 750;
+      white-space: nowrap;
+    }
+
+    .tag.amber {
+      border-color: rgba(255, 189, 89, 0.28);
+      background: var(--amber-soft);
+      color: #ffe0a5;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(145deg, rgba(17, 39, 55, 0.9), rgba(9, 23, 34, 0.82));
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+    }
+
+    .slide-footer {
+      color: var(--faint);
+      font-size: min(0.78vw, 1.38vh);
+      letter-spacing: 0.05em;
+    }
+
+    .footer-mark {
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    /* Slide 1 */
+    .hero {
+      display: grid;
+      grid-template-columns: 1.08fr 0.92fr;
+      align-items: center;
+      gap: 6%;
+      min-height: 0;
+    }
+
+    .hero-copy {
+      display: grid;
+      align-content: center;
+      gap: 1.25em;
+    }
+
+    .hero-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6em;
+    }
+
+    .hero-visual {
+      position: relative;
+      display: grid;
+      grid-template-rows: auto auto auto;
+      align-content: center;
+      gap: 1em;
+      min-height: 0;
+      padding: 6%;
+    }
+
+    .prompt-card,
+    .physical-card {
+      position: relative;
+      padding: 1em 1.1em;
+      overflow: hidden;
+    }
+
+    .prompt-card::after,
+    .physical-card::after {
+      content: "";
+      position: absolute;
+      inset: auto -12% -55% 42%;
+      aspect-ratio: 1;
+      border-radius: 50%;
+      background: rgba(66, 216, 232, 0.12);
+      filter: blur(2px);
+    }
+
+    .card-kicker {
+      margin-bottom: 0.45em;
+      color: var(--faint);
+      font-size: min(0.72vw, 1.28vh);
+      font-weight: 800;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+    }
+
+    .prompt-text {
+      position: relative;
+      z-index: 1;
+      font-size: min(1.25vw, 2.22vh);
+      font-weight: 720;
+      line-height: 1.3;
+    }
+
+    .agent-bridge {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      align-items: center;
+      gap: 0.55em;
+    }
+
+    .bridge-node {
+      padding: 0.68em 0.48em;
+      border: 1px solid rgba(66, 216, 232, 0.28);
+      border-radius: 11px;
+      background: rgba(66, 216, 232, 0.09);
+      color: #cffbff;
+      text-align: center;
+      font-size: min(0.78vw, 1.38vh);
+      font-weight: 780;
+    }
+
+    .bridge-arrow {
+      color: var(--amber);
+      font-weight: 900;
+    }
+
+    .printer-line {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: auto 1fr;
+      align-items: center;
+      gap: 1em;
+    }
+
+    .printer-icon {
+      width: min(4.7vw, 8.35vh);
+      aspect-ratio: 1;
+      color: var(--cyan);
+    }
+
+    .physical-title {
+      font-size: min(1.35vw, 2.4vh);
+      font-weight: 820;
+    }
+
+    .physical-subtitle {
+      margin-top: 0.3em;
+      color: var(--muted);
+      font-size: min(0.85vw, 1.5vh);
+    }
+
+    /* Slide 2 */
+    .journey-layout {
+      display: grid;
+      grid-template-columns: 1fr 0.28fr;
+      gap: 2.2%;
+      min-height: 0;
+    }
+
+    .journey {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-rows: repeat(2, minmax(0, 1fr));
+      gap: 1.1em;
+      min-height: 0;
+    }
+
+    .journey-step {
+      position: relative;
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 0.55em;
+      min-width: 0;
+      padding: 1em;
+    }
+
+    .step-index {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 2.1em;
+      height: 2.1em;
+      border-radius: 50%;
+      background: var(--cyan-soft);
+      color: var(--cyan);
+      font-size: min(0.72vw, 1.28vh);
+      font-weight: 900;
+    }
+
+    .journey-step:nth-child(5) .step-index,
+    .journey-step:nth-child(6) .step-index {
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    .journey-step p {
+      color: var(--muted);
+      font-size: min(0.82vw, 1.46vh);
+      line-height: 1.34;
+    }
+
+    .journey-arrow {
+      position: absolute;
+      top: 50%;
+      right: -0.95em;
+      z-index: 3;
+      display: grid;
+      place-items: center;
+      width: 1.8em;
+      height: 1.8em;
+      border-radius: 50%;
+      background: #0e2230;
+      color: var(--cyan);
+      font-size: min(0.8vw, 1.42vh);
+    }
+
+    .journey-step:nth-child(3) .journey-arrow,
+    .journey-step:nth-child(6) .journey-arrow {
+      display: none;
+    }
+
+    .outcomes {
+      display: grid;
+      align-content: start;
+      gap: 0.75em;
+      padding: 1.1em;
+    }
+
+    .outcomes h3 {
+      color: var(--amber);
+    }
+
+    .outcome {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      align-items: center;
+      gap: 0.7em;
+      padding: 0.64em 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .outcome:last-child {
+      border-bottom: 0;
+    }
+
+    .outcome-dot {
+      width: 0.65em;
+      height: 0.65em;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 12px rgba(102, 214, 158, 0.5);
+    }
+
+    .outcome span:last-child {
+      color: var(--muted);
+      font-size: min(0.78vw, 1.38vh);
+      font-weight: 650;
+      line-height: 1.25;
+    }
+
+    .human-boundary {
+      padding: 0.8em;
+      border: 1px solid rgba(255, 189, 89, 0.28);
+      border-radius: 12px;
+      background: var(--amber-soft);
+      color: #ffe2a8;
+      font-size: min(0.76vw, 1.35vh);
+      line-height: 1.35;
+    }
+
+    /* Slide 3 */
+    .architecture {
+      display: grid;
+      grid-template-columns: 0.86fr 1.08fr 1.35fr;
+      gap: 1.15em;
+      min-height: 0;
+    }
+
+    .lane {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 0.7em;
+      min-height: 0;
+    }
+
+    .lane-title {
+      display: flex;
+      align-items: center;
+      gap: 0.6em;
+      color: var(--muted);
+      font-size: min(0.76vw, 1.35vh);
+      font-weight: 850;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .lane-title span {
+      width: 0.6em;
+      height: 0.6em;
+      border-radius: 50%;
+      background: var(--cyan);
+    }
+
+    .lane:nth-child(2) .lane-title span {
+      background: var(--amber);
+    }
+
+    .lane:nth-child(3) .lane-title span {
+      background: var(--green);
+    }
+
+    .lane-body {
+      display: grid;
+      align-content: start;
+      gap: 0.68em;
+      padding: 0.85em;
+    }
+
+    .architecture-card {
+      position: relative;
+      padding: 0.8em;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(5, 17, 25, 0.48);
+    }
+
+    .architecture-card strong {
+      display: block;
+      margin-bottom: 0.28em;
+      color: var(--ink);
+      font-size: min(0.86vw, 1.52vh);
+    }
+
+    .architecture-card p {
+      color: var(--muted);
+      font-size: min(0.73vw, 1.3vh);
+      line-height: 1.34;
+    }
+
+    .architecture-card.agent {
+      border-color: rgba(66, 216, 232, 0.26);
+      background: rgba(66, 216, 232, 0.08);
+    }
+
+    .architecture-card.guard {
+      border-color: rgba(255, 189, 89, 0.28);
+      background: rgba(255, 189, 89, 0.075);
+    }
+
+    .architecture-card.human {
+      border-color: rgba(102, 214, 158, 0.28);
+      background: rgba(102, 214, 158, 0.075);
+    }
+
+    .orchestrator {
+      display: grid;
+      gap: 0.35em;
+      padding: 0.95em;
+      border: 1px solid rgba(255, 189, 89, 0.35);
+      border-radius: 13px;
+      background: linear-gradient(145deg, rgba(255, 189, 89, 0.14), rgba(255, 189, 89, 0.04));
+    }
+
+    .orchestrator strong {
+      color: var(--amber);
+      font-size: min(0.95vw, 1.68vh);
+    }
+
+    .orchestrator p {
+      color: var(--muted);
+      font-size: min(0.72vw, 1.28vh);
+    }
+
+    .boundary-note {
+      padding: 0.65em 0.75em;
+      border-left: 3px solid var(--cyan);
+      background: rgba(66, 216, 232, 0.06);
+      color: var(--muted);
+      font-size: min(0.69vw, 1.22vh);
+      line-height: 1.35;
+    }
+
+    /* Slide 4 */
+    .governed {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 1.25em;
+      min-height: 0;
+    }
+
+    .workflow-track {
+      display: grid;
+      grid-template-columns: repeat(9, minmax(0, 1fr));
+      align-items: center;
+      gap: 0.38em;
+    }
+
+    .workflow-node {
+      position: relative;
+      display: grid;
+      place-items: center;
+      min-height: 4.7em;
+      padding: 0.55em 0.35em;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: rgba(8, 23, 33, 0.82);
+      color: var(--muted);
+      text-align: center;
+      font-size: min(0.68vw, 1.2vh);
+      font-weight: 780;
+      line-height: 1.22;
+    }
+
+    .workflow-node.gate {
+      border-color: rgba(255, 189, 89, 0.36);
+      background: var(--amber-soft);
+      color: #ffe0a1;
+    }
+
+    .workflow-node:last-child {
+      border-color: rgba(102, 214, 158, 0.38);
+      background: rgba(102, 214, 158, 0.1);
+      color: #b8f7d5;
+    }
+
+    .workflow-node:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      left: calc(100% + 1px);
+      width: calc(0.38em + 2px);
+      height: 1px;
+      background: rgba(66, 216, 232, 0.45);
+    }
+
+    .gate-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1em;
+      min-height: 0;
+    }
+
+    .gate-card {
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 0.65em;
+      padding: 1em;
+    }
+
+    .gate-icon {
+      display: grid;
+      place-items: center;
+      width: 2.15em;
+      height: 2.15em;
+      border: 1px solid rgba(255, 189, 89, 0.32);
+      border-radius: 9px;
+      background: var(--amber-soft);
+      color: var(--amber);
+      font-size: min(0.82vw, 1.46vh);
+      font-weight: 900;
+    }
+
+    .gate-card ul {
+      display: grid;
+      align-content: start;
+      gap: 0.45em;
+      margin: 0;
+      padding-left: 1.1em;
+      color: var(--muted);
+    }
+
+    .gate-card li {
+      font-size: min(0.76vw, 1.35vh);
+      line-height: 1.32;
+    }
+
+    .evidence-strip {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1.1em;
+      padding: 0.7em 1em;
+      border: 1px solid rgba(66, 216, 232, 0.22);
+      border-radius: 12px;
+      background: rgba(66, 216, 232, 0.07);
+      color: #bdf8fd;
+      font-size: min(0.76vw, 1.35vh);
+      font-weight: 720;
+      text-align: center;
+    }
+
+    /* Slide 5 */
+    .challenge-layout {
+      display: grid;
+      grid-template-columns: 1fr 0.42fr;
+      gap: 1.15em;
+      min-height: 0;
+    }
+
+    .challenge-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-rows: repeat(2, minmax(0, 1fr));
+      gap: 0.95em;
+      min-height: 0;
+    }
+
+    .challenge {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      align-content: start;
+      gap: 0.7em 0.8em;
+      padding: 1em;
+    }
+
+    .challenge-number {
+      display: grid;
+      place-items: center;
+      width: 2.2em;
+      height: 2.2em;
+      border-radius: 9px;
+      background: var(--cyan-soft);
+      color: var(--cyan);
+      font-size: min(0.75vw, 1.33vh);
+      font-weight: 900;
+    }
+
+    .challenge:nth-child(2) .challenge-number,
+    .challenge:nth-child(3) .challenge-number {
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    .challenge:nth-child(4) .challenge-number {
+      background: rgba(102, 214, 158, 0.12);
+      color: var(--green);
+    }
+
+    .challenge-copy p {
+      margin-top: 0.42em;
+      color: var(--muted);
+      font-size: min(0.77vw, 1.37vh);
+      line-height: 1.36;
+    }
+
+    .lesson {
+      display: grid;
+      align-content: center;
+      gap: 1em;
+      padding: 1.3em;
+      border-color: rgba(66, 216, 232, 0.28);
+      background:
+        radial-gradient(circle at 85% 10%, rgba(66, 216, 232, 0.16), transparent 35%),
+        linear-gradient(145deg, rgba(17, 39, 55, 0.95), rgba(7, 20, 30, 0.95));
+    }
+
+    .lesson-mark {
+      color: var(--cyan);
+      font-size: min(4.2vw, 7.45vh);
+      font-weight: 900;
+      line-height: 0.65;
+      opacity: 0.55;
+    }
+
+    .lesson blockquote {
+      margin: 0;
+      font-size: min(1.35vw, 2.4vh);
+      font-weight: 760;
+      line-height: 1.35;
+      letter-spacing: -0.02em;
+    }
+
+    .lesson p {
+      color: var(--muted);
+      font-size: min(0.8vw, 1.42vh);
+    }
+
+    /* Controls */
+    .controls {
+      position: fixed;
+      left: 50%;
+      bottom: max(0.6rem, env(safe-area-inset-bottom));
+      z-index: 30;
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      padding: 0.42rem;
+      border: 1px solid rgba(150, 190, 215, 0.18);
+      border-radius: 999px;
+      background: rgba(3, 12, 18, 0.82);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+      backdrop-filter: blur(14px);
+      transform: translateX(-50%);
+    }
+
+    .control-button {
+      display: grid;
+      place-items: center;
+      min-width: 2.35rem;
+      height: 2.35rem;
+      padding: 0 0.72rem;
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 780;
+    }
+
+    .control-button:hover,
+    .control-button:focus-visible {
+      outline: none;
+      background: var(--cyan-soft);
+      color: var(--cyan);
+    }
+
+    .control-button:disabled {
+      opacity: 0.35;
+      cursor: default;
+    }
+
+    .counter {
+      min-width: 4rem;
+      color: var(--ink);
+      text-align: center;
+      font-size: 0.8rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .progress {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 35;
+      height: 3px;
+      background: rgba(150, 190, 215, 0.12);
+    }
+
+    .progress span {
+      display: block;
+      width: 20%;
+      height: 100%;
+      background: linear-gradient(90deg, var(--cyan), var(--amber));
+      box-shadow: 0 0 12px rgba(66, 216, 232, 0.55);
+      transition: width 220ms ease-out;
+    }
+
+    .help-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 40;
+      display: none;
+      place-items: center;
+      padding: 2rem;
+      background: rgba(1, 7, 11, 0.78);
+      backdrop-filter: blur(10px);
+    }
+
+    .help-overlay.open {
+      display: grid;
+    }
+
+    .help-card {
+      width: min(34rem, 92vw);
+      padding: 1.4rem;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: #0c1d29;
+      box-shadow: var(--shadow);
+    }
+
+    .help-card h2 {
+      margin-bottom: 1rem;
+      font-size: 1.5rem;
+    }
+
+    .key-grid {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 0.65rem 1rem;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    kbd {
+      min-width: 3rem;
+      padding: 0.25rem 0.45rem;
+      border: 1px solid rgba(150, 190, 215, 0.25);
+      border-bottom-width: 2px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--ink);
+      font-family: inherit;
+      font-size: 0.78rem;
+      text-align: center;
+    }
+
+    .speaker-notes {
+      position: absolute;
+      left: 4.8%;
+      right: 4.8%;
+      bottom: 3.2%;
+      z-index: 20;
+      display: none;
+      max-height: 23%;
+      overflow: auto;
+      padding: 0.8em 1em;
+      border: 1px solid rgba(255, 189, 89, 0.3);
+      border-radius: 12px;
+      background: rgba(5, 13, 19, 0.94);
+      color: #d6e0e8;
+      font-size: min(0.75vw, 1.33vh);
+      line-height: 1.4;
+      box-shadow: 0 12px 35px rgba(0, 0, 0, 0.35);
+    }
+
+    .deck.show-notes .active .speaker-notes {
+      display: block;
+    }
+
+    @media (max-aspect-ratio: 5 / 6) {
+      .controls {
+        bottom: 0.35rem;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+
+    @media print {
+      @page {
+        size: 13.333in 7.5in;
+        margin: 0;
+      }
+
+      html,
+      body {
+        width: auto;
+        height: auto;
+        overflow: visible;
+        background: #071018;
+        print-color-adjust: exact;
+        -webkit-print-color-adjust: exact;
+      }
+
+      body {
+        display: block;
+      }
+
+      .deck {
+        width: 13.333in;
+        height: 7.5in;
+        overflow: visible;
+        box-shadow: none;
+      }
+
+      .slide,
+      .slide.active {
+        position: relative;
+        display: block;
+        width: 13.333in;
+        height: 7.5in;
+        page-break-after: always;
+        break-after: page;
+        animation: none;
+        background:
+          radial-gradient(circle at 88% 12%, rgba(66, 216, 232, 0.13), transparent 28%),
+          linear-gradient(145deg, #08131d 0%, #071018 58%, #07131c 100%);
+      }
+
+      .slide:last-child {
+        page-break-after: auto;
+        break-after: auto;
+      }
+
+      .controls,
+      .progress,
+      .help-overlay,
+      .speaker-notes,
+      .skip-link {
+        display: none !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#slide-1">Skip to presentation</a>
+
+  <main class="deck" id="deck" aria-label="3D Printing Agent project introduction">
+    <section class="slide active" id="slide-1" aria-labelledby="title-1">
+      <div class="slide-inner">
+        <header class="slide-header">
+          <div class="eyebrow">3D Printing Agent</div>
+          <div class="section-number">01 / VISION</div>
+        </header>
+
+        <div class="hero">
+          <div class="hero-copy">
+            <h1 id="title-1">From <span class="accent">intent</span> to a physical object.</h1>
+            <p class="lede">
+              3D printing is not one task. It is a chain of modeling, geometry,
+              material, slicing, and hardware decisions. This project turns that
+              fragmented workflow into one governed agent experience.
+            </p>
+            <div class="hero-tags" aria-label="Project principles">
+              <span class="tag">Natural-language request</span>
+              <span class="tag">Evidence at every boundary</span>
+              <span class="tag amber">Human-authorized print</span>
+            </div>
+          </div>
+
+          <div class="hero-visual panel" aria-label="Prompt to printer concept">
+            <div class="prompt-card panel">
+              <div class="card-kicker">User request</div>
+              <div class="prompt-text">"Create a toy truck with a red body and blue wheels."</div>
+            </div>
+
+            <div class="agent-bridge" aria-hidden="true">
+              <div class="bridge-node">Model</div>
+              <div class="bridge-arrow">&rarr;</div>
+              <div class="bridge-node">Configure</div>
+              <div class="bridge-arrow">&rarr;</div>
+              <div class="bridge-node">Print</div>
+            </div>
+
+            <div class="physical-card panel">
+              <div class="printer-line">
+                <svg class="printer-icon" viewBox="0 0 80 80" role="img" aria-label="3D printer">
+                  <rect x="11" y="8" width="58" height="63" rx="6" fill="none" stroke="currentColor" stroke-width="4"/>
+                  <path d="M20 57h40M24 20h32M40 20v11M32 31h16l-3 8H35z" fill="none" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/>
+                  <path d="M28 57l4-13h16l4 13" fill="rgba(66,216,232,.16)" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/>
+                  <circle cx="19" cy="65" r="2.5" fill="currentColor"/>
+                  <circle cx="61" cy="65" r="2.5" fill="currentColor"/>
+                </svg>
+                <div>
+                  <div class="card-kicker">Physical outcome</div>
+                  <div class="physical-title">Printer-ready, reviewed, and traceable</div>
+                  <div class="physical-subtitle">The user keeps the final Print/Send decision.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <footer class="slide-footer">
+          <span class="footer-mark">Motivation</span>
+          <span>Agent reasoning where ambiguity exists; deterministic checks where physics matters.</span>
+        </footer>
+      </div>
+      <aside class="speaker-notes">
+        Start with the gap between a sentence and a physical result. The project is
+        not just a model generator: it coordinates every stage needed to make that
+        model printable, while keeping irreversible hardware actions under human control.
+      </aside>
+    </section>
+
+    <section class="slide" id="slide-2" aria-labelledby="title-2">
+      <div class="slide-inner">
+        <header class="slide-header">
+          <div>
+            <div class="eyebrow">What it does</div>
+            <h2 id="title-2">One request. One end-to-end workflow.</h2>
+          </div>
+          <div class="section-number">02 / PRODUCT</div>
+        </header>
+
+        <div class="journey-layout">
+          <div class="journey" aria-label="End-to-end product journey">
+            <article class="journey-step panel">
+              <span class="step-index">1</span>
+              <h3>Understand intent</h3>
+              <p>Capture the object, constraints, colors, target printer, and desired outcome.</p>
+              <span class="journey-arrow" aria-hidden="true">&rarr;</span>
+            </article>
+            <article class="journey-step panel">
+              <span class="step-index">2</span>
+              <h3>Discover or create</h3>
+              <p>Reuse a licensed catalog model or generate editable OpenSCAD from scratch.</p>
+              <span class="journey-arrow" aria-hidden="true">&rarr;</span>
+            </article>
+            <article class="journey-step panel">
+              <span class="step-index">3</span>
+              <h3>Validate and package</h3>
+              <p>Inspect geometry, preserve multipart identity, and produce an immutable 3MF artifact.</p>
+              <span class="journey-arrow" aria-hidden="true">&rarr;</span>
+            </article>
+            <article class="journey-step panel">
+              <span class="step-index">4</span>
+              <h3>Configure the real printer</h3>
+              <p>Observe H2D/AMS state and map each part to a compatible spool and toolhead.</p>
+              <span class="journey-arrow" aria-hidden="true">&rarr;</span>
+            </article>
+            <article class="journey-step panel">
+              <span class="step-index">5</span>
+              <h3>Slice and reconcile</h3>
+              <p>Bambu Studio creates G-code; the system verifies settings, usage, and object mapping.</p>
+              <span class="journey-arrow" aria-hidden="true">&rarr;</span>
+            </article>
+            <article class="journey-step panel">
+              <span class="step-index">6</span>
+              <h3>Connect and print</h3>
+              <p>Official Bambu Connect authenticates and transfers the exact reviewed artifact.</p>
+              <span class="journey-arrow" aria-hidden="true">&rarr;</span>
+            </article>
+          </div>
+
+          <aside class="outcomes panel" aria-label="User-visible outcomes">
+            <h3>What the user gets</h3>
+            <div class="outcome"><span class="outcome-dot"></span><span>Interactive model preview</span></div>
+            <div class="outcome"><span class="outcome-dot"></span><span>Provenance and mesh evidence</span></div>
+            <div class="outcome"><span class="outcome-dot"></span><span>Explicit material assignment</span></div>
+            <div class="outcome"><span class="outcome-dot"></span><span>Verified slice preview</span></div>
+            <div class="outcome"><span class="outcome-dot"></span><span>Live printer status</span></div>
+            <div class="human-boundary">
+              The workflow is end-to-end, but the final physical Print/Send remains a user action.
+            </div>
+          </aside>
+        </div>
+
+        <footer class="slide-footer">
+          <span class="footer-mark">Prompt &rarr; model &rarr; material &rarr; G-code &rarr; printer</span>
+          <span>3MF = model package &nbsp; | &nbsp; G-code = printer motion instructions</span>
+        </footer>
+      </div>
+      <aside class="speaker-notes">
+        Walk left to right. The important product distinction is that the system
+        coordinates every preparation step and monitors the handoff, but official
+        Bambu Connect and the user own authentication and final print authorization.
+      </aside>
+    </section>
+
+    <section class="slide" id="slide-3" aria-labelledby="title-3">
+      <div class="slide-inner">
+        <header class="slide-header">
+          <div>
+            <div class="eyebrow">Agent orchestration</div>
+            <h2 id="title-3">Reasoning is isolated. Evidence is shared.</h2>
+          </div>
+          <div class="section-number">03 / ARCHITECTURE</div>
+        </header>
+
+        <div class="architecture">
+          <section class="lane">
+            <div class="lane-title"><span></span>Agent reasoning</div>
+            <div class="lane-body panel">
+              <article class="architecture-card agent">
+                <strong>Discovery agent</strong>
+                <p>Searches and inspects catalog candidates through constrained, typed tools.</p>
+              </article>
+              <article class="architecture-card agent">
+                <strong>Modeling agent</strong>
+                <p>Creates or modifies OpenSCAD from a versioned, immutable handoff.</p>
+              </article>
+              <article class="architecture-card agent">
+                <strong>Material assignment agent</strong>
+                <p>Selects from server-filtered compatible spools, slots, and toolheads.</p>
+              </article>
+              <div class="boundary-note">
+                Agents do not receive shell, arbitrary filesystem, printer-control, or shared chat history.
+              </div>
+            </div>
+          </section>
+
+          <section class="lane">
+            <div class="lane-title"><span></span>Durable orchestration</div>
+            <div class="lane-body panel">
+              <div class="orchestrator">
+                <strong>FastAPI workflow engine</strong>
+                <p>Coordinates states, retries, typed handoffs, approvals, and idempotent operations.</p>
+              </div>
+              <article class="architecture-card guard">
+                <strong>SQLite + immutable artifacts</strong>
+                <p>Persists workflow history, configuration revisions, manifests, and exact digests.</p>
+              </article>
+              <article class="architecture-card guard">
+                <strong>Human gates</strong>
+                <p>Approve the model, confirm materials, review the slice, and authorize Print/Send.</p>
+              </article>
+              <article class="architecture-card guard">
+                <strong>Fail-closed recovery</strong>
+                <p>Invalid candidates, stale snapshots, mapping drift, and slicer errors create explicit revisions.</p>
+              </article>
+            </div>
+          </section>
+
+          <section class="lane">
+            <div class="lane-title"><span></span>Deterministic services</div>
+            <div class="lane-body panel">
+              <article class="architecture-card human">
+                <strong>Geometry pipeline</strong>
+                <p>OpenSCAD, trimesh, lib3mf, unit normalization, multipart packaging, and mesh checks.</p>
+              </article>
+              <article class="architecture-card human">
+                <strong>Printer configuration</strong>
+                <p>Versioned H2D profile plus read-only cloud device, nozzle, AMS, and quantity snapshots.</p>
+              </article>
+              <article class="architecture-card human">
+                <strong>Bambu Studio CLI</strong>
+                <p>Deterministic slicing with pinned profiles and strict output reconciliation.</p>
+              </article>
+              <article class="architecture-card human">
+                <strong>Official Bambu Connect</strong>
+                <p>Owns signed-in transfer, printer selection, and final physical action.</p>
+              </article>
+            </div>
+          </section>
+        </div>
+
+        <footer class="slide-footer">
+          <span class="footer-mark">Three reasoning roles, one durable state machine</span>
+          <span>Typed tools &nbsp; | &nbsp; Canonical hashes &nbsp; | &nbsp; Explicit authority</span>
+        </footer>
+      </div>
+      <aside class="speaker-notes">
+        The architecture deliberately separates ambiguity from authority. Agents
+        reason about discovery, modeling, and assignment. Application code owns
+        geometry checks, state, evidence, and integration. Discovery and modeling
+        cannot influence each other except through the immutable handoff.
+      </aside>
+    </section>
+
+    <section class="slide" id="slide-4" aria-labelledby="title-4">
+      <div class="slide-inner">
+        <header class="slide-header">
+          <div>
+            <div class="eyebrow">Governed workflow</div>
+            <h2 id="title-4">Every irreversible step has a gate.</h2>
+          </div>
+          <div class="section-number">04 / CONTROL</div>
+        </header>
+
+        <div class="governed">
+          <div class="workflow-track" aria-label="Governed workflow states">
+            <div class="workflow-node">Request</div>
+            <div class="workflow-node">Discover<br>or create</div>
+            <div class="workflow-node">Validate</div>
+            <div class="workflow-node gate">Review<br>model</div>
+            <div class="workflow-node">Configure<br>materials</div>
+            <div class="workflow-node">Slice</div>
+            <div class="workflow-node gate">Review<br>slice</div>
+            <div class="workflow-node">Connect</div>
+            <div class="workflow-node">Print</div>
+          </div>
+
+          <div class="gate-grid">
+            <article class="gate-card panel">
+              <span class="gate-icon">01</span>
+              <h3>Geometry gate</h3>
+              <ul>
+                <li>Finite, watertight, positive-volume mesh</li>
+                <li>Correct scale, orientation, and build-volume fit</li>
+                <li>Semantic parts preserved in 3MF</li>
+              </ul>
+            </article>
+
+            <article class="gate-card panel">
+              <span class="gate-icon">02</span>
+              <h3>Configuration gate</h3>
+              <ul>
+                <li>Digest-bound model approval</li>
+                <li>Immutable profile, cloud, and slot snapshots</li>
+                <li>Compatible material, quantity, nozzle, and toolhead</li>
+              </ul>
+            </article>
+
+            <article class="gate-card panel">
+              <span class="gate-icon">03</span>
+              <h3>Execution gate</h3>
+              <ul>
+                <li>Object-to-filament and tool mapping reconciled</li>
+                <li>Exact slice artifact reviewed</li>
+                <li>Official Connect plus final user Print/Send</li>
+              </ul>
+            </article>
+
+            <div class="evidence-strip">
+              <span>Source + provenance</span>
+              <span>&bull;</span>
+              <span>Mesh report</span>
+              <span>&bull;</span>
+              <span>Configuration revisions</span>
+              <span>&bull;</span>
+              <span>Slice manifest</span>
+              <span>&bull;</span>
+              <span>Printer status</span>
+            </div>
+          </div>
+        </div>
+
+        <footer class="slide-footer">
+          <span class="footer-mark">Fail closed, revise explicitly</span>
+          <span>No silent mutation after approval</span>
+        </footer>
+      </div>
+      <aside class="speaker-notes">
+        The state machine is a product feature, not implementation detail. It makes
+        every important decision visible and recoverable. A retry creates new
+        evidence or a new revision; it never silently changes what the user approved.
+      </aside>
+    </section>
+
+    <section class="slide" id="slide-5" aria-labelledby="title-5">
+      <div class="slide-inner">
+        <header class="slide-header">
+          <div>
+            <div class="eyebrow">Challenges and lessons</div>
+            <h2 id="title-5">Software meets messy geometry and real hardware.</h2>
+          </div>
+          <div class="section-number">05 / LEARNINGS</div>
+        </header>
+
+        <div class="challenge-layout">
+          <div class="challenge-grid">
+            <article class="challenge panel">
+              <span class="challenge-number">01</span>
+              <div class="challenge-copy">
+                <h3>Geometry truth</h3>
+                <p>STL files are unitless. Scale, orientation, manifoldness, tiny features, and slicer behavior all need independent verification.</p>
+              </div>
+            </article>
+            <article class="challenge panel">
+              <span class="challenge-number">02</span>
+              <div class="challenge-copy">
+                <h3>Multipart identity</h3>
+                <p>Part names and repeated instances must survive catalog import, 3MF conversion, arrangement, slicing, and output validation.</p>
+              </div>
+            </article>
+            <article class="challenge panel">
+              <span class="challenge-number">03</span>
+              <div class="challenge-copy">
+                <h3>Physical materials</h3>
+                <p>A requested color must reconcile with real AMS slots, filament profiles, remaining quantity, nozzles, and dual toolheads.</p>
+              </div>
+            </article>
+            <article class="challenge panel">
+              <span class="challenge-number">04</span>
+              <div class="challenge-copy">
+                <h3>Safe integration</h3>
+                <p>Desktop authentication, proprietary slicer behavior, cloud snapshots, retries, and final hardware authority need strict boundaries.</p>
+              </div>
+            </article>
+          </div>
+
+          <aside class="lesson panel">
+            <div class="lesson-mark">&ldquo;</div>
+            <blockquote>
+              Agentic reasoning handles ambiguity. Deterministic evidence makes it safe to act in the physical world.
+            </blockquote>
+            <p>
+              The strongest system is not the one with the most autonomy. It is the
+              one that knows where autonomy should stop.
+            </p>
+          </aside>
+        </div>
+
+        <footer class="slide-footer">
+          <span class="footer-mark">3D Printing Agent</span>
+          <span>Natural-language intent, engineered into a printable result.</span>
+        </footer>
+      </div>
+      <aside class="speaker-notes">
+        Close on the engineering lesson. The difficult work was not producing one
+        mesh or one G-code file. It was preserving meaning and authority across
+        every boundary, from a user's sentence to a machine that can move and heat.
+      </aside>
+    </section>
+  </main>
+
+  <nav class="controls" aria-label="Presentation controls">
+    <button class="control-button" id="prevButton" type="button" aria-label="Previous slide">&larr;</button>
+    <span class="counter" id="counter" aria-live="polite">1 / 5</span>
+    <button class="control-button" id="nextButton" type="button" aria-label="Next slide">&rarr;</button>
+    <button class="control-button" id="notesButton" type="button" aria-pressed="false">Notes</button>
+    <button class="control-button" id="helpButton" type="button" aria-label="Show keyboard shortcuts">?</button>
+  </nav>
+
+  <div class="progress" aria-hidden="true"><span id="progressBar"></span></div>
+
+  <div class="help-overlay" id="helpOverlay" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+    <div class="help-card">
+      <h2 id="helpTitle">Presentation controls</h2>
+      <div class="key-grid">
+        <kbd>&larr; / &rarr;</kbd><span>Previous or next slide</span>
+        <kbd>Space</kbd><span>Next slide</span>
+        <kbd>Home / End</kbd><span>First or last slide</span>
+        <kbd>N</kbd><span>Toggle presenter notes</span>
+        <kbd>F</kbd><span>Toggle fullscreen</span>
+        <kbd>?</kbd><span>Open or close this help</span>
+        <kbd>Esc</kbd><span>Close help or exit fullscreen</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const deck = document.getElementById("deck");
+      const slides = Array.from(document.querySelectorAll(".slide"));
+      const prevButton = document.getElementById("prevButton");
+      const nextButton = document.getElementById("nextButton");
+      const notesButton = document.getElementById("notesButton");
+      const helpButton = document.getElementById("helpButton");
+      const helpOverlay = document.getElementById("helpOverlay");
+      const counter = document.getElementById("counter");
+      const progressBar = document.getElementById("progressBar");
+      let current = 0;
+
+      const clamp = (value) => Math.max(0, Math.min(slides.length - 1, value));
+
+      function showSlide(index, updateHash = true) {
+        current = clamp(index);
+        slides.forEach((slide, slideIndex) => {
+          const active = slideIndex === current;
+          slide.classList.toggle("active", active);
+          slide.setAttribute("aria-hidden", String(!active));
+        });
+        counter.textContent = `${current + 1} / ${slides.length}`;
+        progressBar.style.width = `${((current + 1) / slides.length) * 100}%`;
+        prevButton.disabled = current === 0;
+        nextButton.disabled = current === slides.length - 1;
+        document.title = `${slides[current].querySelector("h1, h2").textContent.trim()} - 3D Printing Agent`;
+        if (updateHash) {
+          history.replaceState(null, "", `#${current + 1}`);
+        }
+      }
+
+      function toggleNotes() {
+        const visible = deck.classList.toggle("show-notes");
+        notesButton.setAttribute("aria-pressed", String(visible));
+      }
+
+      function setHelp(open) {
+        helpOverlay.classList.toggle("open", open);
+        helpOverlay.setAttribute("aria-hidden", String(!open));
+        if (open) {
+          helpButton.focus();
+        }
+      }
+
+      async function toggleFullscreen() {
+        if (!document.fullscreenElement) {
+          await document.documentElement.requestFullscreen?.();
+        } else {
+          await document.exitFullscreen?.();
+        }
+      }
+
+      prevButton.addEventListener("click", () => showSlide(current - 1));
+      nextButton.addEventListener("click", () => showSlide(current + 1));
+      notesButton.addEventListener("click", toggleNotes);
+      helpButton.addEventListener("click", () => setHelp(!helpOverlay.classList.contains("open")));
+      helpOverlay.addEventListener("click", (event) => {
+        if (event.target === helpOverlay) {
+          setHelp(false);
+        }
+      });
+
+      window.addEventListener("hashchange", () => {
+        const index = Number.parseInt(location.hash.slice(1), 10) - 1;
+        if (Number.isInteger(index)) {
+          showSlide(index, false);
+        }
+      });
+
+      window.addEventListener("keydown", (event) => {
+        if (event.altKey || event.ctrlKey || event.metaKey) {
+          return;
+        }
+        const helpOpen = helpOverlay.classList.contains("open");
+        if (event.key === "Escape" && helpOpen) {
+          event.preventDefault();
+          setHelp(false);
+          return;
+        }
+        if (helpOpen && event.key !== "?") {
+          return;
+        }
+        if (["ArrowRight", "PageDown", " "].includes(event.key)) {
+          event.preventDefault();
+          showSlide(current + 1);
+        } else if (["ArrowLeft", "PageUp"].includes(event.key)) {
+          event.preventDefault();
+          showSlide(current - 1);
+        } else if (event.key === "Home") {
+          event.preventDefault();
+          showSlide(0);
+        } else if (event.key === "End") {
+          event.preventDefault();
+          showSlide(slides.length - 1);
+        } else if (event.key.toLowerCase() === "n") {
+          event.preventDefault();
+          toggleNotes();
+        } else if (event.key.toLowerCase() === "f") {
+          event.preventDefault();
+          toggleFullscreen();
+        } else if (event.key === "?") {
+          event.preventDefault();
+          setHelp(!helpOpen);
+        }
+      });
+
+      const initial = Number.parseInt(location.hash.slice(1), 10) - 1;
+      setHelp(false);
+      showSlide(Number.isInteger(initial) ? initial : 0, false);
+    })();
+  </script>
+</body>
+</html>
