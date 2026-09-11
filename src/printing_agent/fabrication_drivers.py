@@ -502,8 +502,39 @@ class BambuStudioCliDriver:
             item.part_id: item.requested_color
             for item in request.material_assignment.requests
         }
+        selected_colors: dict[str, set[str]] = {}
+        for assignment in request.material_assignment.assignments:
+            candidate = next(
+                (
+                    item
+                    for item in request.material_assignment.candidate_options.get(
+                        assignment.part_id,
+                        [],
+                    )
+                    if item.spool_id == assignment.spool_id
+                ),
+                None,
+            )
+            if candidate is not None:
+                selected_colors.setdefault(assignment.spool_id, set()).add(
+                    candidate.color.upper()
+                )
+        inconsistent = [
+            spool_id
+            for spool_id, colors in selected_colors.items()
+            if len(colors) != 1
+        ]
+        if inconsistent:
+            raise ValidationError(
+                "Selected spool has inconsistent physical colors: "
+                + ", ".join(sorted(inconsistent))
+            )
         settings["filament_colour"] = [
-            requested_colors[item.part_id]
+            (
+                next(iter(selected_colors[item.spool_id]))
+                if item.spool_id in selected_colors
+                else requested_colors[item.part_id]
+            )
             for item in filament_assignments
         ]
         return settings

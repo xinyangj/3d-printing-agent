@@ -42,6 +42,7 @@ from printing_agent.fabrication import (
     BambuConnectHandoff,
     JobOverrides,
     MaterialAssignment,
+    MaterialCandidate,
     MaterialDefinitionRevision,
     MaterialDefinitionSpec,
     PartMaterialAssignment,
@@ -1522,6 +1523,25 @@ async def test_bambu_native_settings_bind_single_right_tool_and_usage(
             )
         ],
         assignments=[part_assignment],
+        candidate_options={
+            "body": [
+                MaterialCandidate(
+                    part_id="body",
+                    spool_id=part_assignment.spool_id,
+                    slot_id=part_assignment.slot_id,
+                    material_id=material.material_id,
+                    material_revision=material.revision,
+                    material_digest=material.digest or "0" * 64,
+                    color="#057748",
+                    color_distance=10,
+                    remaining_weight_g=500,
+                    toolhead_ids={"right"},
+                    slicer_filament_profile_id=(
+                        material.spec.slicer_filament_profile_id
+                    ),
+                )
+            ]
+        },
         requires_confirmation=False,
         confirmed_by="test",
         confirmed_at=artifact.created_at,
@@ -1573,6 +1593,7 @@ async def test_bambu_native_settings_bind_single_right_tool_and_usage(
     assert settings["enable_prime_tower"] == "0"
     assert settings["curr_bed_type"] == "High Temp Plate"
     assert settings["nozzle_diameter"] == ["0.4", "0.4"]
+    assert settings["filament_colour"] == ["#057748"]
     cap_assignment = part_assignment.model_copy(
         update={
             "part_id": "cap",
