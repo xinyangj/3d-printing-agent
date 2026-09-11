@@ -273,7 +273,10 @@ class OpenScadRenderer:
         except TimeoutError as exc:
             process.kill()
             await process.wait()
-            raise ExternalServiceError("OpenSCAD rendering timed out") from exc
+            raise ExternalServiceError(
+                "OpenSCAD rendering exceeded "
+                f"{self.settings.openscad_timeout_seconds} seconds"
+            ) from exc
         diagnostics = (stdout + stderr).decode("utf-8", errors="replace")[-8_000:]
         if process.returncode != 0:
             raise ValidationError(

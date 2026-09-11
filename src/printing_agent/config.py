@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     max_download_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
     max_image_bytes: int = Field(default=10 * 1024 * 1024, ge=1024)
     max_image_pixels: int = Field(default=25_000_000, ge=1_000_000)
-    openscad_timeout_seconds: int = Field(default=120, ge=5, le=600)
+    openscad_timeout_seconds: int = Field(default=300, ge=5, le=600)
 
     def ensure_directories(self) -> None:
         for path in (
