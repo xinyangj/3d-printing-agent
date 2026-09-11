@@ -119,6 +119,38 @@ async def test_failed_preparation_can_request_new_base(
     ]
 
 
+async def test_failed_slice_can_request_new_base(
+    repository: WorkflowRepository,
+) -> None:
+    workflow = await repository.create_workflow("Print a small cube", "simulator")
+    pending = await repository.lease_next()
+    assert pending is not None
+    await repository.complete_work(pending.id)
+    for state in (
+        WorkflowState.PLANNING,
+        WorkflowState.DISCOVERING,
+        WorkflowState.SELECTING,
+        WorkflowState.VALIDATING,
+        WorkflowState.AWAITING_APPROVAL,
+        WorkflowState.APPROVED,
+        WorkflowState.SLICE_SETUP,
+        WorkflowState.SLICE_FAILED,
+    ):
+        await repository.transition(workflow.id, state)
+
+    await repository.request_revision(
+        RevisionRequest(
+            workflow_id=workflow.id,
+            mode=RevisionMode.SEARCH_NEW_BASE,
+            feedback="Replace a model that cannot be sliced",
+        )
+    )
+
+    assert (
+        await repository.get_workflow(workflow.id)
+    ).state == WorkflowState.REVISION_REQUESTED
+
+
 async def test_workflow_archive_and_restore_preserve_state(
     repository: WorkflowRepository,
 ) -> None:

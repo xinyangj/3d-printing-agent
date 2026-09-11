@@ -65,6 +65,27 @@ def _mesh(path: Path) -> trimesh.Trimesh:
     return loaded
 
 
+def normalize_source_set_scale(
+    selected: list[tuple[SelectedCandidateFile, CandidateFile, Path, MeshReport]],
+    *,
+    shared_scale: float,
+    max_layout_width: float,
+) -> float:
+    maximum_scaled_extent = max(
+        max(
+            report.dimensions.width_mm,
+            report.dimensions.depth_mm,
+            report.dimensions.height_mm,
+        )
+        * shared_scale
+        for _, _, _, report in selected
+    )
+    inch_normalized_extent = maximum_scaled_extent * 25.4
+    if maximum_scaled_extent < 10 and inch_normalized_extent <= max_layout_width:
+        return shared_scale * 25.4
+    return shared_scale
+
+
 def _layout_instances(
     parts: list[tuple[PartDefinition, int]],
     meshes: dict[str, trimesh.Trimesh],

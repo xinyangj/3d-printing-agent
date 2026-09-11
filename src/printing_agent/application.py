@@ -107,7 +107,11 @@ from printing_agent.modeling import (
     TrimeshSelectedSourceInspector,
     unwrap_base_model_source,
 )
-from printing_agent.multipart import single_part_project, write_project_artifact
+from printing_agent.multipart import (
+    normalize_source_set_scale,
+    single_part_project,
+    write_project_artifact,
+)
 from printing_agent.ports import PrinterAdapter
 from printing_agent.printers import PrinterRegistry, ProfilePrinterAdapter
 from printing_agent.repositories import WorkflowRepository
@@ -2016,6 +2020,21 @@ class PrintingApplication:
                         diagnostics={"source_set": exc.message},
                     ) from exc
 
+            shared_scale = normalize_source_set_scale(
+                prepared,
+                shared_scale=decision.shared_scale,
+                max_layout_width=build_volume.width_mm,
+            )
+            if shared_scale != decision.shared_scale:
+                await self.repository.record_workflow_event(
+                    workflow_id,
+                    "source_set.units_normalized",
+                    {
+                        "declared_scale": decision.shared_scale,
+                        "effective_scale": shared_scale,
+                        "reason": "Unitless STL dimensions are consistent with inches",
+                    },
+                )
             source_set_digest = canonical_digest(
                 {
                     "files": [
@@ -2025,7 +2044,7 @@ class PrintingApplication:
                         }
                         for selection, _, path, _ in prepared
                     ],
-                    "shared_scale": decision.shared_scale,
+                    "shared_scale": shared_scale,
                 }
             )
             provenance = ArtifactProvenance(
@@ -2048,7 +2067,7 @@ class PrintingApplication:
                     prepared,
                     provenance,
                     build_volume,
-                    shared_scale=decision.shared_scale,
+                    shared_scale=shared_scale,
                     description=f"{candidate.introduction}\n{candidate.instructions}",
                     classification=decision.selected_files,
                 )
@@ -2376,8 +2395,9 @@ class PrintingApplication:
             WorkflowState.AWAITING_APPROVAL,
             WorkflowState.APPROVED,
             WorkflowState.PREPARATION_FAILED,
+            WorkflowState.SLICE_FAILED,
         }:
-            raise ConflictError("Only an unsubmitted or failed preparation can be revised")
+            raise ConflictError("Only an unsubmitted or failed workflow can be revised")
         if mode == RevisionMode.REFINE_CURRENT:
             if workflow.active_artifact_version is None:
                 raise ConflictError("Workflow has no active artifact to refine")

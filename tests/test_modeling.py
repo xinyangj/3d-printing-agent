@@ -60,7 +60,11 @@ from printing_agent.modeling import (
     OpenScadSourcePolicy,
     TrimeshSelectedSourceInspector,
 )
-from printing_agent.multipart import ThreeMFService, _module_name
+from printing_agent.multipart import (
+    ThreeMFService,
+    _module_name,
+    normalize_source_set_scale,
+)
 from printing_agent.printers import SimulatedPrinterAdapter
 from printing_agent.repositories import WorkflowRepository
 
@@ -223,6 +227,45 @@ async def test_source_preparation_can_edit_one_file_and_preserve_another(
     assert prepared_by_id["wheel"][2] == wheel_path
     assert sha256_file(prepared_by_id["wheel"][2]) == wheel_digest
     shutil.rmtree(workspace)
+
+
+async def test_tiny_unitless_source_set_is_normalized_from_inches(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "truck.stl"
+    trimesh.creation.box(extents=(6.8, 2.2, 2.5)).export(path)
+    report = await MeshInspector().inspect(path)
+    selected = [
+        (
+            SelectedCandidateFile(
+                file_id="truck",
+                role=SelectedFileRole.UNIQUE_PART,
+                part_id="truck",
+                part_name="Truck",
+                rationale="Primary body",
+                confidence=1,
+            ),
+            CandidateFile(id="truck", name="truck.stl", format="stl"),
+            path,
+            report,
+        )
+    ]
+
+    assert normalize_source_set_scale(
+        selected,
+        shared_scale=1,
+        max_layout_width=350,
+    ) == pytest.approx(25.4)
+    assert normalize_source_set_scale(
+        selected,
+        shared_scale=2,
+        max_layout_width=350,
+    ) == 2
+    assert normalize_source_set_scale(
+        selected,
+        shared_scale=1,
+        max_layout_width=100,
+    ) == 1
 
 
 async def test_source_set_validation_is_atomic_before_cache_promotion(
