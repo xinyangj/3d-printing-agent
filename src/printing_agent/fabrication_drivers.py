@@ -861,6 +861,11 @@ class BambuStudioCliDriver:
         if model_name is None:
             raise ValidationError("Project 3MF contains no model XML")
         model = ElementTree.fromstring(entries[model_name])
+        if (
+            request.artifact.project is not None
+            and len(request.artifact.project.parts) > 1
+        ):
+            BambuStudioCliDriver._lay_flat_thin_objects(model)
         object_rows = BambuStudioCliDriver._expand_repeated_build_items(
             model,
             assignment_index,
@@ -923,6 +928,73 @@ class BambuStudioCliDriver:
         ) as archive:
             for name, data in entries.items():
                 archive.writestr(name, data)
+
+    @staticmethod
+    def _lay_flat_thin_objects(model: ElementTree.Element) -> None:
+        for object_element in model.iter():
+            if not object_element.tag.endswith("object"):
+                continue
+            vertices = [
+                element
+                for element in object_element.iter()
+                if element.tag.endswith("vertex")
+            ]
+            if not vertices:
+                continue
+            try:
+                coordinates = [
+                    [float(vertex.attrib[axis]) for axis in ("x", "y", "z")]
+                    for vertex in vertices
+                ]
+            except (KeyError, ValueError) as exc:
+                raise ValidationError(
+                    "Project 3MF contains an invalid mesh vertex"
+                ) from exc
+            minimums = [
+                min(values[axis] for values in coordinates)
+                for axis in range(3)
+            ]
+            maximums = [
+                max(values[axis] for values in coordinates)
+                for axis in range(3)
+            ]
+            extents = [
+                maximums[axis] - minimums[axis]
+                for axis in range(3)
+            ]
+            thinnest_axis = min(range(3), key=extents.__getitem__)
+            thickness = extents[thinnest_axis]
+            if (
+                thinnest_axis == 2
+                or thickness <= 0
+                or thickness > 1.5
+                or extents[2] < thickness * 4
+            ):
+                continue
+            centers = [
+                (minimums[axis] + maximums[axis]) / 2
+                for axis in range(3)
+            ]
+            for vertex, values in zip(vertices, coordinates, strict=True):
+                relative = [
+                    values[axis] - centers[axis]
+                    for axis in range(3)
+                ]
+                if thinnest_axis == 0:
+                    rotated = [relative[2], relative[1], -relative[0]]
+                else:
+                    rotated = [relative[0], relative[2], -relative[1]]
+                transformed = [
+                    rotated[0] + centers[0],
+                    rotated[1] + centers[1],
+                    rotated[2] + minimums[2] + thickness / 2,
+                ]
+                for axis, value in zip(
+                    ("x", "y", "z"),
+                    transformed,
+                    strict=True,
+                ):
+                    vertex.set(axis, f"{value:.9g}")
 
     @staticmethod
     def _expand_repeated_build_items(

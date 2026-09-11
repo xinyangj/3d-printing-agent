@@ -1472,6 +1472,54 @@ def test_repeated_build_items_receive_explicit_filament_assignments() -> None:
     assert [row[2] for row in rows if row[1] == "bearing"] == [1, 1]
 
 
+def test_thin_vertical_multipart_objects_are_laid_flat() -> None:
+    model = ElementTree.fromstring(
+        """
+        <model xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+          <resources>
+            <object id="1" partnumber="mirror">
+              <mesh><vertices>
+                <vertex x="10" y="20" z="30"/>
+                <vertex x="15" y="21" z="35"/>
+              </vertices></mesh>
+            </object>
+            <object id="2" partnumber="body">
+              <mesh><vertices>
+                <vertex x="0" y="0" z="5"/>
+                <vertex x="10" y="8" z="7"/>
+              </vertices></mesh>
+            </object>
+          </resources>
+          <build/>
+        </model>
+        """
+    )
+
+    BambuStudioCliDriver._lay_flat_thin_objects(model)
+
+    objects = [
+        element for element in model.iter() if element.tag.endswith("object")
+    ]
+    mirror_vertices = [
+        [float(vertex.attrib[axis]) for axis in ("x", "y", "z")]
+        for vertex in objects[0].iter()
+        if vertex.tag.endswith("vertex")
+    ]
+    mirror_extents = [
+        max(values[axis] for values in mirror_vertices)
+        - min(values[axis] for values in mirror_vertices)
+        for axis in range(3)
+    ]
+    assert mirror_extents == [5, 5, 1]
+    assert min(values[2] for values in mirror_vertices) == 30
+    body_vertices = [
+        tuple(float(vertex.attrib[axis]) for axis in ("x", "y", "z"))
+        for vertex in objects[1].iter()
+        if vertex.tag.endswith("vertex")
+    ]
+    assert body_vertices == [(0, 0, 5), (10, 8, 7)]
+
+
 async def test_bambu_native_settings_bind_single_right_tool_and_usage(
     tmp_path: Path,
 ) -> None:
