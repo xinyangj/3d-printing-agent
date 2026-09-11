@@ -4,6 +4,7 @@ import json
 import zipfile
 from datetime import timedelta
 from pathlib import Path
+from xml.etree import ElementTree
 
 import aiosqlite
 import pytest
@@ -1436,6 +1437,41 @@ def test_profile_dependency_digest_includes_inherited_and_included_files(
     }
 
 
+def test_repeated_build_items_receive_explicit_filament_assignments() -> None:
+    model = ElementTree.fromstring(
+        """
+        <model xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+               xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06">
+          <resources>
+            <object id="1" name="Body" partnumber="body" p:UUID="body-uuid"/>
+            <object id="3" name="Wheel" partnumber="wheel" p:UUID="wheel-uuid"/>
+            <object id="5" name="Bearing" partnumber="bearing" p:UUID="bearing-uuid"/>
+          </resources>
+          <build>
+            <item objectid="1"/>
+            <item objectid="3"/>
+            <item objectid="3"/>
+            <item objectid="3"/>
+            <item objectid="3"/>
+            <item objectid="5"/>
+            <item objectid="5"/>
+          </build>
+        </model>
+        """
+    )
+
+    rows = BambuStudioCliDriver._expand_repeated_build_items(
+        model,
+        {"body": 1, "wheel": 2, "bearing": 1},
+    )
+
+    build = next(element for element in model if element.tag.endswith("build"))
+    build_object_ids = [item.attrib["objectid"] for item in build]
+    assert len(build_object_ids) == len(set(build_object_ids)) == 7
+    assert [row[2] for row in rows if row[1] == "wheel"] == [2, 2, 2, 2]
+    assert [row[2] for row in rows if row[1] == "bearing"] == [1, 1]
+
+
 async def test_bambu_native_settings_bind_single_right_tool_and_usage(
     tmp_path: Path,
 ) -> None:
@@ -1650,7 +1686,7 @@ async def test_bambu_native_settings_bind_single_right_tool_and_usage(
         "T1 H-1\n"
         "; OBJECT_ID: 12\n"
         "; start printing object, unique label id: 12\n"
-        "G1 X2 Y2 E1\n"
+        "G1 X2 Y2 E.25\n"
         "; stop printing object, unique label id: 12\n"
     )
     with zipfile.ZipFile(rewritten_path, "w") as archive:

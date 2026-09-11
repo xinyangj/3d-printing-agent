@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import io
 import json
 import math
 import os
 import re
 import shutil
+import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -859,20 +861,27 @@ class BambuStudioCliDriver:
         if model_name is None:
             raise ValidationError("Project 3MF contains no model XML")
         model = ElementTree.fromstring(entries[model_name])
-        object_rows: list[tuple[str, str, int]] = []
-        for element in model.iter():
-            if not element.tag.endswith("object"):
-                continue
-            object_id = element.attrib.get("id")
-            part_id = (
-                element.attrib.get("partnumber")
-                or element.attrib.get("name")
-                or ""
-            )
-            if object_id and part_id in assignment_index:
-                object_rows.append(
-                    (object_id, part_id, assignment_index[part_id])
-                )
+        object_rows = BambuStudioCliDriver._expand_repeated_build_items(
+            model,
+            assignment_index,
+        )
+        ElementTree.register_namespace(
+            "",
+            "http://schemas.microsoft.com/3dmanufacturing/core/2015/02",
+        )
+        ElementTree.register_namespace(
+            "m",
+            "http://schemas.microsoft.com/3dmanufacturing/material/2015/02",
+        )
+        ElementTree.register_namespace(
+            "p",
+            "http://schemas.microsoft.com/3dmanufacturing/production/2015/06",
+        )
+        entries[model_name] = ElementTree.tostring(
+            model,
+            encoding="utf-8",
+            xml_declaration=True,
+        )
         missing_parts = sorted(set(assignment_index) - {row[1] for row in object_rows})
         if missing_parts:
             raise ValidationError(
@@ -914,6 +923,71 @@ class BambuStudioCliDriver:
         ) as archive:
             for name, data in entries.items():
                 archive.writestr(name, data)
+
+    @staticmethod
+    def _expand_repeated_build_items(
+        model: ElementTree.Element,
+        assignment_index: dict[str, int],
+    ) -> list[tuple[str, str, int]]:
+        resources = next(
+            (element for element in model if element.tag.endswith("resources")),
+            None,
+        )
+        build = next(
+            (element for element in model if element.tag.endswith("build")),
+            None,
+        )
+        if resources is None or build is None:
+            raise ValidationError("Project 3MF lacks resources or build items")
+        objects_by_id = {
+            element.attrib["id"]: element
+            for element in resources
+            if element.tag.endswith("object") and element.attrib.get("id")
+        }
+        resource_ids = [
+            int(element.attrib["id"])
+            for element in resources
+            if element.attrib.get("id", "").isdigit()
+        ]
+        next_resource_id = max(resource_ids, default=0) + 1
+        build_references: dict[str, int] = {}
+        for item in build:
+            if not item.tag.endswith("item"):
+                continue
+            object_id = item.attrib.get("objectid")
+            source_object = objects_by_id.get(object_id or "")
+            if object_id is None or source_object is None:
+                continue
+            reference_count = build_references.get(object_id, 0)
+            build_references[object_id] = reference_count + 1
+            if reference_count == 0:
+                continue
+            clone = copy.deepcopy(source_object)
+            while str(next_resource_id) in objects_by_id:
+                next_resource_id += 1
+            clone_id = str(next_resource_id)
+            next_resource_id += 1
+            clone.set("id", clone_id)
+            for attribute in tuple(clone.attrib):
+                if attribute.rsplit("}", 1)[-1].casefold() == "uuid":
+                    clone.set(attribute, str(uuid.uuid4()))
+            resources.append(clone)
+            objects_by_id[clone_id] = clone
+            item.set("objectid", clone_id)
+
+        object_rows: list[tuple[str, str, int]] = []
+        for element in objects_by_id.values():
+            object_id = element.attrib.get("id")
+            part_id = (
+                element.attrib.get("partnumber")
+                or element.attrib.get("name")
+                or ""
+            )
+            if object_id and part_id in assignment_index:
+                object_rows.append(
+                    (object_id, part_id, assignment_index[part_id])
+                )
+        return object_rows
 
     @staticmethod
     def _validate_gcode_3mf(path: Path) -> None:
@@ -1510,7 +1584,7 @@ class BambuStudioCliDriver:
                 active_object is not None
                 and active_filament is not None
                 and re.match(r"^(?:G0?1|G2|G3)\b", raw_line)
-                and re.search(r"\bE-?\d", raw_line)
+                and re.search(r"\bE-?(?:\d|\.\d)", raw_line)
             ):
                 usage.setdefault(active_object, set()).add(active_filament)
             if "stop printing object" in raw_line:
