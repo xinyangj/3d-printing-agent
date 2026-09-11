@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Protocol
 from xml.etree import ElementTree
 
+import numpy as np
+import trimesh
 from PIL import Image, ImageDraw
 
 from printing_agent.artifact_store import sha256_file
@@ -255,10 +257,26 @@ class BambuStudioCliDriver:
             )
             if output_size > self.maximum_output_bytes:
                 raise PolicyViolationError("Sliced job exceeds the configured size limit")
+            thumbnail_model_path: Path | None = None
+            thumbnail_model_transform: tuple[float, ...] | None = None
+            if (
+                request.artifact.project is not None
+                and len(request.artifact.project.parts) == 1
+                and len(request.artifact.project.instances) == 1
+                and request.artifact.model_path.is_file()
+                and request.artifact.mesh.triangle_count <= 100_000
+                and request.artifact.model_path.stat().st_size <= 32 * 1024 * 1024
+            ):
+                thumbnail_model_path = request.artifact.model_path
+                thumbnail_model_transform = tuple(
+                    request.artifact.project.instances[0].transform
+                )
             await asyncio.to_thread(
                 self._ensure_bambu_connect_metadata,
                 output_path,
                 self.maximum_output_bytes * 4,
+                thumbnail_model_path,
+                thumbnail_model_transform,
             )
             output_size = await asyncio.to_thread(
                 lambda: output_path.stat().st_size
@@ -913,6 +931,8 @@ class BambuStudioCliDriver:
     def _ensure_bambu_connect_metadata(
         path: Path,
         maximum_uncompressed_bytes: int = 8 * 1024 * 1024 * 1024,
+        model_path: Path | None = None,
+        model_transform: tuple[float, ...] | None = None,
     ) -> None:
         thumbnail_name = "Metadata/plate_1.png"
         temporary = path.with_name(f"{path.name}.connect.tmp")
@@ -958,7 +978,9 @@ class BambuStudioCliDriver:
                     else {}
                 )
                 thumbnail = BambuStudioCliDriver._render_plate_thumbnail(
-                    plate_payload
+                    plate_payload,
+                    model_path,
+                    model_transform,
                 )
                 if current_thumbnail is None:
                     ElementTree.SubElement(
@@ -1014,7 +1036,19 @@ class BambuStudioCliDriver:
             temporary.unlink(missing_ok=True)
 
     @staticmethod
-    def _render_plate_thumbnail(plate_payload: dict[str, object]) -> bytes:
+    def _render_plate_thumbnail(
+        plate_payload: dict[str, object],
+        model_path: Path | None = None,
+        model_transform: tuple[float, ...] | None = None,
+    ) -> bytes:
+        if model_path is not None and model_path.is_file():
+            try:
+                return BambuStudioCliDriver._render_mesh_thumbnail(
+                    model_path,
+                    model_transform,
+                )
+            except (Exception, MemoryError):
+                pass
         image = Image.new("RGB", (256, 256), "#ECEDE8")
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle(
@@ -1059,6 +1093,104 @@ class BambuStudioCliDriver:
                     outline="#273432",
                     width=1,
                 )
+        output = io.BytesIO()
+        image.save(output, format="PNG", optimize=True)
+        return output.getvalue()
+
+    @staticmethod
+    def _render_mesh_thumbnail(
+        model_path: Path,
+        model_transform: tuple[float, ...] | None = None,
+    ) -> bytes:
+        if model_path.stat().st_size > 32 * 1024 * 1024:
+            raise ValueError("Model mesh is too large for thumbnail rendering")
+        loaded = trimesh.load_mesh(model_path, process=False)
+        if isinstance(loaded, trimesh.Scene):
+            meshes = [
+                geometry
+                for geometry in loaded.geometry.values()
+                if isinstance(geometry, trimesh.Trimesh)
+            ]
+            if not meshes:
+                raise ValueError("Model contains no mesh geometry")
+            mesh = trimesh.util.concatenate(meshes)
+        elif isinstance(loaded, trimesh.Trimesh):
+            mesh = loaded
+        else:
+            raise ValueError("Model contains unsupported geometry")
+        if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            raise ValueError("Model mesh is empty")
+        if len(mesh.faces) > 100_000:
+            raise ValueError("Model mesh is too detailed for thumbnail rendering")
+
+        vertices = np.asarray(mesh.vertices, dtype=np.float64)
+        if model_transform is not None:
+            matrix = np.asarray(model_transform, dtype=np.float64)
+            if matrix.size != 16:
+                raise ValueError("Model instance transform is invalid")
+            vertices = trimesh.transform_points(
+                vertices,
+                matrix.reshape((4, 4)),
+            )
+        vertices -= (vertices.min(axis=0) + vertices.max(axis=0)) / 2
+        z_angle = np.deg2rad(35)
+        x_angle = np.deg2rad(65)
+        rotate_z = np.array(
+            [
+                [np.cos(z_angle), -np.sin(z_angle), 0],
+                [np.sin(z_angle), np.cos(z_angle), 0],
+                [0, 0, 1],
+            ]
+        )
+        rotate_x = np.array(
+            [
+                [1, 0, 0],
+                [0, np.cos(x_angle), -np.sin(x_angle)],
+                [0, np.sin(x_angle), np.cos(x_angle)],
+            ]
+        )
+        transformed = vertices @ rotate_z.T @ rotate_x.T
+        projected = transformed[:, :2].copy()
+        minimum = projected.min(axis=0)
+        maximum = projected.max(axis=0)
+        span = np.maximum(maximum - minimum, 1e-9)
+        scale = min(218 / span[0], 218 / span[1])
+        projected = (projected - (minimum + maximum) / 2) * scale + 128
+
+        image = Image.new("RGB", (256, 256), "#ECEDE8")
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle(
+            (8, 8, 248, 248),
+            radius=12,
+            fill="#D8DDD8",
+            outline="#51615E",
+            width=2,
+        )
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+        depth = transformed[faces].mean(axis=1)[:, 2]
+        order = np.argsort(depth)
+        normals = transformed[faces][:, [1, 2, 0]] - transformed[faces][
+            :, [0, 0, 1]
+        ]
+        face_normals = np.cross(normals[:, 0], normals[:, 1])
+        lengths = np.linalg.norm(face_normals, axis=1)
+        valid = lengths > 1e-12
+        face_normals[valid] /= lengths[valid, None]
+        light = np.array([0.35, -0.45, 0.82])
+        light /= np.linalg.norm(light)
+        brightness = np.clip(face_normals @ light, -0.2, 1.0)
+        base = np.array([5, 119, 72], dtype=np.float64)
+        for index in order:
+            points = [
+                (float(projected[vertex][0]), float(projected[vertex][1]))
+                for vertex in faces[index]
+            ]
+            intensity = 0.55 + 0.35 * max(0.0, float(brightness[index]))
+            color = tuple(
+                int(np.clip(channel * intensity + 28, 0, 255))
+                for channel in base
+            )
+            draw.polygon(points, fill=color)
         output = io.BytesIO()
         image.save(output, format="PNG", optimize=True)
         return output.getvalue()
