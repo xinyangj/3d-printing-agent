@@ -1,0 +1,37 @@
+{
+	admin off
+	auto_https off
+}
+
+http://127.0.0.1:8080 {
+	bind 127.0.0.1
+
+	basic_auth {
+		__AUTH_USERNAME__ __AUTH_PASSWORD_HASH__
+	}
+
+	@cloud_credentials path /api/v1/cloud-credentials*
+	respond @cloud_credentials 404
+
+	@bambu_studio_session path /api/v1/bambu-studio-session*
+	respond @bambu_studio_session 404
+
+	@bambu_connect_management path /api/v1/bambu-connect/install* /api/v1/bambu-connect/open*
+	respond @bambu_connect_management 404
+
+	@bambu_connect_confirmation path_regexp bambu_connect_confirmation ^/api/v1/slicing-profiles/[^/]+/bambu-connect-confirmation$
+	respond @bambu_connect_confirmation 404
+
+	@bambu_connect_launch path_regexp bambu_connect_launch ^/api/v1/workflows/[^/]+/bambu-connect(?:/.*)?$
+	respond @bambu_connect_launch 404
+
+	reverse_proxy 127.0.0.1:8000
+
+	log {
+		output file "var\logs\caddy-access.log" {
+			roll_size 10MiB
+			roll_keep 5
+			roll_keep_for 168h
+		}
+	}
+}

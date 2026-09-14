@@ -1,0 +1,41 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,600&display=swap');
+
+:root {
+  --canvas: #f2f0e8;
+  --paper: #fffef9;
+  --ink: #1c2524;
+  --ink-soft: #3e4a47;
+  --muted: #6f7975;
+  --muted-light: #9ca39f;
+  --line: #dad9d1;
+  --line-strong: #babdb7;
+  --teal: #3eb8a4;
+  --teal-dark: #177969;
+  --teal-pale: #dff3ed;
+  --orange: #df8d39;
+  --orange-pale: #f8ead7;
+  --shadow-block: #dfded5;
+  --display: 'Newsreader', Georgia, serif;
+  --sans: 'Manrope', 'Segoe UI', sans-serif;
+  --mono: 'DM Mono', Consolas, monospace;
+  color: var(--ink-soft);
+  background: var(--canvas);
+  font-family: var(--sans);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+a {
+  color: inherit;
+}
