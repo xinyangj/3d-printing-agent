@@ -369,43 +369,74 @@
     .journey {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
-      grid-template-rows: repeat(2, minmax(0, 1fr));
-      gap: 1.1em;
+      grid-template-rows: repeat(2, auto);
+      align-content: center;
+      gap: 0.85em;
       min-height: 0;
     }
 
     .journey-step {
       position: relative;
       display: grid;
-      grid-template-rows: auto auto 1fr;
-      gap: 0.55em;
+      grid-template-rows: auto auto;
+      gap: 0.65em;
       min-width: 0;
-      padding: 1em;
+      min-height: 8.6em;
+      padding: 0.78em 0.85em 0.82em;
+    }
+
+    .step-visual {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.8em;
+      min-width: 0;
     }
 
     .step-index {
       display: flex;
       align-items: center;
       justify-content: center;
-      width: 2.1em;
-      height: 2.1em;
+      width: 1.9em;
+      height: 1.9em;
       border-radius: 50%;
       background: var(--cyan-soft);
       color: var(--cyan);
-      font-size: min(0.72vw, 1.28vh);
+      font-size: min(0.66vw, 1.17vh);
       font-weight: 900;
     }
 
+    .step-icon {
+      width: min(3.2vw, 5.68vh);
+      height: min(3.2vw, 5.68vh);
+      padding: 0.5em;
+      border: 1px solid rgba(66, 216, 232, 0.22);
+      border-radius: 12px;
+      background:
+        radial-gradient(circle at 70% 20%, rgba(66, 216, 232, 0.19), transparent 55%),
+        rgba(66, 216, 232, 0.07);
+      color: var(--cyan);
+      filter: drop-shadow(0 0 9px rgba(66, 216, 232, 0.12));
+    }
+
     .journey-step:nth-child(5) .step-index,
-    .journey-step:nth-child(6) .step-index {
+    .journey-step:nth-child(6) .step-index,
+    .journey-step:nth-child(5) .step-icon,
+    .journey-step:nth-child(6) .step-icon {
       background: var(--amber-soft);
       color: var(--amber);
+      border-color: rgba(255, 189, 89, 0.24);
+    }
+
+    .step-copy {
+      display: grid;
+      gap: 0.32em;
     }
 
     .journey-step p {
       color: var(--muted);
-      font-size: min(0.82vw, 1.46vh);
-      line-height: 1.34;
+      font-size: min(0.76vw, 1.35vh);
+      line-height: 1.3;
     }
 
     .journey-arrow {
@@ -1086,39 +1117,89 @@
         <div class="journey-layout">
           <div class="journey" aria-label="End-to-end product journey">
             <article class="journey-step panel">
-              <span class="step-index">1</span>
-              <h3>Understand intent</h3>
-              <p>Capture the object, constraints, colors, target printer, and desired outcome.</p>
+              <div class="step-visual">
+                <span class="step-index">1</span>
+                <svg class="step-icon" viewBox="0 0 48 48" aria-hidden="true">
+                  <path d="M8 10h32v22H23l-9 7v-7H8z" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linejoin="round"/>
+                  <path d="M15 18h18M15 24h12" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linecap="round"/>
+                </svg>
+              </div>
+              <div class="step-copy">
+                <h3>Understand intent</h3>
+                <p>Capture the object, constraints, colors, target printer, and desired outcome.</p>
+              </div>
               <span class="journey-arrow" aria-hidden="true">&rarr;</span>
             </article>
             <article class="journey-step panel">
-              <span class="step-index">2</span>
-              <h3>Discover or create</h3>
-              <p>Reuse a licensed catalog model or generate editable OpenSCAD from scratch.</p>
+              <div class="step-visual">
+                <span class="step-index">2</span>
+                <svg class="step-icon" viewBox="0 0 48 48" aria-hidden="true">
+                  <circle cx="20" cy="20" r="10" fill="none" stroke="currentColor" stroke-width="2.7"/>
+                  <path d="m28 28 10 10M17 17l6-3 6 3v7l-6 3-6-3z" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linejoin="round"/>
+                </svg>
+              </div>
+              <div class="step-copy">
+                <h3>Discover or create</h3>
+                <p>Reuse a licensed catalog model or generate editable OpenSCAD from scratch.</p>
+              </div>
               <span class="journey-arrow" aria-hidden="true">&rarr;</span>
             </article>
             <article class="journey-step panel">
-              <span class="step-index">3</span>
-              <h3>Validate and package</h3>
-              <p>Inspect geometry, preserve multipart identity, and produce an immutable 3MF artifact.</p>
+              <div class="step-visual">
+                <span class="step-index">3</span>
+                <svg class="step-icon" viewBox="0 0 48 48" aria-hidden="true">
+                  <path d="m24 7 14 6v10c0 9-5.7 14.5-14 18-8.3-3.5-14-9-14-18V13z" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linejoin="round"/>
+                  <path d="m17 24 5 5 10-11" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </div>
+              <div class="step-copy">
+                <h3>Validate and package</h3>
+                <p>Inspect geometry, preserve multipart identity, and produce an immutable 3MF artifact.</p>
+              </div>
               <span class="journey-arrow" aria-hidden="true">&rarr;</span>
             </article>
             <article class="journey-step panel">
-              <span class="step-index">4</span>
-              <h3>Configure the real printer</h3>
-              <p>Observe H2D/AMS state and map each part to a compatible spool and toolhead.</p>
+              <div class="step-visual">
+                <span class="step-index">4</span>
+                <svg class="step-icon" viewBox="0 0 48 48" aria-hidden="true">
+                  <circle cx="15" cy="24" r="8" fill="none" stroke="currentColor" stroke-width="2.7"/>
+                  <circle cx="33" cy="24" r="8" fill="none" stroke="currentColor" stroke-width="2.7"/>
+                  <circle cx="15" cy="24" r="2.5" fill="currentColor"/>
+                  <circle cx="33" cy="24" r="2.5" fill="currentColor"/>
+                  <path d="M15 16V9h18v7M15 32v7h18v-7" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linecap="round"/>
+                </svg>
+              </div>
+              <div class="step-copy">
+                <h3>Configure the real printer</h3>
+                <p>Observe H2D/AMS state and map each part to a compatible spool and toolhead.</p>
+              </div>
               <span class="journey-arrow" aria-hidden="true">&rarr;</span>
             </article>
             <article class="journey-step panel">
-              <span class="step-index">5</span>
-              <h3>Slice and reconcile</h3>
-              <p>Bambu Studio creates G-code; the system verifies settings, usage, and object mapping.</p>
+              <div class="step-visual">
+                <span class="step-index">5</span>
+                <svg class="step-icon" viewBox="0 0 48 48" aria-hidden="true">
+                  <path d="m9 15 15-7 15 7-15 7zM9 24l15 7 15-7M9 33l15 7 15-7" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linejoin="round"/>
+                </svg>
+              </div>
+              <div class="step-copy">
+                <h3>Slice and reconcile</h3>
+                <p>Bambu Studio creates G-code; the system verifies settings, usage, and object mapping.</p>
+              </div>
               <span class="journey-arrow" aria-hidden="true">&rarr;</span>
             </article>
             <article class="journey-step panel">
-              <span class="step-index">6</span>
-              <h3>Connect and print</h3>
-              <p>Official Bambu Connect authenticates and transfers the exact reviewed artifact.</p>
+              <div class="step-visual">
+                <span class="step-index">6</span>
+                <svg class="step-icon" viewBox="0 0 48 48" aria-hidden="true">
+                  <path d="M9 14h30v27H9zM15 35h18M24 14V7M19 12l5-5 5 5" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M17 22h14v7H17z" fill="none" stroke="currentColor" stroke-width="2.7"/>
+                </svg>
+              </div>
+              <div class="step-copy">
+                <h3>Connect and print</h3>
+                <p>Official Bambu Connect authenticates and transfers the exact reviewed artifact.</p>
+              </div>
               <span class="journey-arrow" aria-hidden="true">&rarr;</span>
             </article>
           </div>
